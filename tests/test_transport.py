@@ -180,14 +180,43 @@ def test_an_anonymous_request_and_a_client_without_a_token_send_no_authorization
     assert all("authorization" not in request.headers for request in script.requests)
 
 
-def test_a_class_extension_overrides_the_path_classification() -> None:
+def test_a_class_extension_applies_to_a_request_to_another_host() -> None:
     script, clock = Script([reply(500), reply(200, {})]), FakeClock()
     with sync_client(script, clock) as client:
         response = client.put(
-            "/r2/part", content=b"x", extensions={CLASS_EXTENSION: RetryClass.PART}
+            "https://r2.example.com/part",
+            content=b"x",
+            extensions={CLASS_EXTENSION: RetryClass.PART},
         )
     assert response.status_code == 200
     assert script.calls == 2
+
+
+def test_a_class_extension_cannot_relabel_an_api_request() -> None:
+    script, clock = Script([READ]), FakeClock()
+    with sync_client(script, clock) as client, pytest.raises(OutcomeUnknownError):
+        client.post(
+            "/v1/agent/credentials/rotate", json={}, extensions={CLASS_EXTENSION: RetryClass.SAFE}
+        )
+    assert script.calls == 1
+
+
+def test_a_path_that_names_an_api_route_on_another_host_is_not_that_route() -> None:
+    script, clock = Script([READ]), FakeClock()
+    with sync_client(script, clock) as client, pytest.raises(NetworkError) as raised:
+        client.post("https://r2.example.com/v1/agent/credentials/rotate", json={})
+    assert not isinstance(raised.value, OutcomeUnknownError)
+    assert script.calls == 1
+
+
+@pytest.mark.parametrize("url", ["https://r2.example.com/part", "http://127.0.0.1:4011/v1/account"])
+def test_the_token_goes_only_to_the_base_url_host(url: str) -> None:
+    script, clock = Script([reply(200, {})]), FakeClock()
+    with sync_client(script, clock, token=TOKEN) as client:
+        client.get(url)
+        client.get("/v1/account")
+    assert "authorization" not in script.requests[0].headers
+    assert script.requests[1].headers["Authorization"] == f"Bearer {TOKEN}"
 
 
 def test_debug_logging_writes_one_line_per_attempt_without_the_query(
@@ -200,7 +229,7 @@ def test_debug_logging_writes_one_line_per_attempt_without_the_query(
     ):
         client.get("/v1/jobs?secret=abc")
         client.put(
-            "/r2/signed?X-Signature=zzz",
+            "https://r2.example.com/signed?X-Signature=zzz",
             content=b"x",
             extensions={LABEL_EXTENSION: "r2:part/3", CLASS_EXTENSION: RetryClass.PART},
         )
@@ -277,3 +306,118 @@ async def test_async_network_errors_and_create_pacing() -> None:
     async with async_client(active, FakeClock()) as client:
         await client.post("/v1/uploads", json={})
     assert active.calls == 10
+
+
+STATUSES = [429, 500, 502, 503, 504]
+
+
+@pytest.mark.parametrize("status", STATUSES)
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/v1/agent/accounts/sg_1/claim"),
+        ("POST", "/v1/agent/credentials/rotate"),
+        ("POST", "/v1/agent/accounts"),
+        ("POST", "/v1/billing/cards/default"),
+        ("PUT", "/v1/billing/cards/default"),
+        ("PATCH", "/v1/org/members/u1"),
+    ],
+)
+def test_claim_rotate_signup_and_other_mutations_never_retry_on_a_status(
+    method: str, path: str, status: int
+) -> None:
+    script, clock = Script([reply(status), reply(200, {})]), FakeClock()
+    with sync_client(script, clock, max_retries=5) as client:
+        assert client.request(method, path, json={}).status_code == status
+    assert script.calls == 1
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize(("status", "calls"), [(502, 2), (503, 2), (500, 1), (504, 1), (429, 1)])
+def test_a_purchase_makes_at_most_two_calls_and_retries_only_502_and_503(
+    status: int, calls: int
+) -> None:
+    script = Script([reply(status)])
+    with sync_client(script, FakeClock(), max_retries=5) as client:
+        client.post("/v1/billing/purchase", json={})
+    assert script.calls == calls
+
+
+def test_a_purchase_makes_at_most_two_calls_on_network_errors() -> None:
+    script = Script([READ])
+    with sync_client(script, FakeClock(), max_retries=5) as client, pytest.raises(NetworkError):
+        client.post("/v1/billing/setup-session", json={})
+    assert script.calls == 2
+
+
+@pytest.mark.parametrize("status", [501, 505, 507])
+def test_a_get_does_not_retry_other_5xx(status: int) -> None:
+    script = Script([reply(status)])
+    with sync_client(script, FakeClock()) as client:
+        assert client.get("/v1/uploads/j1/part-urls").status_code == status
+    assert script.calls == 1
+
+
+@pytest.mark.parametrize("status", STATUSES)
+def test_get_heartbeat_and_part_urls_retry_the_listed_statuses(status: int) -> None:
+    for method, path in (
+        ("GET", "/v1/account"),
+        ("POST", "/v1/uploads/j1/heartbeat"),
+        ("GET", "/v1/uploads/j1/part-urls"),
+    ):
+        script = Script([reply(status), reply(200, {})])
+        with sync_client(script, FakeClock()) as client:
+            assert client.request(method, path).status_code == 200
+        assert script.calls == 2
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/v1/account"),
+        ("PUT", "/v1/uploads/j1/parts/1"),
+        ("POST", "/v1/uploads/j1/complete"),
+        ("POST", "/v1/uploads"),
+        ("POST", "/v1/billing/purchase"),
+    ],
+)
+def test_a_retry_after_above_60_on_a_5xx_is_returned_at_once(
+    method: str, path: str, status: int
+) -> None:
+    script, clock = Script([reply(status, headers={"Retry-After": "61"})]), FakeClock()
+    with sync_client(script, clock) as client:
+        response = client.request(method, path, content=b"x")
+    assert response.status_code == status
+    assert response.headers["Retry-After"] == "61"
+    assert script.calls == 1
+    assert clock.sleeps == []
+
+
+def test_the_create_429_schedule_counts_only_429s_after_other_retries() -> None:
+    script = Script(
+        [reply(500), reply(429, RATE_LIMITED), reply(429, RATE_LIMITED), reply(200, {})]
+    )
+    clock = FakeClock()
+    with sync_client(script, clock, max_retries=5) as client:
+        assert client.post("/v1/uploads", json={}).status_code == 200
+    assert script.calls == 4
+    assert clock.sleeps[1:] == [15.0, 30.0]
+
+
+def test_the_create_429_schedule_still_ends_after_three_waits_following_a_500() -> None:
+    script = Script([reply(500), reply(429, RATE_LIMITED)])
+    clock = FakeClock()
+    with sync_client(script, clock, max_retries=9) as client:
+        assert client.post("/v1/uploads", json={}).status_code == 429
+    assert clock.sleeps[1:] == [15.0, 30.0, 60.0]
+
+
+def test_the_active_jobs_wait_counts_only_active_jobs_429s() -> None:
+    active = reply(429, error_body("too_many_active_jobs", 5001))
+    script = Script([reply(429, RATE_LIMITED), reply(500), active])
+    clock = FakeClock()
+    with sync_client(script, clock, max_retries=3) as client:
+        assert client.post("/v1/uploads", json={}).status_code == 429
+    assert script.calls == 12
+    assert clock.sleeps[2:] == [30.0] * 9

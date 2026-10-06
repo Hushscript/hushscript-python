@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     import httpx
 
 _PLACEHOLDER: Final = re.compile(r"\{(\w+)\}")
+_SENTENCE_BREAK: Final = re.compile(r"(?<=\.) ")
 _TEMPLATE_PARAMETER: Final = re.compile(r"\\\{[^}/]+\\\}")
 
 
@@ -69,6 +70,11 @@ def _minutes(details: Mapping[str, object], keys: tuple[str, ...], *, up: bool) 
     return None
 
 
+def _whole_seconds(retry_after: float | None, from_details: object) -> str | None:
+    seconds = retry_after if retry_after is not None else _number(from_details)
+    return None if seconds is None else str(math.ceil(seconds))
+
+
 def _hint_context(
     details: Mapping[str, object], retry_after: float | None, scope: str | None
 ) -> dict[str, str]:
@@ -78,7 +84,7 @@ def _hint_context(
         "balance": _minutes(details, ("balance_seconds",), up=False),
         "used": _minutes(details, ("used_seconds", "used_today_seconds"), up=False),
         "max": _minutes(details, ("max_seconds", "max_daily_seconds"), up=False),
-        "retryAfter": None if retry_after is None else str(math.ceil(retry_after)),
+        "retryAfter": _whole_seconds(retry_after, details.get("retry_after_seconds")),
         "scope": scope,
     }
     context.update({name: value for name, value in derived.items() if value is not None})
@@ -91,17 +97,18 @@ def render_hint(
     retry_after: float | None = None,
     scope: str | None = None,
 ) -> str | None:
-    """Spec 9.3 rendering: a sentence with an unfilled placeholder is dropped, none left is None."""
+    """Spec 9.3 rendering: split after each ". ", drop the sentences with an unfilled placeholder,
+    join the rest with a space; nothing left is None."""
     template = HINTS.get(code)
     if template is None:
         return None
     context = _hint_context(details or {}, retry_after, scope)
     kept = [
         _PLACEHOLDER.sub(lambda match: context[match.group(1)], sentence)
-        for sentence in template.split(". ")
+        for sentence in _SENTENCE_BREAK.split(template)
         if all(name in context for name in _PLACEHOLDER.findall(sentence))
     ]
-    return ". ".join(kept) or None
+    return " ".join(kept) or None
 
 
 class HushscriptError(Exception):
@@ -174,7 +181,7 @@ class AuthenticationError(ApiError):
     default_code = "unauthorized"
 
 
-class PermissionError(ApiError):  # spec 9.2 names this class PermissionError
+class PermissionDeniedError(ApiError):
     default_code = "pat_forbidden"
 
 
@@ -265,14 +272,14 @@ _CLASS_BY_SLUG: Final[dict[str, type[HushscriptError]]] = {
     "size_exceeded": UploadError,
     "agent_claim_invalid": AuthenticationError,
     "unauthorized": AuthenticationError,
-    "pat_scope_missing": PermissionError,
-    "pat_forbidden": PermissionError,
-    "account_suspended": PermissionError,
-    "agent_pack_locked": PermissionError,
-    "pat_purchase_requires_app": PermissionError,
-    "pat_purchase_requires_authentication": PermissionError,
-    "country_restricted": PermissionError,
-    "signup_not_allowed": PermissionError,
+    "pat_scope_missing": PermissionDeniedError,
+    "pat_forbidden": PermissionDeniedError,
+    "account_suspended": PermissionDeniedError,
+    "agent_pack_locked": PermissionDeniedError,
+    "pat_purchase_requires_app": PermissionDeniedError,
+    "pat_purchase_requires_authentication": PermissionDeniedError,
+    "country_restricted": PermissionDeniedError,
+    "signup_not_allowed": PermissionDeniedError,
     "insufficient_balance": InsufficientBalanceError,
     "org_insufficient_balance": InsufficientBalanceError,
     "org_pool_expired": InsufficientBalanceError,
@@ -290,7 +297,7 @@ _CLASS_BY_STATUS: Final[dict[int, type[HushscriptError]]] = {
     400: ValidationError,
     401: AuthenticationError,
     402: InsufficientBalanceError,
-    403: PermissionError,
+    403: PermissionDeniedError,
     404: NotFoundError,
     409: ConflictError,
     422: ValidationError,

@@ -61,6 +61,13 @@ def test_accepted_base_urls(raw: str, expected: str) -> None:
         "https://",
         "https://user:pass@api.example.com",
         "api.example.com",
+        "https://api.example.com/api",
+        "https://api.example.com/v1/",
+        "http://127.0.0.1:4010/mock",
+        "https://api.example.com?x=1",
+        "https://api.example.com/?",
+        "https://api.example.com#top",
+        "https://api.example.com/#",
     ],
 )
 def test_refused_base_urls(raw: str) -> None:
@@ -98,3 +105,36 @@ def test_max_retries_must_not_be_negative(retries: int) -> None:
 def test_unknown_log_level_is_refused() -> None:
     with pytest.raises(ConfigurationError, match="log_level"):
         resolve_config(TOKEN, log_level="trace", env={})
+
+
+def test_an_explicit_log_level_beats_the_environment() -> None:
+    debug = {"HUSHSCRIPT_LOG": "debug"}
+    assert resolve_config(TOKEN, log_level="off", env=debug).log_level == "off"
+    assert resolve_config(TOKEN, env=debug).log_level == "debug"
+    assert resolve_config(TOKEN, log_level="debug", env={}).log_level == "debug"
+    assert resolve_config(TOKEN, env={"HUSHSCRIPT_LOG": ""}).log_level == "off"
+
+
+def test_an_unknown_log_level_in_the_environment_is_refused() -> None:
+    with pytest.raises(ConfigurationError, match="log_level"):
+        resolve_config(TOKEN, env={"HUSHSCRIPT_LOG": "trace"})
+
+
+@pytest.mark.parametrize(
+    "suffix", ["\x00", "\x1b[31m", "\x7f", "\u00e9", "\u00a0x", " x", "\tx", "a\nb", "\u200b"]
+)
+def test_a_token_with_control_or_non_printable_characters_is_refused(suffix: str) -> None:
+    with pytest.raises(ConfigurationError) as raised:
+        resolve_config(TOKEN + suffix, env={})
+    surface = f"{raised.value} {raised.value!r} {raised.value.hint}"
+    assert TOKEN[12:] not in surface
+    assert suffix not in surface
+
+
+def test_a_token_in_the_environment_is_checked_too() -> None:
+    with pytest.raises(ConfigurationError, match="control or non-printable"):
+        resolve_config(None, env={"HUSHSCRIPT_TOKEN": TOKEN[:20] + "\x07" + TOKEN[20:]})
+
+
+def test_the_whitespace_around_a_token_is_still_stripped() -> None:
+    assert resolve_config(f" \t{TOKEN}\r\n", env={}).credentials.token == TOKEN
