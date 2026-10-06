@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import httpx
@@ -14,9 +15,12 @@ from hushscript._log import RequestLog
 from hushscript._redact import Credentials
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import AsyncIterator, Iterator, Sequence
 
-Step = httpx.Response | Exception
+BASE_URL = "http://127.0.0.1:4010"
+# A callable builds a fresh response per call, which a response with a stream needs: a stream can
+# be read once.
+Step = httpx.Response | Exception | Callable[[], httpx.Response]
 
 
 class FakeClock:
@@ -47,7 +51,7 @@ class Script:
         step = self.steps.pop(0) if len(self.steps) > 1 else self.steps[0]
         if isinstance(step, Exception):
             raise step
-        return step
+        return step() if callable(step) else step
 
     def sync(self) -> httpx.MockTransport:
         return httpx.MockTransport(self._next)
@@ -69,12 +73,16 @@ def settings_for(
     max_retries: int = 3,
     token: str | None = None,
     level: str = "off",
+    base_url: str = BASE_URL,
+    timeout: float = 60.0,
 ) -> TransportSettings:
     return TransportSettings(
         clock=clock,
         log=RequestLog(level),
         credentials=Credentials(token),
         max_retries=max_retries,
+        base_url=httpx.URL(base_url),
+        timeout=timeout,
         rng=random.Random(7),  # noqa: S311  # deterministic jitter for tests
     )
 
@@ -86,10 +94,14 @@ def sync_client(
     max_retries: int = 3,
     token: str | None = None,
     level: str = "off",
+    base_url: str = BASE_URL,
+    timeout: float = 60.0,
 ) -> httpx.Client:
-    settings = settings_for(clock, max_retries=max_retries, token=token, level=level)
+    settings = settings_for(
+        clock, max_retries=max_retries, token=token, level=level, base_url=base_url, timeout=timeout
+    )
     return httpx.Client(
-        base_url="http://127.0.0.1:4010",
+        base_url=base_url,
         transport=RetryingTransport(script.sync(), settings),
     )
 
@@ -101,10 +113,14 @@ def async_client(
     max_retries: int = 3,
     token: str | None = None,
     level: str = "off",
+    base_url: str = BASE_URL,
+    timeout: float = 60.0,
 ) -> httpx.AsyncClient:
-    settings = settings_for(clock, max_retries=max_retries, token=token, level=level)
+    settings = settings_for(
+        clock, max_retries=max_retries, token=token, level=level, base_url=base_url, timeout=timeout
+    )
     return httpx.AsyncClient(
-        base_url="http://127.0.0.1:4010",
+        base_url=base_url,
         transport=AsyncRetryingTransport(script.asynchronous(), settings),
     )
 
@@ -121,3 +137,51 @@ def reply(
 
 def error_body(slug: str, code: int, **extra: object) -> dict[str, object]:
     return {"error": slug, "code": code, **extra}
+
+
+class FailingBody(httpx.SyncByteStream, httpx.AsyncByteStream):
+    """A response body that breaks after its chunks, as a connection reset or a read timeout does
+    once the headers have arrived."""
+
+    def __init__(self, failure: Exception, chunks: tuple[bytes, ...] = ()) -> None:
+        self.failure = failure
+        self.chunks = chunks
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield from self.chunks
+        raise self.failure
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self.chunks:
+            yield chunk
+        raise self.failure
+
+
+def failing_body(
+    failure: Exception, status: int = 200, chunks: tuple[bytes, ...] = ()
+) -> Callable[[], httpx.Response]:
+    """A step whose headers arrive and whose body then fails, afresh on every call."""
+
+    def build() -> httpx.Response:
+        return httpx.Response(status, stream=FailingBody(failure, chunks))
+
+    return build
+
+
+class SlowBody(httpx.SyncByteStream, httpx.AsyncByteStream):
+    """A body that delivers `count` chunks, each one `seconds` of clock time after the last."""
+
+    def __init__(self, clock: FakeClock, seconds: float, count: int) -> None:
+        self.clock = clock
+        self.seconds = seconds
+        self.count = count
+
+    def __iter__(self) -> Iterator[bytes]:
+        for _ in range(self.count):
+            self.clock.time += self.seconds
+            yield b"x"
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for _ in range(self.count):
+            self.clock.time += self.seconds
+            yield b"x"

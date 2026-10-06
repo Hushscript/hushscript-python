@@ -20,6 +20,8 @@ TOKEN_ENV: Final = "HUSHSCRIPT_TOKEN"  # noqa: S105  # the name of an environmen
 BASE_URL_ENV: Final = "HUSHSCRIPT_BASE_URL"
 LOG_ENV: Final = "HUSHSCRIPT_LOG"
 TOKEN_PREFIX: Final = "hsr"  # noqa: S105  # the token family prefix, not a secret
+PRINTABLE_FIRST: Final = 0x21
+PRINTABLE_LAST: Final = 0x7E
 LOOPBACK_HOSTS: Final = frozenset({"localhost", "127.0.0.1", "::1"})
 
 SETUP_HINT: Final = (
@@ -39,6 +41,9 @@ class Config:
 
 def _validate_base_url(raw: str) -> str:
     parts = urlsplit(raw)
+    if parts.path not in {"", "/"} or "?" in raw or "#" in raw:
+        # Requests are classified by their path relative to the base URL (spec 7.4), so it has none.
+        raise ConfigurationError("base_url must not have a path, query or fragment.")
     host = parts.hostname or ""
     secure = parts.scheme == "https"
     loopback = parts.scheme == "http" and host in LOOPBACK_HOSTS
@@ -63,13 +68,16 @@ def resolve_config(  # mirrors the public constructor
     base_url: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     max_retries: int = DEFAULT_MAX_RETRIES,
-    log_level: str = "off",
+    log_level: str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> Config:
     environment = os.environ if env is None else env
     resolved_token = (token or environment.get(TOKEN_ENV, "")).strip()
     if not resolved_token:
         raise ConfigurationError("No Hushscript token was provided.", hint=SETUP_HINT)
+    if any(not PRINTABLE_FIRST <= ord(char) <= PRINTABLE_LAST for char in resolved_token):
+        # The message never echoes the token (spec 7.4).
+        raise ConfigurationError("The token contains control or non-printable characters.")
     if not resolved_token.startswith(TOKEN_PREFIX):
         raise ConfigurationError("This doesn't look like a Hushscript token.")
     resolved_url = _validate_base_url(base_url or environment.get(BASE_URL_ENV) or DEFAULT_BASE_URL)
@@ -77,7 +85,7 @@ def resolve_config(  # mirrors the public constructor
         raise ConfigurationError("timeout must be a positive number of seconds.")
     if not _is_non_negative_int(max_retries):
         raise ConfigurationError("max_retries must be a non-negative integer.")
-    level = log_level if log_level != "off" else environment.get(LOG_ENV, "off") or "off"
+    level = log_level if log_level is not None else environment.get(LOG_ENV) or "off"
     if level not in LOG_LEVELS:
         raise ConfigurationError(f"log_level must be one of {', '.join(LOG_LEVELS)}.")
     return Config(

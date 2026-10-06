@@ -38,6 +38,15 @@ The conformance mock is built from the `hushscript-sdk-conformance` repository a
 CONFORMANCE_CONTEXT=../hushscript-sdk-conformance CONFORMANCE_DIR=../hushscript-sdk-conformance just ci
 ```
 
+`just test` reads the conformance repo's fixtures (`fixtures/hint-rendering.json`) from
+`CONFORMANCE_DIR`, which defaults to `../hushscript-sdk-conformance`; the hint-rendering test fails
+without them.
+
+Runtime dependencies in `pyproject.toml` are compatible ranges on purpose: a library that pins exact
+versions breaks the resolvers of the projects that install it. Everything else is pinned: the dev
+and tool dependencies, the build backend and the container images are locked in `uv.lock` and in
+`pyproject.toml`, and `just ci` tests exactly that set.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md).

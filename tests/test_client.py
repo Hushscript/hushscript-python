@@ -1,15 +1,20 @@
+# pyright: reportPrivateUsage=false
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import attrs
 import httpx
 import pytest
 
 import hushscript._client as client_module
 from conftest import TOKEN
-from helpers import FakeClock, Script, error_body, reply
+from helpers import FakeClock, Script, error_body, failing_body, reply
 from hushscript import (
     AsyncHushscript,
     AuthenticationError,
     Balance,
+    ConfigurationError,
     Hushscript,
     NetworkError,
     RateLimitError,
@@ -17,6 +22,9 @@ from hushscript import (
 from hushscript._client import user_agent
 from hushscript._errors import ApiError
 from hushscript.generated.api.default import get_account
+
+if TYPE_CHECKING:
+    from hushscript.generated.client import AuthenticatedClient
 
 
 def _patch(monkeypatch: pytest.MonkeyPatch, script: Script) -> None:
@@ -42,13 +50,24 @@ ACCOUNT = {
 
 def test_never_prints_token() -> None:
     hs = Hushscript(TOKEN)
-    surface = repr(hs) + str(hs) + str(vars(hs)) + repr(hs.api) + str(vars(hs.api))
+    surface = repr(hs) + str(hs) + str(vars(hs)) + repr(hs.api)
     assert TOKEN[12:] not in surface
 
 
 def test_async_client_never_prints_token() -> None:
     hs = AsyncHushscript(TOKEN)
     assert TOKEN[12:] not in repr(hs) + str(vars(hs)) + repr(hs.api)
+
+
+@pytest.mark.parametrize("client_type", [Hushscript, AsyncHushscript])
+def test_the_api_client_never_holds_the_token(
+    client_type: type[Hushscript | AsyncHushscript],
+) -> None:
+    hs = client_type(TOKEN)
+    assert hs.api.token == ""
+    assert TOKEN[12:] not in repr(attrs.asdict(hs.api, recurse=False))
+    assert TOKEN[12:] not in repr(vars(hs.api))
+    assert not any("authorization" in key.lower() for key in hs.api._headers)
 
 
 def test_the_token_is_not_stored_on_the_httpx_client() -> None:
@@ -167,3 +186,119 @@ async def test_async_balance_and_error_mapping(monkeypatch: pytest.MonkeyPatch) 
     async with AsyncHushscript(TOKEN, base_url="http://127.0.0.1:4010") as hs:
         with pytest.raises(AuthenticationError):
             await hs.balance()
+
+
+def test_a_rotated_token_reaches_the_next_request_through_the_api_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Script([reply(200, ACCOUNT)])
+    _patch(monkeypatch, script)
+    hs = Hushscript(TOKEN, base_url="http://127.0.0.1:4010")
+    new_token = TOKEN.replace("pat.0", "pat.1", 1)
+    hs._config.credentials.replace(new_token)
+    get_account.sync_detailed(client=hs.api)
+    assert script.requests[0].headers["Authorization"] == f"Bearer {new_token}"
+    assert hs.api.token == ""
+
+
+@pytest.mark.parametrize(
+    ("method", "argument"),
+    [
+        ("with_timeout", httpx.Timeout(300)),
+        ("with_headers", {"X-Test": "1"}),
+        ("with_cookies", {"a": "b"}),
+    ],
+)
+def test_derived_api_clients_keep_the_hardened_transport(
+    monkeypatch: pytest.MonkeyPatch, method: str, argument: object
+) -> None:
+    script = Script([reply(503), reply(200, ACCOUNT)])
+    _patch(monkeypatch, script)
+    hs = Hushscript(TOKEN, base_url="http://127.0.0.1:4010", clock=FakeClock())
+    before = hs._http.timeout
+    derived: AuthenticatedClient = getattr(hs.api, method)(argument)
+    assert derived is not hs.api
+    assert derived.token == ""
+    assert get_account.sync_detailed(client=derived).status_code == 200
+    assert script.calls == 2
+    assert script.requests[1].headers["Authorization"] == f"Bearer {TOKEN}"
+    assert hs._http.timeout == before
+    assert TOKEN[12:] not in repr(derived)
+
+
+def test_a_derived_client_carries_its_change_and_leaves_the_original_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Script([reply(200, ACCOUNT)])
+    _patch(monkeypatch, script)
+    hs = Hushscript(TOKEN, base_url="http://127.0.0.1:4010")
+    derived = hs.api.with_headers({"X-Test": "1"}).with_timeout(httpx.Timeout(7))
+    get_account.sync_detailed(client=derived)
+    assert script.requests[0].headers["X-Test"] == "1"
+    assert script.requests[0].headers["User-Agent"] == user_agent()
+    assert derived.get_httpx_client().timeout == httpx.Timeout(7)
+    assert "x-test" not in hs.api.get_httpx_client().headers
+
+
+def test_closing_a_derived_client_leaves_the_shared_transport_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Script([reply(200, ACCOUNT)])
+    _patch(monkeypatch, script)
+    hs = Hushscript(TOKEN, base_url="http://127.0.0.1:4010")
+    with hs.api.with_timeout(httpx.Timeout(7)) as derived:
+        get_account.sync_detailed(client=derived)
+    assert hs.balance().seconds == 7260
+
+
+def test_the_sync_api_client_refuses_to_build_an_unhardened_async_client() -> None:
+    hs = Hushscript(TOKEN)
+    with pytest.raises(ConfigurationError, match="sync client"):
+        hs.api.get_async_httpx_client()
+
+
+@pytest.mark.anyio
+async def test_the_async_api_client_refuses_to_build_an_unhardened_sync_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Script([reply(503), reply(200, ACCOUNT)])
+    _patch(monkeypatch, script)
+    async with AsyncHushscript(TOKEN, base_url="http://127.0.0.1:4010", clock=FakeClock()) as hs:
+        with pytest.raises(ConfigurationError, match="async client"):
+            hs.api.get_httpx_client()
+        derived = hs.api.with_timeout(httpx.Timeout(300))
+        assert (await get_account.asyncio_detailed(client=derived)).status_code == 200
+        assert script.calls == 2
+        assert hs._http.timeout == httpx.Timeout(60.0)
+
+
+def test_an_explicit_log_level_beats_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HUSHSCRIPT_LOG", "debug")
+    assert Hushscript(TOKEN, log_level="off")._config.log_level == "off"
+    assert Hushscript(TOKEN)._config.log_level == "debug"
+    assert AsyncHushscript(TOKEN, log_level="off")._config.log_level == "off"
+    assert AsyncHushscript(TOKEN)._config.log_level == "debug"
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_a_retry_after_above_60_raises_the_status_class_with_retry_after(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    script = Script([reply(status, error_body("server_error", 9000), {"Retry-After": "61"})])
+    _patch(monkeypatch, script)
+    clock = FakeClock()
+    with pytest.raises(ApiError) as raised:
+        Hushscript(TOKEN, base_url="http://127.0.0.1:4010", clock=clock).balance()
+    assert (raised.value.status, raised.value.retry_after) == (status, 61)
+    assert clock.sleeps == []
+    assert script.calls == 1
+
+
+def test_a_body_that_fails_after_the_headers_is_a_network_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Script([failing_body(httpx.ReadTimeout("slow"))])
+    _patch(monkeypatch, script)
+    with pytest.raises(NetworkError):
+        Hushscript(TOKEN, base_url="http://127.0.0.1:4010", clock=FakeClock()).balance()
+    assert script.calls == 4

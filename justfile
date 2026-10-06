@@ -14,15 +14,18 @@ sandbox := "--rm --init --label sdk.test=1 --cap-drop ALL --read-only --security
 floor := "3.11"
 latest := "3.14"
 
-# unit tests with coverage on Python 3.11 (default) or 3.14; no network beyond the mock
+# unit tests with coverage on Python 3.11 (default) or 3.14; no network beyond the mock; reads fixtures from CONFORMANCE_DIR (default ../hushscript-sdk-conformance)
 test version=floor:
     #!/usr/bin/env bash
     set -euo pipefail
     {{ if version == "3.11" { "" } else if version == "3.14" { "" } else { error("version must be 3.11 or 3.14") } }}
     export PYTHON_VERSION={{version}}
     trap 'docker compose down --remove-orphans >/dev/null 2>&1 || true' EXIT
+    # The tests read the conformance repo's fixtures (hint-rendering.json); the checkout is
+    # CONFORMANCE_DIR, or the sibling hushscript-sdk-conformance repository.
+    extra=(-v "$(realpath "${CONFORMANCE_DIR:-../hushscript-sdk-conformance}")":/conformance:ro -e CONFORMANCE_DIR=/conformance)
     docker compose build mock test
-    docker compose run --rm test
+    docker compose run --rm ${extra[@]+"${extra[@]}"} test
 
 # mutmut on the transport and retry modules (nightly)
 mutation version=floor:

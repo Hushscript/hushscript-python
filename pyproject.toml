@@ -87,17 +87,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"src/hushscript/_errors.py" = [
-  # Spec 9.2 names the class PermissionError; the shadow is confined to this package's namespace.
-  "A001",
-]
-"src/hushscript/__init__.py" = [
-  # Re-exports PermissionError under the spec 9.2 name.
-  "A004",
-]
 "tests/**" = [
-  # Imports the spec 9.2 PermissionError under its own name.
-  "A004",
   # pytest idiom.
   "S101",
   # Literal status codes and counts are the assertions.
@@ -192,6 +182,7 @@ also_copy = ["src/hushscript/"]
 pytest_add_cli_args_test_selection = [
   "tests/test_retry.py",
   "tests/test_transport.py",
+  "tests/test_transport_sent.py",
   "tests/test_pacing.py",
   "tests/test_client.py",
 ]

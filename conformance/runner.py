@@ -27,6 +27,10 @@ if TYPE_CHECKING:
 
 Json = Any
 
+# Scenarios of the pinned conformance tag still name the spec 9.2 class PermissionError (R12 renamed
+# it PermissionDeniedError); drop this once the pin moves past the rename.
+CLASS_ALIASES = {"PermissionError": "PermissionDeniedError"}
+
 
 class VirtualClock:
     """Time that moves only when the SDK sleeps; the mock's clock is moved by the same amount."""
@@ -122,7 +126,8 @@ def check_error(expected: Json, error: BaseException) -> list[str]:
     problems = _check_fields(expected, error)
     class_name = expected.get("class")
     if class_name is not None:
-        klass = getattr(hushscript, class_name, None)
+        wanted_class: str = CLASS_ALIASES.get(class_name) or class_name
+        klass = getattr(hushscript, wanted_class, None)
         if klass is None or not isinstance(error, klass):
             problems.append(f"class: expected {class_name}, got {type(error).__name__}")
     if "details" in expected:

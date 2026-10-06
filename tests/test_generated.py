@@ -112,6 +112,18 @@ def test_generator_declares_a_missing_path_parameter() -> None:
     assert spec["paths"]["/v1/x/{id}"]["post"]["parameters"][0]["name"] == "id"
 
 
-def test_the_claim_operation_is_in_the_generated_client() -> None:
-    claim = ROOT / "src" / "hushscript" / "generated" / "api" / "default" / "claim_agent_account.py"
-    assert claim.is_file()
+def test_every_operation_of_the_spec_is_generated() -> None:
+    operation_ids = sorted(
+        operation["operationId"]
+        for item in SPEC["paths"].values()
+        for method, operation in item.items()
+        if method in HTTP_METHODS
+    )
+    generated = sorted(
+        path.stem
+        for path in (ROOT / "src" / "hushscript" / "generated" / "api" / "default").glob("*.py")
+        if path.stem != "__init__"
+    )
+    assert len(operation_ids) == 38
+    assert generated == operation_ids
+    assert "claim_agent_account" in generated

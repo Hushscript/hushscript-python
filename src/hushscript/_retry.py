@@ -18,7 +18,9 @@ BACKOFF_BASE: Final = 0.5
 TOO_MANY_ACTIVE_JOBS: Final = "too_many_active_jobs"
 TOO_MANY_REQUESTS: Final = 429
 
-_NOT_SENT: Final = (httpx.ConnectError, httpx.ConnectTimeout)
+# Spec 7.4: only DNS, connect, TLS-handshake and pool-wait failures happen before the request body
+# is written; httpx maps the first three to ConnectError/ConnectTimeout. Everything else is "sent".
+_NOT_SENT: Final = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 
 class NetworkRetry(enum.Enum):
@@ -55,28 +57,49 @@ _POLICIES: Final = {
     RetryClass.MUTATE: RetryPolicy(frozenset(), NetworkRetry.BEFORE_SENT),
 }
 
+CLAIM: Final = "claim"
+ROTATE: Final = "rotate"
+SIGNUP: Final = "signup"
+
 _JOB: Final = r"/v1/uploads/[^/]+"
+# (method, path, class, name of a route whose lost response needs its own hint)
 _ROUTES: Final = (
-    ("POST", re.compile(rf"^{_JOB}/heartbeat$"), RetryClass.SAFE),
-    ("PUT", re.compile(rf"^{_JOB}/parts/[^/]+$"), RetryClass.PART),
-    ("POST", re.compile(rf"^{_JOB}/complete$"), RetryClass.COMPLETE),
-    ("POST", re.compile(r"^/v1/uploads$"), RetryClass.CREATE),
-    ("POST", re.compile(r"^/v1/billing/(purchase|setup-session)$"), RetryClass.PURCHASE),
-    ("POST", re.compile(r"^/v1/agent/accounts/[^/]+/claim$"), RetryClass.NEVER),
-    ("POST", re.compile(r"^/v1/agent/credentials/rotate$"), RetryClass.NEVER),
-    ("POST", re.compile(r"^/v1/agent/accounts$"), RetryClass.NEVER),
+    ("POST", re.compile(rf"^{_JOB}/heartbeat$"), RetryClass.SAFE, None),
+    ("PUT", re.compile(rf"^{_JOB}/parts/[^/]+$"), RetryClass.PART, None),
+    ("POST", re.compile(rf"^{_JOB}/complete$"), RetryClass.COMPLETE, None),
+    ("POST", re.compile(r"^/v1/uploads$"), RetryClass.CREATE, None),
+    ("POST", re.compile(r"^/v1/billing/(purchase|setup-session)$"), RetryClass.PURCHASE, None),
+    ("POST", re.compile(r"^/v1/agent/accounts/[^/]+/claim$"), RetryClass.NEVER, CLAIM),
+    ("POST", re.compile(r"^/v1/agent/credentials/rotate$"), RetryClass.NEVER, ROTATE),
+    ("POST", re.compile(r"^/v1/agent/accounts$"), RetryClass.NEVER, SIGNUP),
 )
 
 
-def classify(method: str, path: str) -> RetryClass:
-    """The spec 7.2 operation class of a request."""
+def _route(method: str, path: str) -> tuple[RetryClass, str | None] | None:
     verb = method.upper()
-    if verb in {"GET", "HEAD", "OPTIONS"}:
-        return RetryClass.SAFE
-    for route_method, pattern, retry_class in _ROUTES:
+    for route_method, pattern, retry_class, name in _ROUTES:
         if verb == route_method and pattern.match(path.rstrip("/") or "/"):
-            return retry_class
-    return RetryClass.MUTATE
+            return retry_class, name
+    return None
+
+
+def classify(method: str, path: str) -> RetryClass:
+    """The spec 7.2 operation class of a request; `path` is relative to the base URL."""
+    route = _route(method, path)
+    if route is not None:
+        return route[0]
+    return RetryClass.SAFE if method.upper() in {"GET", "HEAD", "OPTIONS"} else RetryClass.MUTATE
+
+
+def unrecoverable_route(method: str, path: str) -> str | None:
+    """`claim`, `rotate` or `signup` when the request is one of the spec 7.4 routes, else None."""
+    route = _route(method, path)
+    return None if route is None else route[1]
+
+
+def is_not_sent(failure: httpx.TransportError) -> bool:
+    """True when the failure happened before the request body was written (spec 7.4)."""
+    return isinstance(failure, _NOT_SENT)
 
 
 def policy_for(retry_class: RetryClass) -> RetryPolicy:
@@ -112,21 +135,32 @@ def _after_failure(
 ) -> Decision:
     if policy.network is NetworkRetry.NONE:
         return STOP
-    if policy.network is NetworkRetry.BEFORE_SENT and not isinstance(failure, _NOT_SENT):
+    if policy.network is NetworkRetry.BEFORE_SENT and not is_not_sent(failure):
         return STOP
     return Decision(retry=True, delay=backoff_delay(attempt, rng))
 
 
-def _after_create_rate_limit(attempt: int, outcome: Outcome) -> Decision:
+RATE_LIMITED: Final = "rate_limited"
+ACTIVE_JOBS: Final = "active_jobs"
+
+
+def create_limit_kind(retry_class: RetryClass, outcome: Outcome) -> str | None:
+    """The 429 schedule (spec 7.5) a response belongs to: `active_jobs`, `rate_limited` or None."""
+    if retry_class is not RetryClass.CREATE or outcome.status != TOO_MANY_REQUESTS:
+        return None
+    return ACTIVE_JOBS if outcome.slug == TOO_MANY_ACTIVE_JOBS else RATE_LIMITED
+
+
+def _after_create_rate_limit(own_429: int, outcome: Outcome) -> Decision:
     if outcome.slug == TOO_MANY_ACTIVE_JOBS:
         return Decision(retry=True, delay=ACTIVE_JOBS_WAIT)
-    if attempt >= len(CREATE_RATE_LIMIT_BACKOFF):
+    if own_429 >= len(CREATE_RATE_LIMIT_BACKOFF):
         return STOP
-    return Decision(retry=True, delay=CREATE_RATE_LIMIT_BACKOFF[attempt])
+    return Decision(retry=True, delay=CREATE_RATE_LIMIT_BACKOFF[own_429])
 
 
 def _after_response(
-    retry_class: RetryClass, attempt: int, outcome: Outcome, rng: random.Random
+    retry_class: RetryClass, attempt: int, own_429: int, outcome: Outcome, rng: random.Random
 ) -> Decision:
     if outcome.status is None or outcome.status not in policy_for(retry_class).statuses:
         return STOP
@@ -134,26 +168,38 @@ def _after_response(
         if outcome.retry_after > MAX_RETRY_AFTER:
             return STOP
         return Decision(retry=True, delay=outcome.retry_after)
-    if retry_class is RetryClass.CREATE and outcome.status == TOO_MANY_REQUESTS:
-        return _after_create_rate_limit(attempt, outcome)
+    if create_limit_kind(retry_class, outcome) is not None:
+        return _after_create_rate_limit(own_429, outcome)
     return Decision(retry=True, delay=backoff_delay(attempt, rng))
 
 
-def decide(
+def _exhausted(
+    retry_class: RetryClass, attempt: int, own_429: int, max_retries: int, outcome: Outcome
+) -> bool:
+    if create_limit_kind(retry_class, outcome) == ACTIVE_JOBS:
+        # Spec 7.5: ten tries whatever max_retries says, counted over active-jobs 429s only; only
+        # max_retries=0 turns this off.
+        return max_retries == 0 or own_429 >= ACTIVE_JOBS_RETRIES
+    cap = policy_for(retry_class).cap
+    return attempt >= (max_retries if cap is None else min(max_retries, cap))
+
+
+def decide(  # the attempt counters are separate on purpose (spec 7.2)
     retry_class: RetryClass,
     attempt: int,
     max_retries: int,
     outcome: Outcome,
     rng: random.Random,
+    own_429: int | None = None,
 ) -> Decision:
-    """Whether to try again after attempt number `attempt` (0 is the first) and how long to wait."""
-    policy = policy_for(retry_class)
-    budget = max_retries if policy.cap is None else min(max_retries, policy.cap)
-    if retry_class is RetryClass.CREATE and outcome.slug == TOO_MANY_ACTIVE_JOBS:
-        # Spec 7.5: ten tries whatever max_retries says; only max_retries=0 turns this off.
-        budget = 0 if max_retries == 0 else ACTIVE_JOBS_RETRIES
-    if attempt >= budget:
+    """Whether to try again after attempt number `attempt` (0 is the first) and how long to wait.
+
+    `own_429` is how many earlier responses were 429s of the same schedule as this one; the 429
+    schedules count only those, not retries of other kinds. It defaults to `attempt`.
+    """
+    own = attempt if own_429 is None else own_429
+    if _exhausted(retry_class, attempt, own, max_retries, outcome):
         return STOP
     if outcome.failure is not None:
-        return _after_failure(policy, attempt, outcome.failure, rng)
-    return _after_response(retry_class, attempt, outcome, rng)
+        return _after_failure(policy_for(retry_class), attempt, outcome.failure, rng)
+    return _after_response(retry_class, attempt, own, outcome, rng)

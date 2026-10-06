@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-import builtins
+import json
+import os
+from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
 
+import hushscript
 from conftest import TOKEN
 from helpers import error_body
 from hushscript import (
@@ -22,7 +26,7 @@ from hushscript import (
     NotFoundError,
     OutcomeUnknownError,
     PaymentMethodRequiredError,
-    PermissionError,
+    PermissionDeniedError,
     PreflightError,
     RateLimitError,
     ResumeMismatchError,
@@ -60,9 +64,9 @@ def response(
     [
         ("unauthorized", 2000, 401, AuthenticationError),
         ("agent_claim_invalid", 4036, 401, AuthenticationError),
-        ("pat_scope_missing", 2023, 403, PermissionError),
-        ("pat_purchase_requires_app", 4021, 403, PermissionError),
-        ("country_restricted", 2011, 403, PermissionError),
+        ("pat_scope_missing", 2023, 403, PermissionDeniedError),
+        ("pat_purchase_requires_app", 4021, 403, PermissionDeniedError),
+        ("country_restricted", 2011, 403, PermissionDeniedError),
         ("insufficient_balance", 3001, 402, InsufficientBalanceError),
         ("org_plan_frozen", 4025, 402, InsufficientBalanceError),
         ("not_found", 4000, 404, NotFoundError),
@@ -223,7 +227,7 @@ def test_raise_for_response_ignores_success_and_raises_otherwise() -> None:
 def test_render_hint_drops_sentences_with_unfilled_placeholders() -> None:
     assert render_hint("no_such_slug") is None
     assert render_hint("insufficient_balance") == 'Buy a pack with hs.buy("300min") or in the app.'
-    assert render_hint("rate_limited") == "Too many requests"
+    assert render_hint("rate_limited") == "Too many requests."
     assert render_hint("config_invalid") == "(message carries the specific reason)"
     assert render_hint("daily_limit") is None
     daily = {"used_today_seconds": 3599, "max_daily_seconds": 36000}
@@ -249,13 +253,81 @@ def test_render_hint_drops_sentences_with_unfilled_placeholders() -> None:
     )
 
 
+CAPPED = "This account has used its 3 purchase attempts for the last 24 hours."
+
+
+@pytest.mark.parametrize(
+    ("code", "details", "retry_after", "expected"),
+    [
+        ("rate_limited", {}, None, "Too many requests."),
+        ("agent_purchase_capped", {}, None, CAPPED),
+        ("agent_purchase_capped", {}, 3600, f"{CAPPED} Try again in 3600 s."),
+        (
+            "agent_purchase_capped",
+            {"retry_after_seconds": 90},
+            None,
+            f"{CAPPED} Try again in 90 s.",
+        ),
+        (
+            "too_many_active_jobs",
+            {},
+            None,
+            "50 jobs are already in progress. Wait for some to finish.",
+        ),
+        (
+            "pat_scope_missing",
+            {},
+            None,
+            (
+                "Create a token that includes it. For billing, also turn on"
+                ' "Let connected apps buy minutes" in the app under Account \u2192 Connected apps.'
+            ),
+        ),
+        ("agent_pack_locked", {}, None, None),
+        (
+            "policy_version_stale",
+            {"current_version": "v2"},
+            None,
+            "Accept the current terms version: v2.",
+        ),
+    ],
+)
+def test_hint_rendering_keeps_each_sentence_period_and_joins_with_a_space(
+    code: str, details: dict[str, object], retry_after: float | None, expected: str | None
+) -> None:
+    assert render_hint(code, details, retry_after) == expected
+
+
+def _conformance_hint_cases() -> list[dict[str, object]]:
+    directory = os.environ.get("CONFORMANCE_DIR")
+    assert directory, "set CONFORMANCE_DIR to a conformance checkout (just test does it for you)"
+    path = Path(directory) / "fixtures" / "hint-rendering.json"
+    cases: list[dict[str, object]] = json.loads(path.read_text(encoding="utf-8"))
+    return cases
+
+
+def test_hint_rendering_matches_the_conformance_fixture() -> None:
+    cases = _conformance_hint_cases()
+    assert len(cases) >= 30
+    mismatches: list[str] = []
+    for case in cases:
+        scope = case.get("scope")
+        details = cast("dict[str, object]", case["details"])
+        actual = render_hint(
+            str(case["slug"]), details, scope=scope if isinstance(scope, str) else None
+        )
+        if actual != case["expected"]:
+            mismatches.append(f"{case['slug']} {details}: {actual!r} != {case['expected']!r}")
+    assert not mismatches
+
+
 def test_the_error_tree_matches_spec_9_2() -> None:
     assert issubclass(PreflightError, HushscriptError)
     for preflight in (UnsupportedMediaError, FileLimitError, DailyLimitError, ResumeMismatchError):
         assert issubclass(preflight, PreflightError)
     for api in (
         AuthenticationError,
-        PermissionError,
+        PermissionDeniedError,
         InsufficientBalanceError,
         NotFoundError,
         ConflictError,
@@ -275,7 +347,8 @@ def test_the_error_tree_matches_spec_9_2() -> None:
         OutcomeUnknownError,
     ):
         assert issubclass(top, HushscriptError)
-    assert not issubclass(PermissionError, builtins.PermissionError)
+    assert PermissionDeniedError.__name__ == "PermissionDeniedError"
+    assert not hasattr(hushscript, "PermissionError")
 
 
 def test_sdk_side_errors_carry_their_own_codes_and_hints() -> None:

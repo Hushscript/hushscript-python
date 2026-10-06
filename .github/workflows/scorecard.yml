@@ -42,6 +42,7 @@ jobs:
             sigstore-tuf-root.storage.googleapis.com:443
             www.bestpractices.dev:443
             bestpractices.coreinfrastructure.org:443
+            *.blob.core.windows.net:443
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

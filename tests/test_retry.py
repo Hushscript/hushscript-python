@@ -14,8 +14,11 @@ from hushscript._retry import (
     RetryClass,
     backoff_delay,
     classify,
+    create_limit_kind,
     decide,
+    is_not_sent,
     policy_for,
+    unrecoverable_route,
 )
 
 RNG = random.Random(1)  # noqa: S311  # deterministic jitter for tests
@@ -153,6 +156,9 @@ def test_create_honors_retry_after_when_present() -> None:
         (RetryClass.PURCHASE, READ, True),
         (RetryClass.MUTATE, CONNECT, True),
         (RetryClass.MUTATE, httpx.ConnectTimeout("slow"), True),
+        (RetryClass.MUTATE, httpx.PoolTimeout("busy"), True),
+        (RetryClass.MUTATE, httpx.WriteError("reset"), False),
+        (RetryClass.NEVER, httpx.PoolTimeout("busy"), False),
         (RetryClass.MUTATE, READ, False),
         (RetryClass.MUTATE, httpx.ReadTimeout("slow"), False),
         (RetryClass.NEVER, CONNECT, False),
@@ -173,3 +179,77 @@ def test_a_missing_status_is_never_retried() -> None:
 
 def test_policy_table_covers_every_class() -> None:
     assert {policy_for(c).network for c in RetryClass} == set(NetworkRetry)
+
+
+def test_only_connection_setup_failures_count_as_not_sent() -> None:
+    assert all(
+        is_not_sent(failure)
+        for failure in (httpx.ConnectError("x"), httpx.ConnectTimeout("x"), httpx.PoolTimeout("x"))
+    )
+    assert not any(
+        is_not_sent(failure)
+        for failure in (
+            httpx.ReadError("x"),
+            httpx.WriteError("x"),
+            httpx.ReadTimeout("x"),
+            httpx.WriteTimeout("x"),
+            httpx.RemoteProtocolError("x"),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "route"),
+    [
+        ("POST", "/v1/agent/accounts/sg_1/claim", "claim"),
+        ("POST", "/v1/agent/credentials/rotate", "rotate"),
+        ("POST", "/v1/agent/accounts", "signup"),
+        ("POST", "/v1/agent/accounts/", "signup"),
+        ("POST", "/v1/billing/purchase", None),
+        ("GET", "/v1/agent/accounts", None),
+        ("POST", "/api/v1/agent/accounts", None),
+    ],
+)
+def test_unrecoverable_routes_are_named_by_the_exact_route(
+    method: str, path: str, route: str | None
+) -> None:
+    assert unrecoverable_route(method, path) == route
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+@pytest.mark.parametrize(
+    "retry_class", [RetryClass.NEVER, RetryClass.MUTATE], ids=lambda c: c.value
+)
+def test_never_and_mutate_classes_never_retry_on_a_status(
+    retry_class: RetryClass, status: int
+) -> None:
+    assert not decide(retry_class, 0, 3, Outcome(status=status), RNG).retry
+
+
+@pytest.mark.parametrize("status", [501, 505, 507, 511])
+def test_the_safe_class_retries_only_the_listed_5xx(status: int) -> None:
+    assert not decide(RetryClass.SAFE, 0, 3, Outcome(status=status), RNG).retry
+
+
+def test_create_limit_kind_tells_the_two_429_schedules_apart() -> None:
+    create = RetryClass.CREATE
+    assert create_limit_kind(create, Outcome(status=429)) == "rate_limited"
+    assert create_limit_kind(create, Outcome(status=429, slug="rate_limited")) == "rate_limited"
+    assert create_limit_kind(create, Outcome(status=429, slug="too_many_active_jobs")) == (
+        "active_jobs"
+    )
+    assert create_limit_kind(create, Outcome(status=500)) is None
+    assert create_limit_kind(RetryClass.SAFE, Outcome(status=429)) is None
+
+
+def test_the_create_schedule_counts_only_its_own_429s() -> None:
+    # Attempt 2 is the third try overall, but the first 429: it waits 15 s, not 60.
+    decision = decide(RetryClass.CREATE, 2, 5, Outcome(status=429), RNG, own_429=0)
+    assert (decision.retry, decision.delay) == (True, 15.0)
+    assert not decide(RetryClass.CREATE, 2, 5, Outcome(status=429), RNG, own_429=3).retry
+
+
+def test_the_active_jobs_budget_ignores_earlier_retries_of_other_kinds() -> None:
+    outcome = Outcome(status=429, slug="too_many_active_jobs")
+    assert decide(RetryClass.CREATE, 7, 3, outcome, RNG, own_429=8).retry
+    assert not decide(RetryClass.CREATE, 2, 3, outcome, RNG, own_429=9).retry
