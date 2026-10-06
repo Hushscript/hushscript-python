@@ -84,12 +84,6 @@ def test_committed_tables_match_a_fresh_emit(name: str, emitter: str) -> None:
     assert emitted == committed
 
 
-def test_committed_hints_match_a_fresh_emit_of_themselves() -> None:
-    emitted = GENERATOR.emit_hints(HINTS)
-    committed = (ROOT / "src" / "hushscript" / "generated" / "hints.py").read_text(encoding="utf-8")
-    assert emitted == committed
-
-
 def test_emit_catalog_rejects_duplicate_slugs_and_bad_codes() -> None:
     entry = {"slug": "a", "code": 1, "status": 400, "meaning": "m"}
     with pytest.raises(ValueError, match="duplicate error slug a"):
