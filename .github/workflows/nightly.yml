@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   mutation:
-    name: mutation (stryker)
+    name: mutation (mutmut)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -31,7 +31,10 @@ jobs:
             registry-1.docker.io:443
             auth.docker.io:443
             production.cloudflare.docker.com:443
-            registry.npmjs.org:443
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
+            pypi.org:443
+            files.pythonhosted.org:443
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,7 +45,7 @@ jobs:
         run: just mutation
 
   fuzz:
-    name: property tests at 10x iterations
+    name: property tests at 10x examples
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -61,16 +64,19 @@ jobs:
             registry-1.docker.io:443
             auth.docker.io:443
             production.cloudflare.docker.com:443
-            registry.npmjs.org:443
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
+            pypi.org:443
+            files.pythonhosted.org:443
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install just
         uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
-      - name: Run unit tests with 10x fast-check iterations
+      - name: Run unit tests with the nightly Hypothesis profile
         env:
-          FC_RUNS_FACTOR: "10"
+          HYPOTHESIS_PROFILE: nightly
         run: just test
 
   smoke:
@@ -94,7 +100,10 @@ jobs:
             registry-1.docker.io:443
             auth.docker.io:443
             production.cloudflare.docker.com:443
-            registry.npmjs.org:443
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
+            pypi.org:443
+            files.pythonhosted.org:443
             api.hushscript.com:443
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

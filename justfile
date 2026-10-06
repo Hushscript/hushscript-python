@@ -98,6 +98,20 @@ build version=floor:
       sh -c 'uv pip install --python /opt/venv/bin/python --target /tmp/site --no-deps --offline /dist/*.whl \
         && PYTHONPATH=/tmp/site timeout 60 /opt/venv/bin/python -c "$0"' "$check"
 
+# release artifacts for publish.yml: the sdist and wheel in <out>/dist (twine checked) and a CycloneDX SBOM
+# of the locked runtime set in <out>/sbom.cdx.json
+dist out:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PYTHON_VERSION={{floor}}
+    docker build --quiet --target dev --build-arg PYTHON_VERSION={{floor}} -f docker/dev.Dockerfile -t "hushscript-python-dev:py{{floor}}" .
+    mkdir -p "{{out}}/dist"
+    docker run {{sandbox}} --network none --user "$(id -u):$(id -g)" -v "$(realpath "{{out}}")":/out "hushscript-python-dev:py{{floor}}" \
+      sh -c 'timeout 600 uv build --no-build-isolation --offline --out-dir /out/dist \
+        && timeout 120 twine check --strict /out/dist/* \
+        && uv export --frozen --no-dev --no-emit-project --no-hashes --no-header > /tmp/requirements.txt \
+        && timeout 120 cyclonedx-py requirements --of JSON --output-file /out/sbom.cdx.json /tmp/requirements.txt'
+
 # regenerate openapi.json and src/hushscript/generated from the production spec, or from a local spec file (outbound network)
 regen spec="":
     #!/usr/bin/env bash
