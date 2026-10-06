@@ -81,7 +81,7 @@ jobs:
     permissions:
       contents: read
       id-token: write # the Sigstore certificate is bound to this job's OIDC identity
-      attestations: write
+      attestations: write # stores the provenance attestation on the repository
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
