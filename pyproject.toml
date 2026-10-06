@@ -27,7 +27,6 @@ dependencies = [
   "httpx>=0.28.1,<0.29",
   "mutagen>=1.47,<2",
   "attrs>=23.2",
-  "python-dateutil>=2.8.2,<3",
 ]
 
 [project.urls]
@@ -52,7 +51,6 @@ dev = [
   "twine==7.0.0",
   "hatchling==1.32.4",
   "cyclonedx-bom==7.5.0",
-  "types-python-dateutil==2.9.0.20260807",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -75,6 +73,8 @@ ignore = [
   # Formatter conflicts, the two rules ruff itself warns about.
   "COM812",
   "ISC001",
+  # Files carry no per-file copyright header; LICENSE at the repository root covers them.
+  "CPY001",
   # TODO comments and their issue-link format are not enforced in this repository.
   "TD002",
   "TD003",
@@ -96,6 +96,8 @@ ignore = [
   "A004",
 ]
 "tests/**" = [
+  # Imports the spec 9.2 PermissionError under its own name.
+  "A004",
   # pytest idiom.
   "S101",
   # Literal status codes and counts are the assertions.
@@ -117,6 +119,11 @@ ignore = [
   "S603",
   "S607",
 ]
+"smoke/**" = [
+  "INP001",
+  # The smoke script reports on stdout.
+  "T201",
+]
 "conformance/**" = [
   "INP001",
   "T201",
@@ -134,7 +141,7 @@ max-args = 8
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src", "tests", "scripts", "conformance"]
+files = ["src", "tests", "scripts", "conformance", "smoke"]
 cache_dir = "/tmp/mypy-cache"
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
@@ -148,7 +155,7 @@ ignore_errors = true
 [tool.basedpyright]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
-include = ["src", "tests", "scripts", "conformance"]
+include = ["src", "tests", "scripts", "conformance", "smoke"]
 exclude = ["src/hushscript/generated"]
 reportMissingTypeStubs = false
 
@@ -170,7 +177,8 @@ skip_covered = false
 exclude_also = ["if TYPE_CHECKING:", "@overload", "\\.\\.\\."]
 
 [tool.deptry]
-extend_exclude = ["build", "src/hushscript/generated"]
+extend_exclude = ["build"]
+known_first_party = ["hushscript"]
 
 [tool.deptry.per_rule_ignores]
 # Used by the transcribe pipeline (duration probe) that lands after the core client.

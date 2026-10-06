@@ -1,0 +1,8 @@
+# openapi-python-client settings; scripts/generate.py passes this file.
+project_name_override: hushscript
+package_name_override: generated
+use_path_prefixes_for_title_model_names: false
+literal_enums: true
+post_hooks:
+  - "ruff check --isolated --select F401,I001 --fix-only ."
+  - "ruff format --isolated ."
