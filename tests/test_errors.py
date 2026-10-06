@@ -118,9 +118,7 @@ def test_extra_body_keys_become_details_and_nested_details_merge() -> None:
     )
     error = error_from_response(response(403, body))
     assert error.details == {"needed_seconds": 21, "allowed_packs": ["45min", "300min"]}
-    assert (
-        error.hint == "New agent accounts can buy 45min and 300min until earlier purchases settle."
-    )
+    assert error.hint == "New agent accounts can buy 45min, 300min until earlier purchases settle."
 
 
 def test_a_scalar_details_value_is_kept_under_its_own_key() -> None:
@@ -161,7 +159,8 @@ def test_a_response_without_a_request_has_no_scope() -> None:
     bare = httpx.Response(403, json=error_body("pat_scope_missing", 2023))
     error = error_from_response(bare)
     assert error.hint is not None
-    assert "{scope}" in error.hint
+    assert "{" not in error.hint
+    assert error.hint.startswith("Create a token that includes it.")
 
 
 def test_insufficient_balance_hint_reads_minutes_from_the_details() -> None:
@@ -221,10 +220,22 @@ def test_raise_for_response_ignores_success_and_raises_otherwise() -> None:
         raise_for_response(response(404, error_body("not_found", 4000)))
 
 
-def test_render_hint_leaves_unknown_slugs_and_unfilled_placeholders_alone() -> None:
+def test_render_hint_drops_sentences_with_unfilled_placeholders() -> None:
     assert render_hint("no_such_slug") is None
-    assert render_hint("insufficient_balance") == (
-        "Not enough minutes: {needed} needed, {balance} available."
+    assert render_hint("insufficient_balance") == 'Buy a pack with hs.buy("300min") or in the app.'
+    assert render_hint("rate_limited") == "Too many requests"
+    assert render_hint("config_invalid") == "(message carries the specific reason)"
+    assert render_hint("daily_limit") is None
+    daily = {"used_today_seconds": 3599, "max_daily_seconds": 36000}
+    assert render_hint("daily_limit", daily) == (
+        "This upload would pass your daily transcription limit"
+        " (59 of 600 min used in the last 24 h)."
+    )
+    assert render_hint("insufficient_balance", {"needed_seconds": 61, "balance_seconds": 119}) == (
+        'Not enough minutes: 2 needed, 1 available. Buy a pack with hs.buy("300min") or in the app.'
+    )
+    assert render_hint("insufficient_balance", {"needed_seconds": 60, "balance_seconds": -1}) == (
+        "Not enough minutes: 1 needed, -1 available."
         ' Buy a pack with hs.buy("300min") or in the app.'
     )
     assert render_hint("daily_limit", {"used": 3, "max": 10}) == (
@@ -233,7 +244,9 @@ def test_render_hint_leaves_unknown_slugs_and_unfilled_placeholders_alone() -> N
     assert render_hint("agent_pack_locked", {"allowed_packs": ["45min"]}) == (
         "New agent accounts can buy 45min until earlier purchases settle."
     )
-    assert render_hint("rate_limited", retry_after=2.5) is not None
+    assert render_hint("rate_limited", retry_after=2.5) == (
+        "Too many requests. The SDK already waited and retried; slow down or try again in 3 s."
+    )
 
 
 def test_the_error_tree_matches_spec_9_2() -> None:
@@ -294,7 +307,6 @@ def test_str_carries_the_hint_and_message_stays_plain() -> None:
 
 
 def test_a_boolean_detail_fills_a_hint_placeholder() -> None:
-    assert render_hint("rate_limited", {"retry_after": True}) is not None
     assert render_hint("policy_version_stale", {"current_version": True}) == (
         "Accept the current terms version: true."
     )
@@ -304,3 +316,9 @@ def test_repr_and_str() -> None:
     error = error_from_response(response(404, error_body("not_found", 4000)))
     assert str(error) == error.message
     assert repr(error).startswith("NotFoundError(code='not_found', status=404")
+
+
+def test_details_keys_are_snake_cased_recursively() -> None:
+    body = error_body("bad_request", 1000, neededSeconds=1, nested={"innerKey": [{"deepKey": 2}]})
+    error = error_from_response(response(400, body))
+    assert error.details == {"needed_seconds": 1, "nested": {"inner_key": [{"deep_key": 2}]}}

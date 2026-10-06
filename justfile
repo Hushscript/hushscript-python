@@ -108,6 +108,7 @@ dist out:
     mkdir -p "{{out}}/dist"
     docker run {{sandbox}} --network none --user "$(id -u):$(id -g)" -v "$(realpath "{{out}}")":/out "hushscript-python-dev:py{{floor}}" \
       sh -c 'timeout 600 uv build --no-build-isolation --offline --out-dir /out/dist \
+        && rm -f /out/dist/.gitignore \
         && timeout 120 twine check --strict /out/dist/* \
         && uv export --frozen --no-dev --no-emit-project --no-hashes --no-header > /tmp/requirements.txt \
         && timeout 120 cyclonedx-py requirements --of JSON --output-file /out/sbom.cdx.json /tmp/requirements.txt'

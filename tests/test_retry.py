@@ -133,9 +133,12 @@ def test_create_backs_off_15_30_60_on_a_429_without_retry_after() -> None:
     ]
 
 
-def test_create_leaves_too_many_active_jobs_to_the_caller() -> None:
+def test_create_retries_too_many_active_jobs_nine_times_whatever_max_retries_says() -> None:
     outcome = Outcome(status=429, slug="too_many_active_jobs")
-    assert not decide(RetryClass.CREATE, 0, 3, outcome, RNG).retry
+    decisions = [decide(RetryClass.CREATE, n, 1, outcome, RNG) for n in range(11)]
+    assert [d.retry for d in decisions] == [True] * 9 + [False, False]
+    assert {d.delay for d in decisions[:9]} == {30.0}
+    assert not decide(RetryClass.CREATE, 0, 0, outcome, RNG).retry
 
 
 def test_create_honors_retry_after_when_present() -> None:

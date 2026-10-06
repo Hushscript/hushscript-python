@@ -129,11 +129,19 @@ def test_create_backs_off_15_30_60_without_a_retry_after() -> None:
     assert script.calls == 4
 
 
-def test_create_returns_too_many_active_jobs_without_retrying() -> None:
+def test_create_waits_30_seconds_ten_tries_on_too_many_active_jobs() -> None:
     script, clock = Script([reply(429, error_body("too_many_active_jobs", 5001))]), FakeClock()
-    with sync_client(script, clock) as client:
+    with sync_client(script, clock, max_retries=1) as client:
         response = client.post("/v1/uploads", json={})
     assert response.json()["error"] == "too_many_active_jobs"
+    assert script.calls == 10
+    assert clock.sleeps == [30.0] * 9
+
+
+def test_max_retries_zero_disables_the_active_jobs_wait() -> None:
+    script = Script([reply(429, error_body("too_many_active_jobs", 5001))])
+    with sync_client(script, FakeClock(), max_retries=0) as client:
+        client.post("/v1/uploads", json={})
     assert script.calls == 1
 
 
@@ -268,4 +276,4 @@ async def test_async_network_errors_and_create_pacing() -> None:
     active = Script([reply(429, error_body("too_many_active_jobs", 5001))])
     async with async_client(active, FakeClock()) as client:
         await client.post("/v1/uploads", json={})
-    assert active.calls == 1
+    assert active.calls == 10

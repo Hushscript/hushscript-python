@@ -148,9 +148,10 @@ enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
 [[tool.mypy.overrides]]
 module = "hushscript.generated.*"
-# Spec 13.2: mypy and basedpyright check src/ without generated/. The generated package is still
-# imported and its signatures are used by the typed client code.
-ignore_errors = true
+# Generated code is type checked under strict like the rest (spec 13.2: not excluded from type
+# checking). The one relaxation: the generator emits isinstance branches on declared unions that
+# mypy proves unreachable (models/job.py).
+warn_unreachable = false
 
 [tool.basedpyright]
 pythonVersion = "3.11"
@@ -185,6 +186,12 @@ known_first_party = ["hushscript"]
 DEP002 = ["mutagen"]
 
 [tool.mutmut]
-paths_to_mutate = ["src/hushscript/_retry.py", "src/hushscript/_pacing.py", "src/hushscript/_http.py"]
-tests_dir = ["tests/"]
-also_copy = ["scripts/"]
+source_paths = ["src/hushscript/_retry.py", "src/hushscript/_pacing.py", "src/hushscript/_http.py"]
+# The mutated modules import their siblings, so the whole package is copied next to them.
+also_copy = ["src/hushscript/"]
+pytest_add_cli_args_test_selection = [
+  "tests/test_retry.py",
+  "tests/test_transport.py",
+  "tests/test_pacing.py",
+  "tests/test_client.py",
+]

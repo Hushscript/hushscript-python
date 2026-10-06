@@ -25,6 +25,27 @@ def _camel(key: str) -> str:
     return head + "".join(part[:1].upper() + part[1:] for part in rest)
 
 
+def _snake(key: str) -> str:
+    return re.sub(r"(?<=[a-z0-9])([A-Z])", lambda match: "_" + match.group(1).lower(), key)
+
+
+def _snake_keys(value: object) -> object:
+    """Spec 9.3: details keys follow the language convention (snake_case here), recursively."""
+    mapping = as_dict(value)
+    if mapping is not None:
+        return {_snake(key): _snake_keys(item) for key, item in mapping.items()}
+    items = as_list(value)
+    if items is not None:
+        return [_snake_keys(item) for item in items]
+    return value
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
 def _format_number(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else str(value)
 
@@ -36,27 +57,31 @@ def _format_context_value(value: object) -> str:
         return _format_number(value)
     items = as_list(value)
     if items is not None:
-        names = [str(item) for item in items]
-        if len(names) > 1:
-            return f"{', '.join(names[:-1])} and {names[-1]}"
-        return "".join(names)
+        return ", ".join(str(item) for item in items)
     return str(value)
+
+
+def _minutes(details: Mapping[str, object], keys: tuple[str, ...], *, up: bool) -> str | None:
+    for key in keys:
+        seconds = _number(details.get(key))
+        if seconds is not None:
+            return str(math.ceil(seconds / 60) if up else math.floor(seconds / 60))
+    return None
 
 
 def _hint_context(
     details: Mapping[str, object], retry_after: float | None, scope: str | None
 ) -> dict[str, str]:
     context = {_camel(key): _format_context_value(value) for key, value in details.items()}
-    needed = details.get("needed_seconds")
-    if isinstance(needed, (int, float)) and not isinstance(needed, bool):
-        context["needed"] = str(math.ceil(needed / 60))
-    available = details.get("balance_seconds")
-    if isinstance(available, (int, float)) and not isinstance(available, bool):
-        context["balance"] = str(int(available / 60))
-    if retry_after is not None:
-        context["retryAfter"] = _format_number(retry_after)
-    if scope is not None:
-        context["scope"] = scope
+    derived = {
+        "needed": _minutes(details, ("needed_seconds",), up=True),
+        "balance": _minutes(details, ("balance_seconds",), up=False),
+        "used": _minutes(details, ("used_seconds", "used_today_seconds"), up=False),
+        "max": _minutes(details, ("max_seconds", "max_daily_seconds"), up=False),
+        "retryAfter": None if retry_after is None else str(math.ceil(retry_after)),
+        "scope": scope,
+    }
+    context.update({name: value for name, value in derived.items() if value is not None})
     return context
 
 
@@ -66,11 +91,17 @@ def render_hint(
     retry_after: float | None = None,
     scope: str | None = None,
 ) -> str | None:
+    """Spec 9.3 rendering: a sentence with an unfilled placeholder is dropped, none left is None."""
     template = HINTS.get(code)
     if template is None:
         return None
     context = _hint_context(details or {}, retry_after, scope)
-    return _PLACEHOLDER.sub(lambda match: context.get(match.group(1), match.group(0)), template)
+    kept = [
+        _PLACEHOLDER.sub(lambda match: context[match.group(1)], sentence)
+        for sentence in template.split(". ")
+        if all(name in context for name in _PLACEHOLDER.findall(sentence))
+    ]
+    return ". ".join(kept) or None
 
 
 class HushscriptError(Exception):
@@ -339,7 +370,7 @@ def error_from_response(
     if operation is None:
         operation = _operation_of(response)
     retry_after = parse_retry_after(response.headers.get("retry-after"))
-    details = as_dict(credentials.scrub_value(_extra_details(body))) or {}
+    details = as_dict(_snake_keys(credentials.scrub_value(_extra_details(body)))) or {}
     error_class = _CLASS_BY_SLUG.get(code) or _CLASS_BY_STATUS.get(status) or ApiError
     return error_class(
         credentials.scrub(message),

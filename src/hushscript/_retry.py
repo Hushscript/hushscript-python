@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Final
 
 import httpx
 
-from ._pacing import CREATE_RATE_LIMIT_BACKOFF
+from ._pacing import ACTIVE_JOBS_RETRIES, ACTIVE_JOBS_WAIT, CREATE_RATE_LIMIT_BACKOFF
 
 if TYPE_CHECKING:
     import random
@@ -117,6 +117,14 @@ def _after_failure(
     return Decision(retry=True, delay=backoff_delay(attempt, rng))
 
 
+def _after_create_rate_limit(attempt: int, outcome: Outcome) -> Decision:
+    if outcome.slug == TOO_MANY_ACTIVE_JOBS:
+        return Decision(retry=True, delay=ACTIVE_JOBS_WAIT)
+    if attempt >= len(CREATE_RATE_LIMIT_BACKOFF):
+        return STOP
+    return Decision(retry=True, delay=CREATE_RATE_LIMIT_BACKOFF[attempt])
+
+
 def _after_response(
     retry_class: RetryClass, attempt: int, outcome: Outcome, rng: random.Random
 ) -> Decision:
@@ -127,9 +135,7 @@ def _after_response(
             return STOP
         return Decision(retry=True, delay=outcome.retry_after)
     if retry_class is RetryClass.CREATE and outcome.status == TOO_MANY_REQUESTS:
-        if outcome.slug == TOO_MANY_ACTIVE_JOBS or attempt >= len(CREATE_RATE_LIMIT_BACKOFF):
-            return STOP
-        return Decision(retry=True, delay=CREATE_RATE_LIMIT_BACKOFF[attempt])
+        return _after_create_rate_limit(attempt, outcome)
     return Decision(retry=True, delay=backoff_delay(attempt, rng))
 
 
@@ -143,6 +149,9 @@ def decide(
     """Whether to try again after attempt number `attempt` (0 is the first) and how long to wait."""
     policy = policy_for(retry_class)
     budget = max_retries if policy.cap is None else min(max_retries, policy.cap)
+    if retry_class is RetryClass.CREATE and outcome.slug == TOO_MANY_ACTIVE_JOBS:
+        # Spec 7.5: ten tries whatever max_retries says; only max_retries=0 turns this off.
+        budget = 0 if max_retries == 0 else ACTIVE_JOBS_RETRIES
     if attempt >= budget:
         return STOP
     if outcome.failure is not None:
