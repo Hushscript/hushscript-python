@@ -1,0 +1,132 @@
+name: hushscript-python
+
+x-hardening: &hardening
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  mem_limit: 4g
+  pids_limit: 512
+  labels:
+    sdk.test: "1"
+
+x-dev-build: &dev-build
+  context: .
+  dockerfile: docker/dev.Dockerfile
+  target: dev
+  args:
+    PYTHON_VERSION: ${PYTHON_VERSION:?set by the justfile}
+
+x-dev: &dev
+  <<: *hardening
+  build: *dev-build
+  image: hushscript-python-dev:py${PYTHON_VERSION:?set by the justfile}
+  working_dir: /work
+
+# Every path a tool writes to, because the root filesystem is read-only. Caches are pointed at /tmp
+# in docker/dev.Dockerfile; the rest are directories the tools insist on.
+x-scratch: &scratch
+  - /tmp
+  - /work/mutants
+  - /work/build
+
+x-sandboxed: &sandboxed
+  <<: *dev
+  network_mode: "service:mock"
+  depends_on:
+    mock:
+      condition: service_healthy
+  tmpfs: *scratch
+
+services:
+  # The mock API every container below shares a network namespace with. Its network is internal,
+  # so the SDK reaches it at http://127.0.0.1:4010 and nothing else.
+  mock:
+    <<: *hardening
+    build:
+      context: ${CONFORMANCE_CONTEXT:-https://github.com/Hushscript/hushscript-sdk-conformance.git#v0.1.0}
+      dockerfile: Dockerfile
+    image: hushscript-sdk-conformance-mock:pinned
+    mem_limit: 512m
+    pids_limit: 128
+    tmpfs:
+      - /tmp
+    networks:
+      - sdk
+
+  test:
+    <<: *sandboxed
+    environment:
+      HYPOTHESIS_PROFILE: ${HYPOTHESIS_PROFILE:-default}
+    command:
+      - sh
+      - -c
+      - >-
+        timeout 1800 pytest --cov --cov-report=json:/tmp/coverage.json --cov-report=term-missing
+        && python scripts/check_coverage.py /tmp/coverage.json
+
+  mutation:
+    <<: *sandboxed
+    command:
+      - sh
+      - -c
+      - >-
+        timeout 3000 mutmut run
+        && mutmut export-cicd-stats
+        && python scripts/check_mutation.py mutants/mutmut-cicd-stats.json
+
+  lint:
+    <<: *sandboxed
+    command:
+      - sh
+      - -c
+      - >-
+        timeout 300 ruff format --check .
+        && timeout 300 ruff check .
+        && timeout 600 mypy
+        && timeout 600 basedpyright
+        && timeout 300 deptry .
+
+  conformance:
+    <<: *sandboxed
+    command: ["timeout", "1800", "python", "conformance/runner.py"]
+
+  examples:
+    <<: *sandboxed
+    command:
+      - sh
+      - -c
+      - >-
+        found=0;
+        for f in examples/*.py; do
+        [ -e "$$f" ] || continue; found=1;
+        timeout 600 python "$$f" || exit 1;
+        done;
+        [ "$$found" = 1 ] || echo "no examples yet"
+
+  # Outbound network: fetches the spec and hints.json, writes openapi.json and src/hushscript/generated.
+  regen:
+    <<: *dev
+    user: "${HOST_UID:-10001}:${HOST_GID:-10001}"
+    tmpfs:
+      - /tmp
+      - /work/build
+    volumes:
+      - ./openapi.json:/work/openapi.json
+      - ./src/hushscript/generated:/work/src/hushscript/generated
+    command: ["timeout", "600", "python", "scripts/generate.py"]
+
+  # Outbound network: the one test that talks to production. Nightly only.
+  smoke:
+    <<: *dev
+    tmpfs:
+      - /tmp
+    environment:
+      HUSHSCRIPT_BASE_URL: https://api.hushscript.com
+      HUSHSCRIPT_TOKEN: ${SMOKE_TOKEN:-}
+    command: ["timeout", "300", "python", "smoke/smoke.py"]
+
+networks:
+  sdk:
+    internal: true
