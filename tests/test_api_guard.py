@@ -3,11 +3,14 @@ through it carries its idempotency key on every error after it was sent (R61).""
 
 from __future__ import annotations
 
+import importlib
 import json
+import pkgutil
 
 import httpx
 import pytest
 
+import hushscript.generated.api
 from hushscript import ApiError, HushscriptError, NetworkError
 from hushscript.generated.api.default import buy_minutes, get_account
 from hushscript.generated.models.buy_minutes_body import BuyMinutesBody
@@ -142,3 +145,17 @@ async def test_the_async_client_guards_a_purchase_the_same_way(
             await get_account.asyncio_detailed(client=hs.api)
         assert plain.value.code == "bad_response"
         assert plain.value.idempotency_key is None
+
+
+def test_every_generated_operation_module_exposes_the_parser_the_guard_runs() -> None:
+    """The guard finds `_parse_response` by module globals: a regenerated client that renames it
+    would silently turn the guard off."""
+    prefix = hushscript.generated.api.__name__ + "."
+    names = [
+        m.name
+        for m in pkgutil.walk_packages(hushscript.generated.api.__path__, prefix)
+        if not m.ispkg
+    ]
+    assert names
+    for name in names:
+        assert callable(getattr(importlib.import_module(name), "_parse_response", None)), name
