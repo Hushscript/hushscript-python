@@ -34,6 +34,24 @@ def path_size(file: FileInput) -> int | None:
     return status.st_size if stat.S_ISREG(status.st_mode) else None
 
 
+def read_full(stream: BinaryIO, length: int) -> bytes:
+    """Up to `length` bytes, reading on until they are all there or the stream ends. A raw
+    unbuffered stream (a pipe, `io.FileIO`) may return fewer bytes than asked without being at
+    its end, so one short read is not EOF."""
+    data = stream.read(length)
+    if len(data) >= length or not data:
+        return data
+    chunks = [data]
+    remaining = length - len(data)
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 class Source:
     """A file the pipeline reads in byte ranges: from a path, from memory or from a stream."""
 
@@ -108,7 +126,7 @@ class SeekableSource(Source):
     def read_range(self, offset: int, length: int) -> bytes:
         with self._lock:
             self._stream.seek(offset)
-            return self._stream.read(length)
+            return read_full(self._stream, length)
 
     def at_end(self) -> bool:
         with self._lock:
@@ -140,7 +158,7 @@ class SequentialSource(Source):
 
     def head(self) -> bytes:
         if not self._head_taken:
-            self._head = self._stream.read(min(HEAD_BYTES, self.size))
+            self._head = read_full(self._stream, min(HEAD_BYTES, self.size))
             self._head_taken = True
         return self._head
 
@@ -151,11 +169,11 @@ class SequentialSource(Source):
             )
         head = self.head()
         if offset >= len(head):
-            data = self._stream.read(length)
+            data = read_full(self._stream, length)
         else:
             data = head[offset : offset + length]
             if len(data) < length:
-                data += self._stream.read(length - len(data))
+                data += read_full(self._stream, length - len(data))
         self._position += len(data)
         return data
 
@@ -176,8 +194,12 @@ def check_size(size: object) -> None:
         )
 
 
-def make_source(file: FileInput, size: int | None = None) -> Source:
-    """Wraps a path, bytes or a binary stream. `size` is required only for a non-seekable stream."""
+def make_source(
+    file: FileInput, size: int | None = None, *, default_size: int | None = None
+) -> Source:
+    """Wraps a path, bytes or a binary stream. `size` is required only for a non-seekable stream;
+    `default_size` stands in for it there (a resume knows the size from its token) and is ignored
+    for a stream that can seek, which is measured."""
     if isinstance(file, (str, os.PathLike)):
         return PathSource(file)
     if isinstance(file, (bytes, bytearray, memoryview)):
@@ -186,6 +208,7 @@ def make_source(file: FileInput, size: int | None = None) -> Source:
     stream = file
     if stream.seekable():
         return SeekableSource(stream, size)
+    size = default_size if size is None else size
     if size is None:
         raise PreflightError(NEEDS_SIZE, code="invalid_option")
     return SequentialSource(stream, size)

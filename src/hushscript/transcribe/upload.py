@@ -13,6 +13,7 @@ from hushscript._config import PART_TIMEOUT
 from hushscript._errors import NetworkError, UploadError, raise_for_response
 from hushscript._http import CLASS_EXTENSION, LABEL_EXTENSION, STREAM_EXTENSION
 from hushscript._json import as_dict, as_list
+from hushscript._log import hiding_signed_url
 from hushscript._response import BadBodyError, parsed
 from hushscript._retry import RetryClass
 
@@ -379,7 +380,8 @@ class SyncUploader:
             "PUT", url, content=data, timeout=PART_TIMEOUTS, extensions=r2_extensions(n)
         )
         try:
-            response = client.send(request, stream=True)
+            with hiding_signed_url(f"r2:part/{n}"):
+                response = client.send(request, stream=True)
             try:
                 etag = etag_of(response)
                 if response.is_success and etag is None:

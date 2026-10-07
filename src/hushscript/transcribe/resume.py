@@ -80,7 +80,7 @@ def early_source(state: ResumeState, file: FileInput | None) -> Source | None:
         if size is not None:
             check_same_file(state, size)
         return None
-    source = make_source(file)
+    source = make_source(file, default_size=state.size)
     check_same_file(state, source.size)
     return source
 
@@ -91,7 +91,7 @@ def late_source(state: ResumeState, file: FileInput | None, source: Source | Non
         return source
     if file is None:
         raise file_required()
-    opened = make_source(file)
+    opened = make_source(file, default_size=state.size)
     check_same_file(state, opened.size)
     return opened
 

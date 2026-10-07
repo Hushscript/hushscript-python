@@ -53,10 +53,17 @@ def hs_for(
     api: FakeApi,
     clock: FakeClock | None = None,
     max_retries: int = 3,
+    log_level: str | None = None,
 ) -> Hushscript:
     monkeypatch.setattr(client_module, "_sync_inner", api.sync)
     monkeypatch.setattr(client_module, "_async_inner", api.asynchronous)
-    return Hushscript(TOKEN, base_url=BASE_URL, clock=clock or PipeClock(), max_retries=max_retries)
+    return Hushscript(
+        TOKEN,
+        base_url=BASE_URL,
+        clock=clock or PipeClock(),
+        max_retries=max_retries,
+        log_level=log_level,
+    )
 
 
 def async_hs_for(
@@ -64,9 +71,14 @@ def async_hs_for(
     api: FakeApi,
     clock: FakeClock | None = None,
     max_retries: int = 3,
+    log_level: str | None = None,
 ) -> AsyncHushscript:
     monkeypatch.setattr(client_module, "_sync_inner", api.sync)
     monkeypatch.setattr(client_module, "_async_inner", api.asynchronous)
     return AsyncHushscript(
-        TOKEN, base_url=BASE_URL, clock=clock or PipeClock(), max_retries=max_retries
+        TOKEN,
+        base_url=BASE_URL,
+        clock=clock or PipeClock(),
+        max_retries=max_retries,
+        log_level=log_level,
     )

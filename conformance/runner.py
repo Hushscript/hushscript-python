@@ -25,6 +25,7 @@ import hushscript._client as client_module
 from hushscript import Hushscript, HushscriptError
 from hushscript._json import as_dict, as_list
 from hushscript.transcribe.probe import probe_duration
+from hushscript.transcribe.sniff import sniff
 from hushscript.transcribe.source import make_source
 
 BASE_URL = "http://127.0.0.1:4010"
@@ -259,15 +260,29 @@ def _transcribe(hs: Hushscript, args: Json, files: Files) -> Json:
 
 def _probe(_hs: Hushscript, args: Json, files: Files) -> Json:
     tolerance = args["toleranceSeconds"]
+    refuse = set(args.get("refuse", []))
     failures: list[Json] = []
+    refused = 0
     for name, expected in files.durations.items():
+        source = make_source(files[name])
+        if name in refuse:
+            # R46: the sniffer turns these away before any probe runs, as `check_media` does.
+            if sniff(source.head()) is None:
+                refused += 1
+            else:
+                failures.append({"file": name, "expected": "refused", "got": "sniffed"})
+            continue
         try:
-            got: float | None = probe_duration(make_source(files[name]))
+            got: float | None = probe_duration(source)
         except HushscriptError:
             got = None
         if got is None or abs(got - expected) > tolerance:
             failures.append({"file": name, "expected": expected, "got": got})
-    return {"checked": len(files.durations), "failures": failures}
+    return {
+        "checked": len(files.durations) - len(refuse),
+        "refused": refused,
+        "failures": failures,
+    }
 
 
 OPS: dict[str, Callable[[Hushscript, Json, Files], Json]] = {

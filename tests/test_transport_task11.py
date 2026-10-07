@@ -36,12 +36,16 @@ from hushscript._http import (
     CLASS_EXTENSION,
     STREAM_EXTENSION,
     AsyncRetryingTransport,
+    RetryingTransport,
+    TransportSettings,
 )
 from hushscript._pacing import TokenBucket
 from hushscript._retry import RetryClass
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from hushscript._redact import Credentials
 
 CLAIM = "/v1/agent/accounts/sg_1/claim"
 CREATE = "/v1/uploads"
@@ -374,3 +378,105 @@ def test_the_system_clock_wait_wakes_on_the_event_and_otherwise_times_out() -> N
     assert clock.wait(stop, 0.01) is False
     stop.set()
     assert clock.wait(stop, 30) is True
+
+
+# --- every attempt takes a token and reads the token (spec 7.4, 7.5) ---
+
+
+class _CountingBucket(TokenBucket):
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__(clock)
+        self.reserved = 0
+
+    def reserve(self) -> float:
+        self.reserved += 1
+        return super().reserve()
+
+
+class _RotatingClock(FakeClock):
+    """A clock that rotates the token during every sleep, as another thread's `rotate_token` can
+    while a request waits."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.credentials: Credentials | None = None
+
+    def sleep(self, seconds: float) -> None:
+        super().sleep(seconds)
+        if self.credentials is not None:
+            self.credentials.replace(f"hsr-rotated-{len(self.sleeps)}")
+
+
+def _settings_with(clock: FakeClock, bucket: TokenBucket | None = None) -> TransportSettings:
+    settings = settings_for(clock, token=TOKEN, max_retries=5)
+    settings.bucket = bucket
+    if isinstance(clock, _RotatingClock):
+        clock.credentials = settings.credentials
+    return settings
+
+
+def test_every_attempt_of_a_paced_create_takes_a_token() -> None:
+    clock = FakeClock()
+    bucket = _CountingBucket(clock)
+    pending = [reply(503), reply(503), reply(503), reply(503), reply(200, {"job_id": "j"})]
+    transport = RetryingTransport(
+        httpx.MockTransport(lambda _request: pending.pop(0)), _settings_with(clock, bucket)
+    )
+    with httpx.Client(base_url=BASE_URL, transport=transport) as client:
+        assert client.post(CREATE, json=KEYED).status_code == 200
+    assert bucket.reserved == 5
+    assert max(clock.sleeps) > 8  # past the backoff cap: the fifth attempt waited for a slot
+
+
+def test_a_rotation_during_a_pacing_wait_reaches_the_queued_request() -> None:
+    clock = _RotatingClock()
+    bucket = TokenBucket(clock, capacity=1)
+    bucket.reserve()  # the one free slot is gone, so the create waits a whole window
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization"))
+        return reply(200, {"job_id": "j"})
+
+    transport = RetryingTransport(httpx.MockTransport(handler), _settings_with(clock, bucket))
+    with httpx.Client(base_url=BASE_URL, transport=transport) as client:
+        assert client.post(CREATE, json=KEYED).status_code == 200
+    assert clock.sleeps == [pytest.approx(60.0)]
+    assert seen == ["Bearer hsr-rotated-1"]
+
+
+def test_a_rotation_during_a_backoff_reaches_the_retry() -> None:
+    clock = _RotatingClock()
+    pending = [reply(503), reply(200, {"ok": True})]
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization"))
+        return pending.pop(0)
+
+    transport = RetryingTransport(httpx.MockTransport(handler), _settings_with(clock))
+    with httpx.Client(base_url=BASE_URL, transport=transport) as client:
+        assert client.get("/v1/account").status_code == 200
+    assert seen == [f"Bearer {TOKEN}", "Bearer hsr-rotated-1"]
+
+
+@pytest.mark.anyio
+async def test_the_async_transport_paces_and_authorizes_every_attempt() -> None:
+    class AsyncRotatingClock(_RotatingClock):
+        async def asleep(self, seconds: float) -> None:
+            self.sleep(seconds)
+
+    clock = AsyncRotatingClock()
+    bucket = _CountingBucket(clock)
+    seen: list[str | None] = []
+    pending = [reply(503), reply(200, {"job_id": "j"})]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization"))
+        return pending.pop(0)
+
+    transport = AsyncRetryingTransport(httpx.MockTransport(handler), _settings_with(clock, bucket))
+    async with httpx.AsyncClient(base_url=BASE_URL, transport=transport) as client:
+        assert (await client.post(CREATE, json=KEYED)).status_code == 200
+    assert bucket.reserved == 2
+    assert seen == [f"Bearer {TOKEN}", "Bearer hsr-rotated-1"]

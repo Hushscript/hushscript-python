@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
@@ -32,6 +33,8 @@ if TYPE_CHECKING:
     from .upload import Created
 
 UPLOADING: Final = "uploading"
+RESUME_NOTE: Final = "The job exists on the server. Resume it with this token: "
+SENT_NOTE: Final = "The create request was sent, so the job may exist. Idempotency key: "
 
 
 @dataclass(slots=True)
@@ -40,12 +43,25 @@ class Tracker:
 
     key: str
     token: str | None = None
+    sent: bool = False
+    """True from the moment the create goes out: the server may have committed it."""
+
+    def note(self) -> str:
+        if self.token is None:
+            return f"{SENT_NOTE}{self.key}"
+        return f"{RESUME_NOTE}{self.token} (idempotency key {self.key})"
 
 
 @contextmanager
 def annotated(tracker: Tracker) -> Generator[None]:
     try:
         yield
+    except (asyncio.CancelledError, KeyboardInterrupt) as interrupted:
+        # Spec 7.4 and R26: an interrupt is never converted (asyncio.timeout and task groups
+        # depend on it); once the create is out, the way back to the job rides along as a note.
+        if tracker.sent:
+            interrupted.add_note(tracker.note())
+        raise
     except HushscriptError as error:
         error.idempotency_key = tracker.key
         if tracker.token is not None and error.resume_token is None:
@@ -117,7 +133,7 @@ def _upload(
 ) -> None:
     job_path = f"/v1/uploads/{created.job_id}"
     uploader = SyncUploader(session, created.job_id, created.plan, source, concurrency)
-    heartbeat = Heartbeat(session.clock)
+    heartbeat = Heartbeat(session.clock, session.log)
 
     def ping() -> None:
         raise_for_response(
@@ -188,6 +204,7 @@ def run_transcribe(
     tracker = Tracker(key)
     with annotated(tracker):
         callbacks.progress(UploadingProgress(0, 0, state.size))
+        tracker.sent = True
         created = create(session, body)
         return _after_create(session, created, tracker, state, source, options, callbacks)
 
@@ -210,7 +227,7 @@ def run_resume(
     options.validate()
     state = decode_token(token)
     source = early_source(state, file)
-    tracker = Tracker(state.idempotency_key, token)
+    tracker = Tracker(state.idempotency_key, token, sent=True)
     with annotated(tracker):
         job = read_job_to_resume(session, state.job_id)
         if job.state != UPLOADING:

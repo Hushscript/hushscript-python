@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import threading
 import time
 import tracemalloc
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
+from conftest import TOKEN
 from fakeapi import FakeApi, Job, error_reply
 from hushscript import (
     AuthenticationError,
@@ -782,3 +784,120 @@ def test_memory_stays_at_concurrency_times_part_size(
     # Two parts in flight, one copy each, and the harness's own transient copy of the part it is
     # answering; far below the 16 MiB of the file.
     assert peak - held < (width + 1) * part_size + (1 << 20)
+
+
+# --- fix round: log redaction, interrupt notes, resume of a stream ---
+
+
+def test_no_signed_url_or_token_reaches_any_logger(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    api = FakeApi(parts=3)
+    hs = hs_for(monkeypatch, api, log_level="debug")
+    with caplog.at_level(logging.DEBUG):
+        hs.transcribe(media(), duration_seconds=100)
+    text = "\n".join(f"{r.name}: {r.getMessage()}" for r in caplog.records)
+    assert api.count("PUT", R2) == 3
+    assert "sig=" not in text
+    assert "__r2" not in text
+    assert TOKEN not in text
+    assert "hushscript PUT r2:part/1 200" in text
+    assert "httpx: HTTP Request: PUT r2:part/1" in text  # httpx's own line, URL swapped out
+
+
+def test_another_httpx_users_urls_are_left_alone(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    api = FakeApi()
+    hs_for(monkeypatch, api, log_level="debug")
+    with (
+        caplog.at_level(logging.INFO, logger="httpx"),
+        httpx.Client(transport=httpx.MockTransport(lambda _r: httpx.Response(200))) as other,
+    ):
+        other.get("https://example.test/a?b=1")
+    assert any("https://example.test/a?b=1" in r.getMessage() for r in caplog.records)
+
+
+def test_an_interrupt_during_the_create_names_the_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    def interrupt() -> None:
+        raise KeyboardInterrupt
+
+    api = FakeApi(after_create=interrupt)  # the job is committed, the response never arrives
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        hs.transcribe(media(), duration_seconds=100, idempotency_key="k" * 24)
+    notes = "\n".join(raised.value.__notes__)
+    assert "k" * 24 in notes
+    assert len(api.jobs) == 1
+
+
+def test_an_interrupt_during_the_parts_names_the_key_and_the_resume_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupt(_n: int, _attempt: int) -> httpx.Response | None:
+        raise KeyboardInterrupt
+
+    api = FakeApi(r2_hook=interrupt)
+    hs = hs_for(monkeypatch, api)
+    tokens: list[str] = []
+    with pytest.raises(KeyboardInterrupt) as raised:
+        hs.transcribe(
+            media(),
+            duration_seconds=100,
+            concurrency=1,
+            idempotency_key="k" * 24,
+            on_resume_token=tokens.append,
+        )
+    notes = "\n".join(raised.value.__notes__)
+    assert "k" * 24 in notes
+    assert tokens[0] in notes
+
+
+def test_an_interrupt_before_the_create_is_sent_carries_no_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupt(_event: Progress) -> None:
+        raise KeyboardInterrupt
+
+    hs = hs_for(monkeypatch, FakeApi())
+    with pytest.raises(KeyboardInterrupt) as raised:
+        hs.transcribe(media(), duration_seconds=100, on_progress=interrupt)
+    assert not getattr(raised.value, "__notes__", [])
+
+
+def _broken_upload(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeApi, str, dict[str, bool]]:
+    broken = {"on": True}
+
+    def r2(n: int, _attempt: int) -> httpx.Response | None:
+        return httpx.Response(503) if broken["on"] and n == 3 else None
+
+    api = FakeApi(r2_hook=r2)
+    tokens: list[str] = []
+    with pytest.raises(UploadError):
+        hs_for(monkeypatch, api).transcribe(
+            media(), duration_seconds=100, concurrency=1, on_resume_token=tokens.append
+        )
+    return api, tokens[0], broken
+
+
+def test_resume_takes_a_stream_that_cannot_seek_with_the_size_from_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, token, broken = _broken_upload(monkeypatch)
+    broken["on"] = False
+    transcript = hs_for(monkeypatch, api).resume(token, OneWay(media()))
+    assert transcript.id
+    assert len(api.jobs) == 1
+    assert api.count("POST", COMPLETE) == 1
+
+
+@pytest.mark.parametrize("size", [8999, 9001])
+def test_resume_still_refuses_a_stream_of_another_size(
+    monkeypatch: pytest.MonkeyPatch, size: int
+) -> None:
+    api, token, broken = _broken_upload(monkeypatch)
+    broken["on"] = False
+    with pytest.raises(UploadError) as raised:
+        hs_for(monkeypatch, api).resume(token, OneWay(media(size)))
+    assert raised.value.code == "stream_size_mismatch"
+    assert api.count("POST", COMPLETE) == 0

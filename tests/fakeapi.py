@@ -72,6 +72,8 @@ class FakeApi:
     url_ttl_expired: bool = False
     retain_bodies: bool = True
     r2_delay: float = 0.0
+    create_delay: float = 0.0
+    after_create: Callable[[], None] | None = None
     overrides: list[tuple[str, str, Callable[[], httpx.Response]]] = field(default_factory=list)
     lose_parts: tuple[int, ...] = ()
     drop_after_commit: int = 0
@@ -94,7 +96,10 @@ class FakeApi:
         async def handler(request: httpx.Request) -> httpx.Response:
             if self.r2_delay and request.url.path.startswith("/__r2/"):
                 await asyncio.sleep(self.r2_delay)
-            return self._handle(request)
+            response = self._handle(request)
+            if self.create_delay and request.url.path == "/v1/uploads":
+                await asyncio.sleep(self.create_delay)  # committed, response not yet delivered
+            return response
 
         return httpx.MockTransport(handler)
 
@@ -199,6 +204,8 @@ class FakeApi:
                 if key:
                     self.keys[key] = job.id
         direct = not self.proxied and job.state == "uploading"
+        if self.after_create is not None:
+            self.after_create()
         if self.drop_after_commit > 0:
             self.drop_after_commit -= 1
             raise httpx.ReadError("connection reset after the job was committed")
