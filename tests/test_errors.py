@@ -592,6 +592,8 @@ def test_no_source_file_reads_json_but_through_the_shared_loader() -> None:
     offenders = [
         str(path.relative_to(source))
         for path in source.rglob("*.py")
-        if path.name != "_json.py" and reads.search(path.read_text(encoding="utf-8"))
+        if path.name != "_json.py"
+        and "generated" not in path.relative_to(source).parts  # the unused generated endpoints
+        and reads.search(path.read_text(encoding="utf-8"))
     ]
     assert offenders == []
