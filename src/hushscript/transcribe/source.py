@@ -7,7 +7,7 @@ import threading
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, BinaryIO, Final
 
-from hushscript._errors import PreflightError
+from hushscript._errors import PreflightError, UploadError
 
 from .sniff import HEAD_BYTES
 
@@ -164,8 +164,9 @@ class SequentialSource(Source):
 
     def read_range(self, offset: int, length: int) -> bytes:
         if offset != self._position:
-            raise PreflightError(
-                "A stream can only be read from start to end.", code="invalid_option"
+            raise UploadError(
+                "A stream can only be uploaded in order, one part at a time.",
+                code="stream_not_seekable",
             )
         head = self.head()
         if offset >= len(head):

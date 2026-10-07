@@ -136,6 +136,8 @@ class Media:
 
 def check_media(source: Source, options: Options) -> Media:
     """Spec 8.1 steps 1 to 3: format by magic bytes, size, duration."""
+    if source.sequential and options.duration_seconds is None:
+        raise invalid_option("A stream that cannot seek needs duration_seconds and size.")
     try:
         head = source.head()
     except OSError as failure:

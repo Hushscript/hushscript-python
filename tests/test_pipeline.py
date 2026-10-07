@@ -474,9 +474,9 @@ def test_a_stream_that_cannot_seek_needs_size_and_duration(monkeypatch: pytest.M
     hs = hs_for(monkeypatch, api)
     with pytest.raises(PreflightError):
         hs.transcribe(OneWay(media()), duration_seconds=100)
-    with pytest.raises(UnsupportedMediaError) as raised:
+    with pytest.raises(PreflightError) as raised:
         hs.transcribe(OneWay(media()), size=9000)
-    assert raised.value.code == "duration_unreadable"
+    assert raised.value.code == "invalid_option"
     assert api.requests == []
 
 

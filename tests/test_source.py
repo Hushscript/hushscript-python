@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from hushscript import PreflightError
+from hushscript import PreflightError, UploadError
 from hushscript.transcribe.source import (
     BytesSource,
     PathSource,
@@ -96,8 +96,9 @@ def test_a_sequential_part_inside_the_head_is_served_from_it() -> None:
 def test_a_stream_cannot_be_read_out_of_order() -> None:
     source = SequentialSource(OneWay(DATA), len(DATA))
     source.read_range(0, 10)
-    with pytest.raises(PreflightError):
+    with pytest.raises(UploadError) as raised:
         source.read_range(5000, 10)
+    assert raised.value.code == "stream_not_seekable"
 
 
 class Trickle:
