@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import os
 import stat
 import sys
@@ -324,3 +325,10 @@ def test_a_failure_after_a_saved_token_says_where_it_is(
     monkeypatch.setattr(sys, "argv", ["x", "--terms", "t", "--token-file", str(path)])
     assert agent_signup.main() == 1
     assert f"Any token that was issued is in {path}." in capsys.readouterr().err
+
+
+def test_the_readme_retry_snippet_refuses_what_the_buy_example_refuses() -> None:
+    readme = (EXAMPLES.parent / "README.md").read_text(encoding="utf-8")
+    match = re.search(r"refused = error\.status in \{([^}]*)\}", readme)
+    assert match is not None
+    assert {int(code) for code in match.group(1).split(",")} == set(buy.REFUSALS)
