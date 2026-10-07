@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import pickle
+from urllib.parse import quote
 
+import httpx
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
 from conftest import TOKEN
+from helpers import reply
+from hushscript._errors import error_from_response
 from hushscript._redact import REDACTED, TOKEN_PATTERN, Credentials, redact
+from hushscript.resources.agent import read_answer
 
 
 def _token(version: int, region: str, public: str, secret: str) -> str:
@@ -64,3 +69,57 @@ def test_credentials_never_show_the_token() -> None:
     )
     with pytest.raises(TypeError, match="pickled"):
         pickle.dumps(credentials)
+
+
+PUBLIC = "0123456789abcdef" * 2
+SECRET = "fedcba9876543210" * 4
+
+
+@pytest.mark.parametrize("piece", [SECRET, f"{PUBLIC}.{SECRET}", TOKEN])
+def test_an_echoed_piece_of_the_token_is_scrubbed(piece: str) -> None:
+    assert Credentials(TOKEN).scrub(f"echo {piece} end") == f"echo {REDACTED} end"
+    assert Credentials(TOKEN).scrub(f"echo {piece.upper()} end") == f"echo {REDACTED} end"
+
+
+def test_an_odd_token_loses_its_bare_secret_after_the_last_dot() -> None:
+    odd = "hsr-odd.public." + "s3cretSEGMENTvalue99"
+    assert Credentials(odd).scrub("x s3cretSEGMENTvalue99 x") == f"x {REDACTED} x"
+    assert Credentials(odd).scrub("x " + odd.upper() + " x") == f"x {REDACTED} x"
+
+
+def test_the_whole_token_is_scrubbed_in_its_percent_encoded_and_cased_forms() -> None:
+    credentials = Credentials(TOKEN)
+    encoded = quote(TOKEN, safe="")
+    assert "%3A" in encoded
+    for form in (encoded, encoded.lower(), TOKEN.upper(), TOKEN.replace(":", "%3a")):
+        assert credentials.scrub(f"/v1/{form}/x") == f"/v1/{REDACTED}/x"
+
+
+def test_a_short_segment_is_an_ordinary_substring() -> None:
+    credentials = Credentials("hsr-odd.public.shortsecret")
+    assert credentials.scrub("a shortsecret b") == "a shortsecret b"
+
+
+def test_past_and_remembered_tokens_are_scrubbed_the_same_way() -> None:
+    credentials = Credentials("hsr-old.id." + "o" * 20)
+    credentials.replace("hsr-new.id." + "n" * 20)
+    credentials.remember("hsr-seen.id." + "s" * 20)
+    text = credentials.scrub(f"{'o' * 20} {'n' * 20} {'s' * 20}")
+    assert text == f"{REDACTED} {REDACTED} {REDACTED}"
+
+
+def test_a_remembered_token_is_taken_trimmed_from_an_answer() -> None:
+    odd = "hsr1-odd-token-value-1234"
+    credentials = Credentials()
+    read_answer(reply(201, {"pat": f"  {odd}\n"}), credentials)
+    assert credentials.scrub(f"echo {odd}") == f"echo {REDACTED}"
+
+
+@pytest.mark.parametrize(
+    "slug", [TOKEN, SECRET, f"{PUBLIC}.{SECRET}", TOKEN.upper(), quote(TOKEN, safe="")]
+)
+def test_a_server_slug_that_echoes_the_token_is_not_stored_in_the_code(slug: str) -> None:
+    response = httpx.Response(418, json={"error": slug, "code": 1})
+    error = error_from_response(response, credentials=Credentials(TOKEN))
+    assert error.code == REDACTED
+    assert SECRET not in repr(error) + str(error) + error.code
