@@ -171,7 +171,9 @@ def wait_job(
 
 def fetch_transcript(session: SyncSession, job: Job) -> Transcript:
     transcript_id = finish(job)
-    return transcript_of(session.http.get(f"/v1/transcripts/{segment(transcript_id)}"), session.credentials)
+    return transcript_of(
+        session.http.get(f"/v1/transcripts/{segment(transcript_id)}"), session.credentials
+    )
 
 
 def _upload(
@@ -290,7 +292,9 @@ def run_resume(
         if job.state != UPLOADING:
             return fetch_transcript(
                 session,
-                wait_job(session, segment(state.job_id), options.wait_timeout, callbacks, token, job),
+                wait_job(
+                    session, segment(state.job_id), options.wait_timeout, callbacks, token, job
+                ),
             )
         late = late_source(state, file, source)
         callbacks.progress(UploadingProgress(0, 0, state.size))

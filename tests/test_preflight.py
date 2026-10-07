@@ -193,6 +193,9 @@ def test_the_daily_limit_is_refused_with_the_numbers() -> None:
     assert "599 of 600 min" in error.hint
 
 
-@pytest.mark.parametrize("account", [None, {}, {"limits": []}, {"limits": {"max_daily_seconds": "7", "used_today_seconds": 1}}])
+@pytest.mark.parametrize(
+    "account",
+    [None, {}, {"limits": []}, {"limits": {"max_daily_seconds": "7", "used_today_seconds": 1}}],
+)
 def test_an_account_the_sdk_cannot_read_is_not_a_refusal(account: object) -> None:
     check_account(account, MEDIA)
