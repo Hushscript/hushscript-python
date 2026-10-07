@@ -82,8 +82,8 @@ def test_an_echoed_piece_of_the_token_is_scrubbed(piece: str) -> None:
 
 
 def test_an_odd_token_loses_its_bare_secret_after_the_last_dot() -> None:
-    odd = "hsr-odd.public." + "s3cretSEGMENTvalue99"
-    assert Credentials(odd).scrub("x s3cretSEGMENTvalue99 x") == f"x {REDACTED} x"
+    odd = "hsr-odd.public." + "s3cretSegmentValue99"
+    assert Credentials(odd).scrub("x s3cretSegmentValue99 x") == f"x {REDACTED} x"
     assert Credentials(odd).scrub("x " + odd.upper() + " x") == f"x {REDACTED} x"
 
 
