@@ -210,7 +210,7 @@ def test_an_error_status_is_still_its_own_error_not_bad_response(
 # --- the upload plan and the part URLs ---
 
 
-def _plan(part: int, total: int) -> httpx.Response:
+def _plan(part: object, total: object) -> httpx.Response:
     upload: dict[str, object] = {
         "part_size_bytes": part,
         "total_parts": total,
@@ -220,7 +220,7 @@ def _plan(part: int, total: int) -> httpx.Response:
     return httpx.Response(200, json={"job_id": "job_1", "state": "uploading", "upload": upload})
 
 
-@pytest.mark.parametrize(("part", "total"), [(0, 3), (3000, 0), (3000, 7), (3000, 2)])
+@pytest.mark.parametrize(("part", "total"), [(3000, 7), (3000, 2)])
 def test_a_plan_that_does_not_describe_the_file_is_bad_part_plan(
     monkeypatch: pytest.MonkeyPatch, part: int, total: int
 ) -> None:
@@ -231,6 +231,45 @@ def test_a_plan_that_does_not_describe_the_file_is_bad_part_plan(
         hs.transcribe(media(), duration_seconds=100)
     assert raised.value.code == "bad_part_plan"
     assert raised.value.resume_token
+
+
+@pytest.mark.parametrize(
+    ("part", "total"),
+    [(0, 3), (3000, 0), (-1, 3), (3000, -4), (1.5, 3), (3000, 2.0), ("3000", 2), (True, 2)],
+)
+def test_a_plan_with_a_number_that_cannot_be_one_is_bad_response_with_the_key(
+    monkeypatch: pytest.MonkeyPatch, part: object, total: object
+) -> None:
+    api = FakeApi()
+    api.overrides.append(("POST", CREATE, lambda: _plan(part, total)))
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(ApiError) as raised:
+        hs.transcribe(media(), duration_seconds=100)
+    assert (raised.value.code, raised.value.status, raised.value.numeric_code) == (
+        "bad_response",
+        200,
+        None,
+    )
+    assert raised.value.idempotency_key
+
+
+def test_a_part_url_page_with_a_non_positive_size_is_bad_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(parts=40)
+    page: dict[str, object] = {
+        "part_size_bytes": 0,
+        "total_parts": 40,
+        "part_urls": [],
+        "next_part_number": None,
+    }
+    api.overrides.append(
+        ("GET", r"/v1/uploads/[^/]+/part-urls", lambda: httpx.Response(200, json=page))
+    )
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(ApiError) as raised:
+        hs.transcribe(media(4000), duration_seconds=100, concurrency=1)
+    assert raised.value.code == "bad_response"
 
 
 def test_a_part_without_a_url_is_part_url_missing(monkeypatch: pytest.MonkeyPatch) -> None:

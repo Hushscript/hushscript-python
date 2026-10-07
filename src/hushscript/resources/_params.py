@@ -13,10 +13,15 @@ def check_page_size(page_size: object) -> None:
 
 
 def path_id(resource_id: object) -> str:
-    """An id as one path segment: nothing in it can reach another route."""
-    if not isinstance(resource_id, str) or not resource_id:
-        raise invalid_option("An id is a non-empty string.")
-    return quote(resource_id, safe="")
+    """An id as one percent-encoded path segment. An empty or non-string id, `.` and `..` (which a
+    client or proxy would resolve to another route) and text that cannot be encoded as UTF-8 (a
+    lone surrogate) are `invalid_option`, before any request."""
+    if not isinstance(resource_id, str) or resource_id in {"", ".", ".."}:
+        raise invalid_option("An id is a non-empty string other than . and ..")
+    try:
+        return quote(resource_id, safe="")
+    except UnicodeEncodeError:
+        raise invalid_option("An id must be text that encodes as UTF-8.") from None
 
 
 def list_params(cursor: str | None, page_size: int | None) -> dict[str, str | int]:

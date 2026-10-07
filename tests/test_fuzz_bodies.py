@@ -12,12 +12,14 @@ import json
 from typing import TYPE_CHECKING, Any
 
 import httpx
+import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
 from conftest import TOKEN
 from helpers import account_body, job_body, transcript_body
 from hushscript import HushscriptError, Transcript
+from hushscript._errors import raise_for_response
 from hushscript._models import Job
 from hushscript._redact import Credentials
 from hushscript._response import parsed
@@ -156,8 +158,6 @@ def through_the_boundary(parse: Callable[[object], object], body: object) -> obj
         return parsed(response, Credentials(TOKEN), parse)
     except HushscriptError as error:
         failure = error
-    if failure.code == "bad_part_plan":  # a plan whose numbers cannot describe a file (spec 8.3)
-        return None
     assert (failure.code, failure.status, failure.numeric_code) == ("bad_response", 200, None)
     return None
 
@@ -240,3 +240,32 @@ def test_the_preflight_account_read_only_ever_answers_with_a_value_or_an_error(
 def test_every_unmutated_body_parses() -> None:
     for name, (parse, body) in CASES.items():
         assert through_the_boundary(parse, body) is not None, name
+
+
+GARBAGE = st.one_of(
+    st.binary(max_size=200),
+    st.text(max_size=100).map(str.encode),
+    st.integers(min_value=1, max_value=5000).map(lambda depth: b"[" * depth + b"]" * depth),
+    st.integers(min_value=1, max_value=5000).map(
+        lambda depth: b'{"error":"x","details":' + b"[" * depth + b"1" + b"]" * depth + b"}"
+    ),
+    VALUES.map(
+        lambda value: json.dumps({"error": value, "code": value, "details": value}).encode()
+    ),
+    VALUES.map(lambda value: json.dumps(value, allow_nan=True).encode()),
+)
+
+
+@given(st.integers(min_value=400, max_value=599), GARBAGE)
+def test_an_error_status_with_any_body_only_ever_raises_a_hushscript_error(
+    status: int, content: bytes
+) -> None:
+    response = httpx.Response(
+        status,
+        content=content,
+        headers={"content-type": "application/json"},
+        request=httpx.Request("GET", "http://127.0.0.1:4010/v1/account"),
+    )
+    with pytest.raises(HushscriptError) as raised:
+        raise_for_response(response, credentials=Credentials(TOKEN))
+    assert raised.value.status == status

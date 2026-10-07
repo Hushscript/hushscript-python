@@ -57,6 +57,8 @@ class JobOptions:
     auto_generate_insights: bool | None
     """The upload's insights override, or None when it used the account default."""
 
+    __hash__ = None  # type: ignore[assignment]  # holds a list, so it is unhashable by design
+
 
 @dataclass(frozen=True, slots=True)
 class Job:
@@ -80,6 +82,8 @@ class Job:
     retry_of: str | None
     created_at: datetime
     options: JobOptions
+
+    __hash__ = None  # type: ignore[assignment]  # holds a JobOptions, which is unhashable
 
     @classmethod
     def from_body(cls, body: object) -> Job:

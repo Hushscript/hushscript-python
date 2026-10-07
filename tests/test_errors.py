@@ -10,7 +10,7 @@ import pytest
 
 import hushscript
 from conftest import TOKEN
-from helpers import error_body
+from helpers import FakeClock, Script, error_body, reply, sync_client
 from hushscript import (
     AbortError,
     ApiError,
@@ -453,3 +453,51 @@ def test_other_hints_are_unaffected_by_the_wrong_state_rule() -> None:
         )
     )
     assert error.hint is not None
+
+
+def _nested(depth: int, leaf: object = 1) -> str:
+    return "[" * depth + json.dumps(leaf) + "]" * depth
+
+
+@pytest.mark.parametrize("depth", [700, 3000, 200_000])
+@pytest.mark.parametrize("status", [400, 402, 404, 429, 500, 502])
+def test_an_error_body_nested_past_the_recursion_limit_is_still_an_error_of_its_status(
+    depth: int, status: int
+) -> None:
+    for text in (
+        _nested(depth),
+        '{"error":"rate_limited","code":5000,"details":' + _nested(depth) + "}",
+        '{"error":"rate_limited","code":5000,"x":' + '{"a":' * depth + "1" + "}" * depth + "}",
+    ):
+        reply_ = httpx.Response(
+            status,
+            content=text.encode(),
+            headers={"content-type": "application/json"},
+            request=httpx.Request("GET", "http://127.0.0.1:4010/v1/account"),
+        )
+        error = error_from_response(reply_, credentials=Credentials(TOKEN))
+        assert isinstance(error, ApiError)
+        assert error.status == status
+        if depth >= 3000:  # past what any Python version's walkers read
+            assert error.details == {}
+
+
+def test_a_deep_error_body_that_still_parses_keeps_its_slug() -> None:
+    text = '{"error":"rate_limited","code":5000,"details":' + _nested(800) + "}"
+    reply_ = httpx.Response(
+        429,
+        content=text.encode(),
+        request=httpx.Request("GET", "http://127.0.0.1:4010/v1/account"),
+    )
+    assert error_from_response(reply_, credentials=Credentials(TOKEN)).code in {
+        "rate_limited",
+        "http_429",
+    }
+
+
+def test_the_transport_survives_a_deep_body_on_a_create_that_was_rate_limited() -> None:
+    script = Script([httpx.Response(429, content=_nested(3000).encode()), reply(200, {})])
+    client = sync_client(script, FakeClock(), token=TOKEN)
+    response = client.post("/v1/uploads", json={"idempotency_key": "k" * 20})
+    assert response.status_code == 200
+    assert script.calls == 2

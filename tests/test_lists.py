@@ -12,6 +12,7 @@ from helpers import error_body, job_body, reply, transcript_body
 from hushscript import (
     OPERATION_SCOPES,
     ApiError,
+    DeletedTranscript,
     HushscriptError,
     Job,
     NotFoundError,
@@ -333,3 +334,24 @@ async def test_a_bad_async_page_is_a_bad_response(monkeypatch: pytest.MonkeyPatc
     hs, _ = async_hs_on(monkeypatch, lambda _request: reply(200, transcript_body()))
     with pytest.raises(ApiError):
         _ = [item async for item in hs.jobs.list()]
+
+
+def test_a_summary_and_a_deleted_record_are_unhashable_by_design(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hs, _ = hs_on(monkeypatch, pager(1))
+    summary = next(hs.transcripts.list())
+    for value in (
+        summary,
+        DeletedTranscript(
+            id="a",
+            title="t",
+            duration_seconds=1,
+            created_at=summary.created_at,
+            deleted_at=summary.created_at,
+            cause="manual",
+            receipt=None,
+        ),
+    ):
+        with pytest.raises(TypeError, match="unhashable"):
+            hash(value)

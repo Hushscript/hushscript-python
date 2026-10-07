@@ -11,6 +11,7 @@ from hushscript.paginate import Page, apaginate, paginate
 from hushscript.resources._params import path_id
 from hushscript.transcribe import apipeline, pipeline
 from hushscript.transcribe.pipeline import Callbacks
+from hushscript.transcribe.preflight import check_wait_timeout
 from hushscript.transcribe.wait import DEFAULT_WAIT_TIMEOUT
 
 if TYPE_CHECKING:
@@ -59,6 +60,7 @@ class Jobs:
     ) -> Job:
         """Polls until the job is `done` or `failed` (spec 8.6); WaitTimeoutError after
         `wait_timeout` seconds. A failed job is returned, not raised."""
+        check_wait_timeout(wait_timeout)
         return pipeline.wait_job(
             self._session, path_id(job_id), wait_timeout, Callbacks(on_progress=on_progress), None
         )
@@ -87,6 +89,7 @@ class AsyncJobs:
         wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
         on_progress: Callable[[Progress], None] | None = None,
     ) -> Job:
+        check_wait_timeout(wait_timeout)
         return await apipeline.wait_job(
             self._session, path_id(job_id), wait_timeout, Callbacks(on_progress=on_progress), None
         )

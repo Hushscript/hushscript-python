@@ -50,8 +50,6 @@ class Created:
     plan: Plan | None
     """None in proxied mode (`upload: null`), which a job that has left `uploading` also shows;
     `state` tells them apart."""
-    plan_error: UploadError | None = None
-    """Set when the plan's numbers cannot describe a file; raised once the resume token exists."""
 
 
 def _whole(value: object) -> int | None:
@@ -81,10 +79,14 @@ def parse_plan(raw: object) -> Plan:
     part_size = _whole(fields.get("part_size_bytes"))
     total = _whole(fields.get("total_parts"))
     next_part = _whole(fields.get("next_part_number"))
-    if part_size is None or total is None or (next_part is not None and next_part < 1):
+    if (
+        part_size is None
+        or total is None
+        or part_size < 1
+        or total < 1
+        or (next_part is not None and next_part < 1)
+    ):
         raise _unexpected("upload plan")
-    if part_size < 1 or total < 1:
-        raise bad_part_plan()
     return Plan(
         part_size=part_size,
         total_parts=total,
@@ -106,17 +108,10 @@ def parse_created(body: object) -> Created:
         raise _unexpected("create response")
     upload = fields.get("upload")
     state = fields.get("state")
-    plan, plan_error = None, None
-    if upload is not None:
-        try:
-            plan = parse_plan(upload)
-        except UploadError as unusable:
-            plan_error = unusable
     return Created(
         job_id=job_id,
         state=state if isinstance(state, str) else "uploading",
-        plan=plan,
-        plan_error=plan_error,
+        plan=None if upload is None else parse_plan(upload),
     )
 
 

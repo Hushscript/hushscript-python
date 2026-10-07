@@ -88,7 +88,7 @@ def _label(request: httpx.Request) -> str:
 def _has_idempotency_key(request: httpx.Request) -> bool:
     try:
         parsed: object = json.loads(request.content)
-    except (ValueError, httpx.RequestNotRead):
+    except (ValueError, RecursionError, httpx.RequestNotRead):
         return False
     key = (as_dict(parsed) or {}).get(IDEMPOTENCY_FIELD)
     return isinstance(key, str) and bool(key)
@@ -97,7 +97,7 @@ def _has_idempotency_key(request: httpx.Request) -> bool:
 def _slug_of(body: bytes) -> str | None:
     try:
         parsed: object = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     slug = (as_dict(parsed) or {}).get("error")
     return slug if isinstance(slug, str) else None

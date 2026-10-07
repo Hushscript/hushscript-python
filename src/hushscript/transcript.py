@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
@@ -68,6 +69,14 @@ def _milliseconds(value: object) -> int:
     return math.floor(value)
 
 
+def _no_fields() -> Mapping[str, object]:
+    return {}
+
+
+def _no_translations() -> Mapping[str, list[Utterance]]:
+    return {}
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class Transcript:
     """A finished transcript with its formatters (spec 6.2). `to_json()` is the API's body."""
@@ -89,8 +98,14 @@ class Transcript:
     """The translation locales, without the reserved `cleaned`, in the API's order."""
     cleaned: list[Utterance] | None
     """The AI-cleaned body, when there is one."""
-    _raw: Mapping[str, object] = field(repr=False, compare=False)
-    _translations: Mapping[str, list[Utterance]] = field(repr=False, compare=False)
+    _raw: Mapping[str, object] = field(
+        init=False, default_factory=_no_fields, repr=False, compare=False
+    )
+    _translations: Mapping[str, list[Utterance]] = field(
+        init=False, default_factory=_no_translations, repr=False, compare=False
+    )
+
+    __hash__ = None  # type: ignore[assignment]  # holds lists, so it is unhashable by design
 
     @classmethod
     def from_api(cls, body: object) -> Transcript:
@@ -107,7 +122,7 @@ class Transcript:
             for locale, language in (as_dict(envelope["translations"]) or {}).items()
         }
         auto_delete = fields["auto_delete_at"]
-        return cls(
+        transcript = cls(
             id=as_text(fields["id"]),
             title=as_text(fields["title"]),
             language=maybe_text(fields["language_detected"]),
@@ -121,9 +136,10 @@ class Transcript:
             utterances=_utterances(envelope["original"], names),
             languages=[locale for locale in translations if locale != CLEANED],
             cleaned=translations.get(CLEANED),
-            _raw=fields,
-            _translations=translations,
         )
+        object.__setattr__(transcript, "_raw", fields)
+        object.__setattr__(transcript, "_translations", translations)
+        return transcript
 
     @property
     def text(self) -> str:
@@ -132,10 +148,10 @@ class Transcript:
 
     def utterances_for(self, language: str | None = None) -> list[Utterance]:
         """The translation (or `cleaned` body) for `language`; the original when `language` is
-        empty or the transcript has no such translation."""
-        if language is None:
-            return self.utterances
-        return self._translations.get(language, self.utterances)
+        empty or the transcript has no such translation. The list is a copy."""
+        if not language:
+            return list(self.utterances)
+        return list(self._translations.get(language, self.utterances))
 
     def to_srt(self, language: str | None = None, *, captions: bool = True) -> str:
         return render_srt(self.utterances_for(language), captions=captions)
@@ -156,8 +172,8 @@ class Transcript:
         )
 
     def to_json(self) -> Mapping[str, object]:
-        """The API body this transcript was built from, unknown fields included."""
-        return self._raw
+        """A copy of the API body this transcript was built from, unknown fields included."""
+        return copy.deepcopy(dict(self._raw))
 
     def __repr__(self) -> str:
         return (

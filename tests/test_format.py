@@ -104,7 +104,7 @@ def test_whitespace_is_the_javascript_set() -> None:
     # U+0085 and U+001C are Python spaces but not JavaScript's; U+FEFF is the reverse.
     assert wrap_into_cues("a\u0085b", 42, 2) == ["a\u0085b"]
     assert wrap_into_cues("a\x1cb", 42, 2) == ["a\x1cb"]
-    assert wrap_into_cues("a﻿b", 42, 2) == ["a", "b"] or True
+    assert wrap_into_cues("a\ufeffb", 42, 2) == ["a b"]
     assert cue_text("one\n　\ntwo") == "one\ntwo"
     assert cue_text("x\v\ny") == "x\v\ny"  # \v is not a line break here
 
