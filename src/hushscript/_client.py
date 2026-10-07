@@ -12,7 +12,7 @@ from ._errors import ConfigurationError
 from ._http import AsyncRetryingTransport, RetryingTransport, TransportSettings
 from ._log import RequestLog
 from ._pacing import TokenBucket
-from ._redact import REDACTED
+from ._redact import REDACTED, Secret
 from ._response import parsed
 from ._version import __version__
 from .generated.client import AuthenticatedClient
@@ -387,9 +387,11 @@ class Hushscript:
         `ConflictError`) until the checkout is paid, and is never retried: a lost answer, or one
         without a usable token, is an `OutcomeUnknownError` whose hint says what to check."""
         path = claim_path(signup_id)
+        secret = Secret(claim_secret)
+        del claim_secret  # no frame of the SDK holds the secret as text from here on (R81)
         config = resolve_tokenless_config(base_url=base_url, timeout=timeout, log_level=log_level)
         with _tokenless_http(config, clock) as http:
-            response = http.post(path, json=claim_body(claim_secret))
+            response = http.post(path, json=claim_body(secret))
             return claimed(response, config.credentials)
 
     def transcribe(  # noqa: PLR0913  the keyword surface of spec 6.1
@@ -581,9 +583,11 @@ class AsyncHushscript:
         clock: Clock | None = None,
     ) -> AgentAccount:
         path = claim_path(signup_id)
+        secret = Secret(claim_secret)
+        del claim_secret  # no frame of the SDK holds the secret as text from here on (R81)
         config = resolve_tokenless_config(base_url=base_url, timeout=timeout, log_level=log_level)
         async with _tokenless_async_http(config, clock) as http:
-            response = await http.post(path, json=claim_body(claim_secret))
+            response = await http.post(path, json=claim_body(secret))
             return claimed(response, config.credentials)
 
     async def transcribe(  # noqa: PLR0913  the keyword surface of spec 6.1

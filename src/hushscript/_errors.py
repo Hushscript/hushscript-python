@@ -323,11 +323,12 @@ class OutcomeUnknownError(HushscriptError):
         self,
         message: str,
         *,
-        received_token: str | None = None,
+        received_token: str | Secret | None = None,
         **kwargs: Any,  # noqa: ANN401  # forwarded to HushscriptError, which types them
     ) -> None:
         super().__init__(message, **kwargs)
-        self._received = Secret(received_token if received_token and received_token.strip() else "")
+        text = received_token.reveal() if isinstance(received_token, Secret) else received_token
+        self._received = Secret(text if text and text.strip() else "")
 
     @property
     def received_token(self) -> str | None:

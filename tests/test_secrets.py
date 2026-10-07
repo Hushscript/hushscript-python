@@ -4,30 +4,48 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import json
 import logging
 import pickle
 import pprint
-from typing import Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
 
 import hushscript._client as client_module
+import hushscript.resources.agent as agent_module
 from conftest import TOKEN
+from fakeapi import FakeApi
 from helpers import BASE_URL, FakeClock, reply
 from hushscript import (
     AgentAccount,
+    AgentInfo,
+    AgentSignup,
+    AsyncHushscript,
     Balance,
     Hushscript,
+    HushscriptError,
+    NetworkError,
     OutcomeUnknownError,
     Purchase,
     RotatedToken,
+    UploadError,
 )
 from hushscript._redact import REDACTED, Credentials, Secret
+from hushscript.money import to_money
 from hushscript.transcribe.upload import Created, parse_created
+from pipe import async_hs_for, hs_for, media
 from routes import Routes, hs_on
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from types import TracebackType
+
 ODD = "hsr1-oddé-RECEIVED-SECRET"
+CLAIM_SECRET = "cs_CLAIM-SECRET-VALUE"
+PAT = "hsr1:eu:pat." + "ab" * 16 + "." + "cd" * 32
 SIGNED = "https://acct.r2.example.com/b/part-1?X-Amz-Signature=SIGNED-SECRET&X-Amz-Expires=3600"
 
 
@@ -136,12 +154,7 @@ def test_the_client_and_the_objects_it_returns_print_no_token(
     for value in (hs, hs.api, hs.jobs, hs.billing, hs.agent, hs._session, hs._config):  # pyright: ignore[reportPrivateUsage]
         for text in (repr(value), str(value), pprint.pformat(value)):
             assert TOKEN not in text
-    for result in (
-        Purchase(60, 1),
-        Balance(1, 0, 0, None, None),
-        AgentAccount("tok", "u", ["a"], Balance(1, 0, 0, None, None)),
-        RotatedToken("tok", "id", ["a"], None),
-    ):
+    for result in (Purchase(60, 1), Balance(1, 0, 0, None, None)):
         for text in shown(result):
             assert TOKEN not in text
 
@@ -163,3 +176,213 @@ def test_a_token_in_an_error_message_is_redacted_whatever_its_shape(
         repr(getattr(raised.value, "details", {})),
     ]
     assert all(TOKEN not in text for text in texts)
+
+
+BALANCE = Balance(1, 0, 0, None, None)
+
+
+def with_secrets() -> list[tuple[object, str]]:
+    """Each result that hands the caller a secret, with the secret it holds."""
+    return [
+        (AgentAccount(TOKEN, "u", ["a"], BALANCE), TOKEN),
+        (RotatedToken(TOKEN, "id", ["a"], None), TOKEN),
+        (
+            AgentSignup(
+                "sg_1",
+                CLAIM_SECRET,
+                "https://checkout.test/pay",
+                to_money(599, "USD"),
+                datetime.fromtimestamp(1_700_001_800, tz=UTC),
+            ),
+            CLAIM_SECRET,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(("result", "secret"), with_secrets())
+def test_a_result_with_a_secret_prints_the_marker_and_serializes_the_value(
+    result: Any,  # the three result types share only this
+    secret: str,
+) -> None:
+    for text in (repr(result), str(result), f"{result}", pprint.pformat(result), repr([result])):
+        assert secret not in text
+        assert "[redacted]" in text
+    assert repr(copy.deepcopy(result)) == repr(result)
+    name = "claim_secret" if isinstance(result, AgentSignup) else "token"
+    assert getattr(result, name) == secret
+    assert f"{name}={REDACTED}" in repr(result)
+    # a deliberate export carries the value
+    assert dataclasses.asdict(result)[name] == secret
+    assert secret.encode() in pickle.dumps(result)
+    assert json.dumps(dataclasses.asdict(result), default=str).count(secret) == 1
+
+
+def sdk_locals(error: BaseException) -> Iterator[tuple[str, str, object]]:
+    """Every local of every SDK-owned frame (module under `hushscript`) on the traceback of
+    `error` and of what it was raised from or while handling. The HTTP library's frames are not
+    the SDK's and are not walked."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        tb: TracebackType | None = current.__traceback__
+        while tb is not None:
+            module = str(tb.tb_frame.f_globals.get("__name__", ""))
+            if module.split(".", maxsplit=1)[0] == "hushscript":
+                for name, value in tb.tb_frame.f_locals.items():
+                    yield module, f"{tb.tb_frame.f_code.co_name}.{name}", value
+            tb = tb.tb_next
+        pending.extend(part for part in (current.__cause__, current.__context__) if part)
+
+
+def holds_text(value: object, secret: str, depth: int = 0) -> bool:
+    """Whether `value` is, or is a plain container of, text that carries `secret`."""
+    if depth > 6:  # a frame local nests a few levels at most
+        return False
+    if isinstance(value, str):
+        return secret in value
+    if isinstance(value, bytes):
+        return secret.encode() in value
+    if isinstance(value, dict):
+        return any(holds_text(part, secret, depth + 1) for item in value.items() for part in item)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(holds_text(part, secret, depth + 1) for part in value)
+    return False
+
+
+def assert_no_plain_secret(error: BaseException, *secrets: str) -> None:
+    walked = list(sdk_locals(error))
+    assert walked
+    for module, where, value in walked:
+        for secret in secrets:
+            assert not holds_text(value, secret), f"{secret!r} is a plain local: {module} {where}"
+
+
+def signed_url_of(api: FakeApi) -> str:
+    return str(next(r for r in api.requests if r.method == "PUT" and "__r2" in r.url.path).url)
+
+
+def no_etag(_n: int, _attempt: int) -> httpx.Response:
+    return httpx.Response(200)
+
+
+def test_a_failure_while_putting_a_part_leaves_the_signed_url_out_of_sdk_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(r2_hook=no_etag)
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(UploadError) as raised:
+        hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    url = signed_url_of(api)
+    assert "sig=" in url
+    assert_no_plain_secret(raised.value, url, url.split("?")[1])
+
+
+@pytest.mark.anyio
+async def test_the_asyncio_upload_leaves_the_signed_url_out_of_sdk_frames_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(r2_hook=no_etag)
+    hs = async_hs_for(monkeypatch, api)
+    with pytest.raises(UploadError) as raised:
+        await hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    url = signed_url_of(api)
+    assert_no_plain_secret(raised.value, url, url.split("?")[1])
+
+
+def test_a_claim_answer_the_sdk_cannot_use_leaves_the_token_out_of_sdk_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routes = Routes(
+        lambda _r: reply(201, {"pat": PAT, "user_id": 7, "scopes": [], "balance_seconds": 0})
+    )
+    monkeypatch.setattr(client_module, "_sync_inner", routes.sync)
+    with pytest.raises(OutcomeUnknownError) as raised:
+        Hushscript.agent_claim("sg_1", "s", base_url=BASE_URL, clock=FakeClock())
+    assert raised.value.received_token == PAT
+    assert_no_plain_secret(raised.value, PAT)
+
+
+def test_a_failure_of_the_sdk_while_reading_a_claim_leaves_the_token_out_of_sdk_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(_token: Secret, _fields: dict[str, object]) -> AgentAccount:
+        raise RuntimeError
+
+    routes = Routes(
+        lambda _r: reply(201, {"pat": PAT, "user_id": "u", "scopes": [], "balance_seconds": 0})
+    )
+    monkeypatch.setattr(client_module, "_sync_inner", routes.sync)
+    monkeypatch.setattr(agent_module, "account_of", refuse)
+    with pytest.raises(OutcomeUnknownError) as raised:
+        Hushscript.agent_claim("sg_1", "s", base_url=BASE_URL, clock=FakeClock())
+    assert raised.value.received_token == PAT
+    assert_no_plain_secret(raised.value, PAT)
+
+
+def test_a_rotation_the_sdk_cannot_use_leaves_the_token_out_of_sdk_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hs, _ = hs_on(monkeypatch, lambda _r: reply(200, {"pat": PAT, "pat_id": 7, "scopes": []}))
+    with pytest.raises(OutcomeUnknownError) as raised:
+        hs.agent.rotate_token()
+    assert_no_plain_secret(raised.value, PAT)
+
+
+def test_a_claim_that_fails_leaves_the_claim_secret_out_of_sdk_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    routes = Routes(refuse)
+    monkeypatch.setattr(client_module, "_sync_inner", routes.sync)
+    with pytest.raises(NetworkError) as raised:
+        Hushscript.agent_claim("sg_1", CLAIM_SECRET, base_url=BASE_URL, clock=FakeClock())
+    assert json.loads(routes.requests[0].content) == {"claim_secret": CLAIM_SECRET}
+    assert_no_plain_secret(raised.value, CLAIM_SECRET)
+
+
+@pytest.mark.anyio
+async def test_an_asyncio_claim_that_fails_leaves_the_claim_secret_out_of_sdk_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    routes = Routes(refuse)
+    monkeypatch.setattr(client_module, "_async_inner", routes.asynchronous)
+    with pytest.raises(NetworkError) as raised:
+        await AsyncHushscript.agent_claim(
+            "sg_1", CLAIM_SECRET, base_url=BASE_URL, clock=FakeClock()
+        )
+    assert_no_plain_secret(raised.value, CLAIM_SECRET)
+
+
+def test_a_signup_answer_the_sdk_cannot_use_leaves_the_claim_secret_out_of_sdk_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = {
+        "signup_id": "sg_1",
+        "claim_secret": CLAIM_SECRET,
+        "checkout_url": "https://checkout.test/pay",
+        "amount": 599,
+        "currency": "USD",
+        "expires_at": -1,
+    }
+    routes = Routes(lambda _r: reply(200, body))
+    monkeypatch.setattr(client_module, "_sync_inner", routes.sync)
+    with pytest.raises(HushscriptError) as raised:
+        Hushscript.agent_signup(
+            email="a@example.com",
+            pack="45min",
+            accept_terms="2026-10-01",
+            agent=AgentInfo("a", "p"),
+            base_url=BASE_URL,
+            clock=FakeClock(),
+        )
+    assert raised.value.code == "bad_response"
+    assert_no_plain_secret(raised.value, CLAIM_SECRET)
