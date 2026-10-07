@@ -15,12 +15,13 @@ from hushscript.transcribe.resume import (
     encode_token,
     file_required,
 )
+from hushscript.transcribe.segment import usable_segment
 
 STATE = ResumeState("job_1", "k" * 36, 1234, 21)
 
 
 @given(
-    st.text(min_size=1, max_size=40),
+    st.text(min_size=1, max_size=40).filter(usable_segment),
     st.text(min_size=16, max_size=128),
     st.integers(min_value=1, max_value=5_000_000_000),
     st.integers(min_value=15, max_value=36000),
@@ -80,3 +81,16 @@ def test_a_missing_file_is_its_own_code() -> None:
     error = file_required()
     assert error.code == "resume_file_required"
     assert error.hint is not None
+
+
+@pytest.mark.parametrize("job_id", ["", ".", "..", "a/b", "a\\b", "../x"])
+def test_a_token_naming_an_id_that_cannot_be_a_path_segment_is_refused(job_id: str) -> None:
+    token = encode_token(ResumeState(job_id, "k" * 36, 1234, 21))
+    with pytest.raises(ConfigurationError) as raised:
+        decode_token(token)
+    assert raised.value.code == "config_invalid"
+
+
+def test_a_token_naming_an_id_with_awkward_characters_is_kept() -> None:
+    state = ResumeState("j #?%é-1", "k" * 36, 1234, 21)
+    assert decode_token(encode_token(state)) == state

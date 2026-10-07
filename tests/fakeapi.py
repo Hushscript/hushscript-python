@@ -15,6 +15,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 import httpx
 
@@ -78,6 +79,10 @@ class FakeApi:
     part_hook: Callable[[int, int], Reply] | None = None
     heartbeat_steps: list[Reply] = field(default_factory=list)
     url_ttl_expired: bool = False
+    job_prefix: str = "job_"
+    null_part_urls: str = ""
+    """"create": the create answer's `part_urls` is null; "page": it is empty and the pages after
+    it are null; "late-page": only the pages after the first are null."""
     retain_bodies: bool = True
     r2_delay: float = 0.0
     create_delay: float = 0.0
@@ -181,7 +186,7 @@ class FakeApi:
         total = job.total or 0
         sig = "expired" if expired else "ok"
         urls = [
-            {"n": n, "url": f"{BASE_URL}/__r2/{job.id}/{n}?sig={sig}"}
+            {"n": n, "url": f"{BASE_URL}/__r2/{quote(job.id, safe='')}/{n}?sig={sig}"}
             for n in range(start, min(start + PAGE, total + 1))
         ]
         nxt = start + PAGE if start + PAGE <= total else None
@@ -212,11 +217,17 @@ class FakeApi:
                 size = body["size_bytes"]
                 part = None if self.proxied else max(1, math.ceil(size / self.parts))
                 total = None if part is None else math.ceil(size / part)
-                job = Job(f"job_{len(self.jobs) + 1}", size, part, total, key)
+                job = Job(f"{self.job_prefix}{len(self.jobs) + 1}", size, part, total, key)
                 self.jobs[job.id] = job
                 if key:
                     self.keys[key] = job.id
         direct = not self.proxied and job.state == "uploading"
+        upload = self._page(job, 1, expired=self.url_ttl_expired) if direct else None
+        if upload is not None and self.null_part_urls == "create":
+            upload["part_urls"] = None
+        if upload is not None and self.null_part_urls == "page":
+            upload["part_urls"] = []
+            upload["next_part_number"] = 1
         if self.after_create is not None:
             self.after_create()
         if self.drop_after_commit > 0:
@@ -227,7 +238,7 @@ class FakeApi:
             json={
                 "job_id": job.id,
                 "state": job.state,
-                "upload": self._page(job, 1, expired=self.url_ttl_expired) if direct else None,
+                "upload": upload,
             },
         )
 
@@ -238,7 +249,10 @@ class FakeApi:
         job = self._job_or_404(job_id)
         if isinstance(job, httpx.Response):
             return job
-        return httpx.Response(200, json=self._page(job, start))
+        page = self._page(job, start)
+        if self.null_part_urls == "page" or (self.null_part_urls == "late-page" and start > 1):
+            page["part_urls"] = None
+        return httpx.Response(200, json=page)
 
     def _r2(self, request: httpx.Request, job_id: str, n: int) -> httpx.Response:
         job = self.jobs[job_id]

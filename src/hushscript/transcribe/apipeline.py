@@ -28,6 +28,7 @@ from .resume import (
     job_missing,
     late_source,
 )
+from .segment import segment
 from .source import FileInput, Source, make_source
 from .upload import parse_created, stream_size_mismatch
 from .wait import await_job, finish, job_from, transcript_of
@@ -48,20 +49,20 @@ async def create(session: AsyncSession, body: Mapping[str, object]) -> Created:
     return parsed(response, session.credentials, parse_created)
 
 
-async def get_job(session: AsyncSession, job_id: str) -> Job:
-    return job_from(await session.http.get(f"/v1/jobs/{job_id}"), session.credentials)
+async def get_job(session: AsyncSession, job_segment: str) -> Job:
+    return job_from(await session.http.get(f"/v1/jobs/{job_segment}"), session.credentials)
 
 
 async def wait_job(
     session: AsyncSession,
-    job_id: str,
+    job_segment: str,
     wait_timeout: float,
     callbacks: Callbacks,
     token: str | None,
     first: Job | None = None,
 ) -> Job:
     return await await_job(
-        lambda: get_job(session, job_id),
+        lambda: get_job(session, job_segment),
         session.clock,
         wait_timeout,
         callbacks.progress,
@@ -73,7 +74,7 @@ async def wait_job(
 async def fetch_transcript(session: AsyncSession, job: Job) -> Transcript:
     transcript_id = finish(job)
     return transcript_of(
-        await session.http.get(f"/v1/transcripts/{transcript_id}"), session.credentials
+        await session.http.get(f"/v1/transcripts/{segment(transcript_id)}"), session.credentials
     )
 
 
@@ -105,7 +106,7 @@ async def _upload(
     concurrency: int,
     callbacks: Callbacks,
 ) -> None:
-    job_path = f"/v1/uploads/{created.job_id}"
+    job_path = f"/v1/uploads/{segment(created.job_id)}"
     uploader = AsyncUploader(session, created.job_id, created.plan, source, concurrency)
     total = source.size
 
@@ -149,7 +150,7 @@ async def _after_create(  # the upload, wait and fetch that follow a create
         if source is None:
             raise file_required()
         await _upload(session, created, source, options.concurrency, callbacks)
-    job = await wait_job(session, created.job_id, options.wait_timeout, callbacks, token)
+    job = await wait_job(session, segment(created.job_id), options.wait_timeout, callbacks, token)
     return await fetch_transcript(session, job)
 
 
@@ -176,7 +177,7 @@ async def run_transcribe(
     source = make_source(file, size)
     media = await asyncio.to_thread(check_media, source, options)
     account = json_body(await session.http.get("/v1/account"), session.credentials)
-    check_account(account, media, options)
+    check_account(account, media)
     key = options.new_key()
     state = ResumeState("", key, media.size, media.duration_seconds)
     body = create_body(media, options, key, title=options.title)
@@ -193,7 +194,7 @@ async def run_transcribe(
 
 async def read_job_to_resume(session: AsyncSession, job_id: str) -> Job:
     try:
-        return await get_job(session, job_id)
+        return await get_job(session, segment(job_id))
     except NotFoundError as missing:
         raise job_missing() from missing
 
@@ -220,7 +221,7 @@ async def run_resume(
         job = await read_job_to_resume(session, state.job_id)
         if job.state != UPLOADING:
             waited = await wait_job(
-                session, state.job_id, options.wait_timeout, callbacks, token, job
+                session, segment(state.job_id), options.wait_timeout, callbacks, token, job
             )
             return await fetch_transcript(session, waited)
         late = late_source(state, file, source)

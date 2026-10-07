@@ -19,6 +19,7 @@ from .resume import (
     job_missing,
     late_source,
 )
+from .segment import segment
 from .source import FileInput, Source, make_source
 from .upload import SyncUploader, parse_created, stream_size_mismatch
 from .wait import finish, job_from, transcript_of, wait_for_job
@@ -146,20 +147,20 @@ def create(session: SyncSession, body: Mapping[str, object]) -> Created:
     return parsed(response, session.credentials, parse_created)
 
 
-def get_job(session: SyncSession, job_id: str) -> Job:
-    return job_from(session.http.get(f"/v1/jobs/{job_id}"), session.credentials)
+def get_job(session: SyncSession, job_segment: str) -> Job:
+    return job_from(session.http.get(f"/v1/jobs/{job_segment}"), session.credentials)
 
 
 def wait_job(
     session: SyncSession,
-    job_id: str,
+    job_segment: str,
     wait_timeout: float,
     callbacks: Callbacks,
     token: str | None,
     first: Job | None = None,
 ) -> Job:
     return wait_for_job(
-        lambda: get_job(session, job_id),
+        lambda: get_job(session, job_segment),
         session.clock,
         wait_timeout,
         callbacks.progress,
@@ -170,7 +171,9 @@ def wait_job(
 
 def fetch_transcript(session: SyncSession, job: Job) -> Transcript:
     transcript_id = finish(job)
-    return transcript_of(session.http.get(f"/v1/transcripts/{transcript_id}"), session.credentials)
+    return transcript_of(
+        session.http.get(f"/v1/transcripts/{segment(transcript_id)}"), session.credentials
+    )
 
 
 def _upload(
@@ -180,7 +183,7 @@ def _upload(
     concurrency: int,
     callbacks: Callbacks,
 ) -> None:
-    job_path = f"/v1/uploads/{created.job_id}"
+    job_path = f"/v1/uploads/{segment(created.job_id)}"
     uploader = SyncUploader(session, created.job_id, created.plan, source, concurrency)
     heartbeat = Heartbeat(session.clock, session.log)
 
@@ -228,7 +231,7 @@ def _after_create(  # the upload, wait and fetch that follow a create, for a new
         if source is None:
             raise file_required()
         _upload(session, created, source, options.concurrency, callbacks)
-    job = wait_job(session, created.job_id, options.wait_timeout, callbacks, token)
+    job = wait_job(session, segment(created.job_id), options.wait_timeout, callbacks, token)
     return fetch_transcript(session, job)
 
 
@@ -243,7 +246,7 @@ def run_transcribe(
     source = make_source(file, size)
     media: Media = check_media(source, options)
     account = json_body(session.http.get("/v1/account"), session.credentials)
-    check_account(account, media, options)
+    check_account(account, media)
     key = options.new_key()
     state = ResumeState("", key, media.size, media.duration_seconds)
     body = create_body(media, options, key, title=options.title)
@@ -261,7 +264,7 @@ def run_transcribe(
 def read_job_to_resume(session: SyncSession, job_id: str) -> Job:
     """The job a token names; a 404 means it was deleted or pruned (spec 7.3)."""
     try:
-        return get_job(session, job_id)
+        return get_job(session, segment(job_id))
     except NotFoundError as missing:
         raise job_missing() from missing
 
@@ -289,7 +292,9 @@ def run_resume(
         if job.state != UPLOADING:
             return fetch_transcript(
                 session,
-                wait_job(session, state.job_id, options.wait_timeout, callbacks, token, job),
+                wait_job(
+                    session, segment(state.job_id), options.wait_timeout, callbacks, token, job
+                ),
             )
         late = late_source(state, file, source)
         callbacks.progress(UploadingProgress(0, 0, state.size))

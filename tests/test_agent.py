@@ -166,11 +166,13 @@ def test_a_policy_version_error_quotes_the_current_version(monkeypatch: pytest.M
     static(
         monkeypatch,
         lambda _r: reply(
-            422, error_body("policy_version_stale", 1043, current_version="2026-11-01")
+            422,
+            error_body("policy_version_stale", 1043, details={"current_version": "2026-11-01"}),
         ),
     )
     with pytest.raises(ValidationError) as raised:
         signup()
+    assert raised.value.details == {"current_version": "2026-11-01"}
     assert raised.value.hint
     assert "2026-11-01" in raised.value.hint
 

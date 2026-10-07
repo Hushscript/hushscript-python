@@ -26,7 +26,7 @@ from hushscript._response import parsed
 from hushscript.resources.account import Account, Balance
 from hushscript.resources.jobs import job_page
 from hushscript.resources.transcripts import deleted_page, summary_page
-from hushscript.transcribe.preflight import Media, Options, check_account
+from hushscript.transcribe.preflight import Media, check_account
 from hushscript.transcribe.upload import parse_created, parse_plan
 
 if TYPE_CHECKING:
@@ -83,7 +83,7 @@ TRANSLATED = transcript_body(
 
 def check_account_of(body: object) -> object:
     """The preflight read of `GET /v1/account`: it returns, or raises a HushscriptError."""
-    check_account(body, Media(size=1000, duration_seconds=60), Options())
+    check_account(body, Media(size=1000, duration_seconds=60))
     return True
 
 
