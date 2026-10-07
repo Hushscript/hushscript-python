@@ -99,7 +99,7 @@ def annotated(tracker: Tracker, run: Callable[[], T]) -> T:
     except (asyncio.CancelledError, KeyboardInterrupt) as interrupted:
         note_interrupt(tracker, interrupted)
         raise
-    except Exception as failure:
+    except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
         failed = annotate(tracker, failure)
     raise failed
 

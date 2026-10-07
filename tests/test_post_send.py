@@ -453,7 +453,7 @@ async def test_async_the_cause_of_an_unexpected_purchase_error_is_redacted(
 
 
 def whole_chain(error: BaseException) -> list[BaseException]:
-    """The error and everything reachable through `__cause__` and `__context__`, suppressed or not."""
+    """The error and all that is reachable through `__cause__` and `__context__`."""
     seen: list[BaseException] = []
     pending: list[BaseException | None] = [error]
     while pending:

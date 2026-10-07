@@ -358,7 +358,7 @@ class AsyncAgent:
         self._session = session
 
     async def rotate_token(self) -> RotatedToken:
-        """`hs.agent.rotate_token()` on the asyncio client; failures after the request was sent, an API
-        error answer apart, are the same `OutcomeUnknownError` with `received_token`."""
+        """`hs.agent.rotate_token()` on the asyncio client; a failure after the request was sent, an
+        API error answer apart, is the same `OutcomeUnknownError` with `received_token`."""
         response = await self._session.http.post("/v1/agent/credentials/rotate")
         return rotated(response, self._session.credentials)
