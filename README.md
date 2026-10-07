@@ -109,9 +109,7 @@ except HushscriptError as error:
     refused = error.status is not None and error.status < 500 and error.code != "bad_response"
     if error.idempotency_key is None or refused:
         raise  # a refusal charged nothing, so only a lost or unusable answer is worth a retry
-    purchase = hs.buy(
-        "300min", acknowledge_no_refund=True, idempotency_key=error.idempotency_key
-    )
+    purchase = hs.buy("300min", acknowledge_no_refund=True, idempotency_key=error.idempotency_key)
 ```
 
 A key you pass yourself must be 1 to 128 characters from `A-Za-z0-9_-`. Do not reuse a key for a
