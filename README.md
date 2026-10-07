@@ -22,6 +22,14 @@ with Hushscript() as hs:  # reads HUSHSCRIPT_TOKEN
     Path("meeting.srt").write_text(transcript.to_srt(), encoding="utf-8")
 ```
 
+`transcribe()` and `resume()` take a path, `bytes` or a binary file object. A seekable file is
+probed and read like a path; a non-seekable one (a pipe, a socket) is read once, in order, one part
+at a time, so it needs its exact `size` and `duration_seconds`:
+
+```python
+transcript = hs.transcribe(sys.stdin.buffer, size=size_in_bytes, duration_seconds=1800)
+```
+
 Every call has an asyncio twin on `AsyncHushscript` with the same names (`await` the calls and use
 `async for` on the lists); the examples below use the synchronous client.
 
