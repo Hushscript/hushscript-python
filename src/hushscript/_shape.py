@@ -68,15 +68,18 @@ def positive(value: object) -> Problem | None:
     return None if whole is not None and 0 < whole < INT_LIMIT else Problem((), "a number above 0")
 
 
+def finite_number(value: object) -> bool:
+    """A number inside the 64-bit range; total, where `math.isfinite` raises on a huge int."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    return abs(value) < INT_LIMIT
+
+
 def number(value: object) -> Problem | None:
     """A finite number; `NaN` and `Infinity` parse in Python but are not JSON."""
-    ok = (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        and abs(value) < INT_LIMIT
-    )
-    return None if ok else Problem((), "a number")
+    return None if finite_number(value) else Problem((), "a number")
 
 
 def timestamp(value: object) -> Problem | None:

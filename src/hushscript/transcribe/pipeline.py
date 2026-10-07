@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
 
-from hushscript._errors import HushscriptError, NotFoundError, raise_for_response
+from hushscript._errors import HushscriptError, NotFoundError, raise_for_response, unexpected_error
 from hushscript._models import Job, UploadingProgress
 from hushscript._response import json_body, parsed
 
@@ -46,15 +46,21 @@ class Tracker:
     token: str | None = None
     sent: bool = False
     """True from the moment the create goes out: the server may have committed it."""
+    callers: list[BaseException] = field(default_factory=list)
+    """What the caller's own callbacks raised: those pass through unchanged (R63)."""
 
     def note(self) -> str:
         if self.token is None:
             return f"{SENT_NOTE}{self.key}"
         return f"{RESUME_NOTE}{self.token} (idempotency key {self.key})"
 
+    def from_caller(self, failure: BaseException) -> bool:
+        return any(failure is raised for raised in self.callers)
+
 
 @contextmanager
 def annotated(tracker: Tracker) -> Generator[None]:
+    failed: HushscriptError | None = None
     try:
         yield
     except (asyncio.CancelledError, KeyboardInterrupt) as interrupted:
@@ -68,6 +74,16 @@ def annotated(tracker: Tracker) -> Generator[None]:
         if tracker.token is not None and error.resume_token is None:
             error.resume_token = tracker.token
         raise
+    except Exception as failure:
+        # R61 and R63: once the create is out nothing but an SDK error leaves, except what the
+        # caller's own callbacks raised.
+        if not tracker.sent or tracker.from_caller(failure):
+            raise
+        failed = unexpected_error(failure)
+    if failed is not None:
+        failed.idempotency_key = tracker.key
+        failed.resume_token = tracker.token
+        raise failed
 
 
 def replay_body(state: ResumeState) -> Mapping[str, object]:
@@ -82,10 +98,24 @@ def replay_body(state: ResumeState) -> Mapping[str, object]:
 class Callbacks:
     on_progress: Callable[[Progress], None] | None = None
     on_resume_token: Callable[[str], None] | None = None
+    raised: list[BaseException] = field(default_factory=list)
+    """Whatever the callbacks raised, so the pipeline can tell it from a failure of its own."""
 
     def progress(self, event: Progress) -> None:
         if self.on_progress is not None:
-            self.on_progress(event)
+            try:
+                self.on_progress(event)
+            except Exception as failure:
+                self.raised.append(failure)
+                raise
+
+    def resume_token(self, token: str) -> None:
+        if self.on_resume_token is not None:
+            try:
+                self.on_resume_token(token)
+            except Exception as failure:
+                self.raised.append(failure)
+                raise
 
 
 def percent(sent: int, total: int) -> int:
@@ -114,7 +144,7 @@ def wait_job(
         lambda: get_job(session, job_id),
         session.clock,
         wait_timeout,
-        callbacks.on_progress,
+        callbacks.progress,
         token,
         first,
     )
@@ -175,8 +205,7 @@ def _after_create(  # the upload, wait and fetch that follow a create, for a new
         ResumeState(created.job_id, state.idempotency_key, state.size, state.duration_seconds)
     )
     tracker.token = token
-    if callbacks.on_resume_token is not None:
-        callbacks.on_resume_token(token)
+    callbacks.resume_token(token)
     if created.state == UPLOADING:
         if source is None:
             raise file_required()
@@ -200,7 +229,7 @@ def run_transcribe(
     key = options.new_key()
     state = ResumeState("", key, media.size, media.duration_seconds)
     body = create_body(media, options, key, title=options.title)
-    tracker = Tracker(key)
+    tracker = Tracker(key, callers=callbacks.raised)
     with annotated(tracker):
         callbacks.progress(UploadingProgress(0, 0, state.size))
         tracker.sent = True
@@ -226,7 +255,7 @@ def run_resume(
     options.validate()
     state = decode_token(token)
     source = early_source(state, file)
-    tracker = Tracker(state.idempotency_key, token, sent=True)
+    tracker = Tracker(state.idempotency_key, token, sent=True, callers=callbacks.raised)
     with annotated(tracker):
         job = read_job_to_resume(session, state.job_id)
         if job.state != UPLOADING:

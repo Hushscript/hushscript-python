@@ -13,7 +13,7 @@ from hushscript._http import UNKNOWN_HINTS
 from hushscript._json import as_dict, as_list
 from hushscript._response import bad_response, parsed
 from hushscript._retry import CLAIM, ROTATE
-from hushscript._shape import as_text, as_whole, check_shape, to_datetime
+from hushscript._shape import INT_LIMIT, as_text, as_whole, check_shape, to_datetime
 from hushscript._shapes import AGENT_SIGNUP
 from hushscript.money import Money, to_money
 from hushscript.resources._params import path_id
@@ -144,11 +144,15 @@ def _whole(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _count(value: object) -> bool:
+    return _whole(value) and isinstance(value, int) and 0 <= value < INT_LIMIT
+
+
 def _claim_usable(fields: dict[str, object]) -> bool:
     return (
         isinstance(fields.get("user_id"), str)
         and _strings(fields.get("scopes")) is not None
-        and _whole(fields.get("balance_seconds"))
+        and _count(fields.get("balance_seconds"))
     )
 
 

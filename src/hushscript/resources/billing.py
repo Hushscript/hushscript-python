@@ -7,7 +7,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
-from hushscript._errors import HushscriptError, PaymentMethodRequiredError, raise_for_response
+from hushscript._errors import (
+    HushscriptError,
+    PaymentMethodRequiredError,
+    raise_for_response,
+    unexpected_error,
+)
 from hushscript._json import as_dict, as_list
 from hushscript._response import BadBodyError, parsed
 from hushscript._shape import (
@@ -293,7 +298,9 @@ def purchase_body(
 @contextmanager
 def purchase_sent(key: str) -> Generator[None]:
     """From the moment the purchase request goes out the card may have been charged, so every error
-    carries the key (spec 6.5); an interrupt is never converted, and carries it as a note."""
+    carries the key (spec 6.5), whatever its kind; an interrupt is never converted, and carries it
+    as a note."""
+    failed: HushscriptError | None = None
     try:
         yield
     except (asyncio.CancelledError, KeyboardInterrupt) as interrupted:
@@ -305,6 +312,11 @@ def purchase_sent(key: str) -> Generator[None]:
     except HushscriptError as error:
         error.idempotency_key = key
         raise
+    except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
+        failed = unexpected_error(failure)
+    if failed is not None:
+        failed.idempotency_key = key
+        raise failed
 
 
 def check_card_id(card_id: object) -> str:

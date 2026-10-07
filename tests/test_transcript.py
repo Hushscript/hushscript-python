@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
@@ -250,9 +250,22 @@ def test_every_value_that_holds_a_list_is_unhashable_by_design() -> None:
             set[object]().add(value)
 
 
-def test_the_private_state_of_a_transcript_is_not_a_constructor_argument() -> None:
-    names = {f.name for f in fields(Transcript) if f.init}
-    assert "_raw" not in names
-    assert "_translations" not in names
-    with pytest.raises(TypeError):
-        Transcript(_raw={})  # type: ignore[call-arg]  # pyright: ignore[reportCallIssue]
+def test_the_private_state_of_a_transcript_is_keyword_only() -> None:
+    private = [f for f in fields(Transcript) if f.name in {"_raw", "_translations"}]
+    assert len(private) == 2
+    assert all(f.kw_only for f in private)
+    assert not any(f.repr or f.compare for f in private)
+
+
+def test_a_replaced_transcript_keeps_its_private_state() -> None:
+    original = Transcript.from_api(
+        _body(
+            [_utterance("A", "hello")],
+            translations={"es": {"utterances": [_utterance("A", "hola")]}},
+        )
+    )
+    copy = replace(original, title="renamed")
+    assert copy.title == "renamed"
+    assert copy.to_json() == original.to_json()
+    assert "hola" in copy.to_text("es")
+    assert copy.to_srt("es") == original.to_srt("es")
