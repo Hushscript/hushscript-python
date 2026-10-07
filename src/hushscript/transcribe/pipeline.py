@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Mapping
 
     from hushscript._models import Progress
+    from hushscript._redact import Credentials
     from hushscript.transcript import Transcript
 
     from .session import SyncSession
@@ -48,6 +49,10 @@ class Tracker:
     """True from the moment the create goes out: the server may have committed it."""
     callers: list[BaseException] = field(default_factory=list)
     """What the caller's own callbacks raised: those pass through unchanged (R63)."""
+    credentials: Credentials | None = None
+    """What an unexpected failure's cause is redacted with."""
+    unexpected: HushscriptError | None = None
+    """The error `annotated` swallowed, for `pending` to hand back outside its handler."""
 
     def note(self) -> str:
         if self.token is None:
@@ -57,10 +62,19 @@ class Tracker:
     def from_caller(self, failure: BaseException) -> bool:
         return any(failure is raised for raised in self.callers)
 
+    def pending(self) -> HushscriptError:
+        """The error to raise after the `annotated` block has ended, where no exception is being
+        handled: the unredacted original is then not left on the error's `__context__`."""
+        if self.unexpected is None:
+            raise AssertionError("annotated ended without a result")
+        return self.unexpected
+
 
 @contextmanager
 def annotated(tracker: Tracker) -> Generator[None]:
-    failed: HushscriptError | None = None
+    """Every failure after the create went out is an SDK error that carries the key and the token.
+    A stray one is kept on the tracker and swallowed: the block must be followed by
+    `raise tracker.pending()`, which is reached only then."""
     try:
         yield
     except (asyncio.CancelledError, KeyboardInterrupt) as interrupted:
@@ -69,21 +83,23 @@ def annotated(tracker: Tracker) -> Generator[None]:
         if tracker.sent:
             interrupted.add_note(tracker.note())
         raise
-    except HushscriptError as error:
-        error.idempotency_key = tracker.key
-        if tracker.token is not None and error.resume_token is None:
-            error.resume_token = tracker.token
-        raise
     except Exception as failure:
-        # R61 and R63: once the create is out nothing but an SDK error leaves, except what the
-        # caller's own callbacks raised.
-        if not tracker.sent or tracker.from_caller(failure):
+        # R63 first: what the caller's own callbacks raised, an SDK error among it (a nested
+        # `buy()` failing with its own key), reaches the caller as it is.
+        if tracker.from_caller(failure):
             raise
-        failed = unexpected_error(failure)
-    if failed is not None:
+        if isinstance(failure, HushscriptError):
+            failure.idempotency_key = tracker.key
+            if tracker.token is not None and failure.resume_token is None:
+                failure.resume_token = tracker.token
+            raise
+        # R61: once the create is out nothing but an SDK error leaves.
+        if not tracker.sent:
+            raise
+        failed = unexpected_error(failure, tracker.credentials)
         failed.idempotency_key = tracker.key
         failed.resume_token = tracker.token
-        raise failed
+        tracker.unexpected = failed
 
 
 def replay_body(state: ResumeState) -> Mapping[str, object]:
@@ -229,12 +245,13 @@ def run_transcribe(
     key = options.new_key()
     state = ResumeState("", key, media.size, media.duration_seconds)
     body = create_body(media, options, key, title=options.title)
-    tracker = Tracker(key, callers=callbacks.raised)
+    tracker = Tracker(key, callers=callbacks.raised, credentials=session.credentials)
     with annotated(tracker):
         callbacks.progress(UploadingProgress(0, 0, state.size))
         tracker.sent = True
         created = create(session, body)
         return _after_create(session, created, tracker, state, source, options, callbacks)
+    raise tracker.pending()
 
 
 def read_job_to_resume(session: SyncSession, job_id: str) -> Job:
@@ -255,7 +272,13 @@ def run_resume(
     options.validate()
     state = decode_token(token)
     source = early_source(state, file)
-    tracker = Tracker(state.idempotency_key, token, sent=True, callers=callbacks.raised)
+    tracker = Tracker(
+        state.idempotency_key,
+        token,
+        sent=True,
+        callers=callbacks.raised,
+        credentials=session.credentials,
+    )
     with annotated(tracker):
         job = read_job_to_resume(session, state.job_id)
         if job.state != UPLOADING:
@@ -269,3 +292,4 @@ def run_resume(
         if created.job_id != state.job_id:
             raise job_missing()
         return _after_create(session, created, tracker, state, source, options, callbacks)
+    raise tracker.pending()

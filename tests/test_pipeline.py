@@ -113,7 +113,7 @@ def test_every_direct_put_failing_before_any_success_falls_back_to_the_api(
     assert api.count("PUT", PARTS) == 3
     assert api.count("PUT", R2) >= 1
     assert _complete_body(api) == b""
-    assert api.of("PUT", PARTS)[0].url.path.endswith("/1")
+    assert sorted(put.url.path.rsplit("/", 1)[1] for put in api.of("PUT", PARTS)) == ["1", "2", "3"]
 
 
 def test_a_part_that_keeps_failing_after_a_success_stays_direct(

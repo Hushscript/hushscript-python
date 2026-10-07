@@ -160,12 +160,13 @@ async def run_transcribe(
     key = options.new_key()
     state = ResumeState("", key, media.size, media.duration_seconds)
     body = create_body(media, options, key, title=options.title)
-    tracker = Tracker(key, callers=callbacks.raised)
+    tracker = Tracker(key, callers=callbacks.raised, credentials=session.credentials)
     with annotated(tracker):
         callbacks.progress(UploadingProgress(0, 0, state.size))
         tracker.sent = True
         created = await create(session, body)
         return await _after_create(session, created, tracker, state, source, options, callbacks)
+    raise tracker.pending()
 
 
 async def read_job_to_resume(session: AsyncSession, job_id: str) -> Job:
@@ -185,7 +186,13 @@ async def run_resume(
     options.validate()
     state = decode_token(token)
     source = early_source(state, file)
-    tracker = Tracker(state.idempotency_key, token, sent=True, callers=callbacks.raised)
+    tracker = Tracker(
+        state.idempotency_key,
+        token,
+        sent=True,
+        callers=callbacks.raised,
+        credentials=session.credentials,
+    )
     with annotated(tracker):
         job = await read_job_to_resume(session, state.job_id)
         if job.state != UPLOADING:
@@ -199,3 +206,4 @@ async def run_resume(
         if created.job_id != state.job_id:
             raise job_missing()
         return await _after_create(session, created, tracker, state, source, options, callbacks)
+    raise tracker.pending()

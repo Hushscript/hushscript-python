@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 import hushscript._client as client_module
+import hushscript.resources.agent as agent_module
 from conftest import TOKEN
 from helpers import BASE_URL, FakeClock, error_body, reply
 from hushscript import (
@@ -476,3 +477,113 @@ async def test_an_async_lost_claim_is_outcome_unknown(monkeypatch: pytest.Monkey
         await AsyncHushscript.agent_claim("sg_1", "s", base_url=BASE_URL)
     assert raised.value.hint == CLAIM_HINT
     assert len(routes.requests) == 1
+
+
+# --- the SDK failing on a 2xx answer (R61, spec 7.4) ---
+
+STRAY = f"stray failure with {NEW_TOKEN} in it"
+LONE = "hsr\u2026\ud800"
+
+
+def escaped(status: int, body: object) -> httpx.Response:
+    """A JSON answer written with escapes, as a server writes a lone surrogate."""
+    return httpx.Response(
+        status, content=json.dumps(body).encode(), headers={"content-type": "application/json"}
+    )
+
+
+def stray(*_args: object, **_kwargs: object) -> object:
+    raise TypeError(STRAY)
+
+
+def check_stray_loss(error: OutcomeUnknownError, hint: str) -> None:
+    assert error.hint == hint
+    assert error.received_token == NEW_TOKEN
+    cause = error.__cause__
+    assert cause is not None
+    assert "TypeError" in str(cause)
+    assert NEW_TOKEN not in str(cause) + str(error) + repr(error)
+    assert error.__context__ is None
+
+
+def test_an_sdk_failure_reading_a_claim_answer_is_a_lost_credential_with_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    static(monkeypatch, lambda _r: reply(201, CLAIMED))
+    monkeypatch.setattr(agent_module, "account_of", stray)
+    with pytest.raises(OutcomeUnknownError) as raised:
+        claim()
+    check_stray_loss(raised.value, CLAIM_HINT)
+
+
+@pytest.mark.anyio
+async def test_async_an_sdk_failure_reading_a_claim_answer_is_a_lost_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    static(monkeypatch, lambda _r: reply(201, CLAIMED))
+    monkeypatch.setattr(agent_module, "account_of", stray)
+    with pytest.raises(OutcomeUnknownError) as raised:
+        await AsyncHushscript.agent_claim("sg_1", "s", base_url=BASE_URL)
+    check_stray_loss(raised.value, CLAIM_HINT)
+
+
+def test_an_sdk_failure_reading_a_rotation_answer_leaves_the_client_on_the_token_the_caller_has(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/agent/credentials/rotate":
+            return reply(201, ROTATED)
+        return reply(200, {"balance_seconds": 60, "held_seconds": 0})
+
+    hs, routes = hs_on(monkeypatch, handler)
+    monkeypatch.setattr(agent_module, "rotated_of", stray)
+    with pytest.raises(OutcomeUnknownError) as raised:
+        hs.agent.rotate_token()
+    check_stray_loss(raised.value, ROTATE_HINT)
+    hs.balance()
+    assert routes.requests[1].headers["authorization"] == f"Bearer {raised.value.received_token}"
+
+
+@pytest.mark.anyio
+async def test_async_an_sdk_failure_reading_a_rotation_answer_is_a_lost_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hs, _ = async_hs_on(monkeypatch, lambda _r: reply(201, ROTATED))
+    monkeypatch.setattr(agent_module, "rotated_of", stray)
+    with pytest.raises(OutcomeUnknownError) as raised:
+        await hs.agent.rotate_token()
+    check_stray_loss(raised.value, ROTATE_HINT)
+
+
+def test_a_pat_with_a_lone_surrogate_in_a_claim_is_a_lost_credential_that_keeps_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    static(monkeypatch, lambda _r: escaped(201, {**CLAIMED, "pat": LONE}))
+    with pytest.raises(OutcomeUnknownError) as raised:
+        claim()
+    assert raised.value.hint == CLAIM_HINT
+    assert raised.value.received_token == LONE
+    assert isinstance(raised.value.__cause__, ApiError)
+    assert raised.value.__cause__.code == "bad_response"
+
+
+def test_a_pat_with_a_lone_surrogate_in_a_rotation_is_never_stored_and_breaks_nothing_later(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/agent/credentials/rotate":
+            return escaped(201, {**ROTATED, "pat": LONE})
+        return reply(500, error_body("internal_error", 5000))
+
+    hs, routes = hs_on(monkeypatch, handler)
+    with pytest.raises(OutcomeUnknownError) as raised:
+        hs.agent.rotate_token()
+    assert raised.value.hint == ROTATE_HINT
+    assert raised.value.received_token == LONE
+    credentials = hs._config.credentials  # pyright: ignore[reportPrivateUsage]
+    assert credentials.token == TOKEN
+    assert credentials.scrub(f"echo {LONE}") == f"echo {LONE}"  # never registered
+    with pytest.raises(ApiError) as later:
+        hs.balance()
+    assert later.value.status == 500
+    assert routes.requests[1].headers["authorization"] == f"Bearer {TOKEN}"

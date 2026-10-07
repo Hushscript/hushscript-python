@@ -198,6 +198,7 @@ class _Attempt:
         self.budget = settings.timeout
         self.deadline = self.started + self.budget
         self.body: _WrittenBody | None = None
+        self.answered = False
         self.phases: dict[str, float | None] = {}
         self._track_body()
 
@@ -230,6 +231,7 @@ class _Attempt:
         self._authorize()
         self.started = self.settings.clock.now()
         self.deadline = self.started + self.budget
+        self.answered = False
         if self.body is not None:
             self.body.done = False
         self.tighten()
@@ -272,7 +274,9 @@ class _Attempt:
         response.stream = _DeadlineBody(response.stream, self)
 
     def sent(self) -> bool:
-        return self.body is not None and self.body.done
+        """The body was fully written, or an answer came, which a transport that never reads the
+        body proves just as well."""
+        return self.answered or (self.body is not None and self.body.done)
 
     def judge(self, outcome: Outcome) -> Decision:
         kind = create_limit_kind(self.retry_class, outcome)
@@ -320,10 +324,11 @@ class _Attempt:
         return NetworkError(f"Could not reach the Hushscript API: {where} ({reason}).")
 
     def unexpected(self, failure: Exception) -> HushscriptError:
-        """Spec 9.2 and R61: a failure of the SDK's own after the request went out. A claim,
-        rotation or signup answer lost this way is as lost as one that never came (spec 7.4)."""
+        """Spec 9.2 and R61: a failure of the SDK's own. A claim, rotation or signup answer lost
+        this way after the request went out is as lost as one that never came (spec 7.4); one
+        before it was sent lost nothing."""
         error = unexpected_error(failure, self.settings.credentials)
-        if self.retry_class is not RetryClass.NEVER:
+        if self.retry_class is not RetryClass.NEVER or not self.sent():
             return error
         unknown = OutcomeUnknownError(
             f"The answer to {self.request.method} {self.label} could not be used "
@@ -392,6 +397,7 @@ class RetryingTransport(httpx.BaseTransport):
 
     def _send(self, attempt: _Attempt, request: httpx.Request) -> httpx.Response:
         response = self._inner.handle_request(request)
+        attempt.answered = True
         try:
             attempt.read(response)
             if not attempt.stream:
@@ -455,6 +461,7 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
         try:
             async with asyncio.timeout(max(attempt.remaining(), 0.0)):
                 response = await self._inner.handle_async_request(attempt.request)
+                attempt.answered = True
                 try:
                     attempt.read(response)
                     if not attempt.stream:

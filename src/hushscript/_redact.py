@@ -18,7 +18,8 @@ def _patterns(token: str) -> list[re.Pattern[str]]:
     percent-encoded, then what follows `pat.` and the bare secret after the last dot. Matching
     ignores case. A later piece is only ever a substring of an earlier one, so the order keeps the
     id from being left behind."""
-    pieces = [token, quote(token, safe="")]
+    # surrogatepass: a lone surrogate in a registered secret still has a percent-encoded form
+    pieces = [token, quote(token, safe="", errors="surrogatepass")]
     _, found, tail = token.partition("pat.")
     if found:
         pieces.append(tail)
