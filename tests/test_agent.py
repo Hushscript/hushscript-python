@@ -332,6 +332,32 @@ def test_a_rotation_returns_the_token_and_the_client_sends_it_from_then_on(
     assert routes.requests[1].headers["authorization"] == f"Bearer {NEW_TOKEN}"
 
 
+def test_a_rotation_answer_with_a_5000_digit_integer_still_yields_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = json.dumps(ROTATED)[:-1].encode() + b',"unused":' + b"9" * 5000 + b"}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/agent/credentials/rotate":
+            return httpx.Response(201, content=body)
+        return reply(200, {"balance_seconds": 60, "held_seconds": 0})
+
+    hs, routes = hs_on(monkeypatch, handler)
+    assert hs.agent.rotate_token().token == NEW_TOKEN
+    hs.balance()
+    assert routes.requests[1].headers["authorization"] == f"Bearer {NEW_TOKEN}"
+
+
+def test_a_rotation_answer_with_a_5000_digit_integer_and_a_bad_field_keeps_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = json.dumps({**ROTATED, "pat_id": 5})[:-1].encode() + b',"unused":' + b"9" * 5000 + b"}"
+    hs, _routes = hs_on(monkeypatch, lambda _r: httpx.Response(201, content=body))
+    with pytest.raises(OutcomeUnknownError) as raised:
+        hs.agent.rotate_token()
+    assert raised.value.received_token == NEW_TOKEN
+
+
 def test_a_rotation_without_an_expiry_never_expires(monkeypatch: pytest.MonkeyPatch) -> None:
     body = {key: value for key, value in ROTATED.items() if key != "expires_at"}
     hs, _ = hs_on(monkeypatch, lambda _r: reply(200, body))

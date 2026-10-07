@@ -12,7 +12,7 @@ from hushscript._errors import (
     unexpected_error,
 )
 from hushscript._http import UNKNOWN_HINTS
-from hushscript._json import as_dict, as_list
+from hushscript._json import as_dict, as_list, loads
 from hushscript._response import bad_response, parsed
 from hushscript._retry import CLAIM, ROTATE
 from hushscript._shape import INT_LIMIT, as_text, as_whole, check_shape, to_datetime
@@ -181,7 +181,7 @@ def _rotate_usable(fields: dict[str, object]) -> bool:
 
 def _decode(response: httpx.Response) -> dict[str, object]:
     try:
-        return as_dict(response.json()) or {}
+        return as_dict(loads(response.content)) or {}
     except (ValueError, RecursionError):
         return {}
 
@@ -227,18 +227,6 @@ def _register(seen: str | None, credentials: Credentials) -> None:
     token check; anything else the server put in `pat` is never registered."""
     if seen is not None and acceptable_token(seen.strip()):
         credentials.remember(seen.strip())
-
-
-def read_answer(
-    response: httpx.Response, credentials: Credentials
-) -> tuple[dict[str, object], str | None]:
-    """The fields and the `pat` of a claim or rotation answer; a non-2xx answer raises its API
-    error. A 2xx is decoded whatever its status."""
-    raise_for_response(response, credentials=credentials)
-    fields = _decode(response)
-    seen = _pat_of(fields)
-    _register(seen, credentials)
-    return fields, seen
 
 
 def settle(

@@ -10,9 +10,10 @@ from hypothesis import strategies as st
 
 from conftest import TOKEN
 from helpers import reply
+from hushscript import OutcomeUnknownError
 from hushscript._errors import error_from_response
 from hushscript._redact import REDACTED, TOKEN_PATTERN, Credentials, redact
-from hushscript.resources.agent import read_answer
+from routes import hs_on
 
 
 def _token(version: int, region: str, public: str, secret: str) -> str:
@@ -108,10 +109,14 @@ def test_past_and_remembered_tokens_are_scrubbed_the_same_way() -> None:
     assert text == f"{REDACTED} {REDACTED} {REDACTED}"
 
 
-def test_a_remembered_token_is_taken_trimmed_from_an_answer() -> None:
+def test_a_remembered_token_is_taken_trimmed_from_an_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     odd = "hsr1-odd-token-value-1234"
-    credentials = Credentials()
-    read_answer(reply(201, {"pat": f"  {odd}\n"}), credentials)
+    hs, _routes = hs_on(monkeypatch, lambda _r: reply(201, {"pat": f"  {odd}\n"}))
+    with pytest.raises(OutcomeUnknownError):
+        hs.agent.rotate_token()
+    credentials = hs._config.credentials  # pyright: ignore[reportPrivateUsage]
     assert credentials.scrub(f"echo {odd}") == f"echo {REDACTED}"
 
 

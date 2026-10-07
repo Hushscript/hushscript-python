@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
 import math
 import re
 from typing import TYPE_CHECKING, Any, ClassVar, Final
 
-from ._json import as_dict, as_list
+from ._json import as_dict, as_list, loads
 from ._redact import Credentials, Secret, redact
 from .generated.catalog import ERROR_CATALOG
 from .generated.hints import HINTS
@@ -28,7 +27,6 @@ _MAX_RETRY_AFTER_DIGITS: Final = 19
 RETRY_AFTER_CAP: Final = float(2**53 - 1)
 """R71: a Retry-After that is a non-negative integer, however large, is "over 60" and reported at
 most this."""
-_MAX_JSON_INT_DIGITS: Final = 4000
 
 
 def _camel(key: str) -> str:
@@ -425,17 +423,9 @@ def _operation_of(response: httpx.Response) -> str | None:
     return operation_key(request.method, request.url.path)
 
 
-def _bounded_int(text: str) -> int:
-    """An integer literal of any length: past what `int()` reads it is beyond every range the SDK
-    accepts, and keeps its sign."""
-    if len(text) <= _MAX_JSON_INT_DIGITS:
-        return int(text)
-    return -_INT_LIMIT * 2 if text.startswith("-") else _INT_LIMIT * 2
-
-
 def _parse_body(response: httpx.Response) -> dict[str, object]:
     try:
-        parsed: object = json.loads(response.content, parse_int=_bounded_int)
+        parsed: object = loads(response.content)
     except (ValueError, RecursionError):  # not JSON, or nested past what the parser reads
         return {}
     return as_dict(parsed) or {}

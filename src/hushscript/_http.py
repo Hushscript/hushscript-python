@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import random
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, cast
@@ -16,7 +15,7 @@ from ._errors import (
     parse_retry_after,
     unexpected_error,
 )
-from ._json import as_dict
+from ._json import as_dict, loads
 from ._retry import (
     CLAIM,
     ROTATE,
@@ -93,7 +92,7 @@ def _label(request: httpx.Request) -> str:
 
 def _has_idempotency_key(request: httpx.Request) -> bool:
     try:
-        parsed: object = json.loads(request.content)
+        parsed: object = loads(request.content)
     except (ValueError, RecursionError, httpx.RequestNotRead):
         return False
     key = (as_dict(parsed) or {}).get(IDEMPOTENCY_FIELD)
@@ -102,7 +101,7 @@ def _has_idempotency_key(request: httpx.Request) -> bool:
 
 def _slug_of(body: bytes) -> str | None:
     try:
-        parsed: object = json.loads(body)
+        parsed: object = loads(body)
     except (ValueError, RecursionError):
         return None
     slug = (as_dict(parsed) or {}).get("error")
