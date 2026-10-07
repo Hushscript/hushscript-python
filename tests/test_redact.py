@@ -123,3 +123,14 @@ def test_a_server_slug_that_echoes_the_token_is_not_stored_in_the_code(slug: str
     error = error_from_response(response, credentials=Credentials(TOKEN))
     assert error.code == REDACTED
     assert SECRET not in repr(error) + str(error) + error.code
+
+
+def test_a_registered_secret_with_a_lone_surrogate_never_breaks_redaction() -> None:
+    odd = "hsr\u2026\ud800" + "a" * 20
+    credentials = Credentials(TOKEN)
+    credentials.remember(odd)
+    credentials.replace(odd)
+    assert credentials.scrub(f"echo {odd} {quote(odd, safe='', errors='surrogatepass')}") == (
+        f"echo {REDACTED} {REDACTED}"
+    )
+    assert credentials.scrub(f"echo {TOKEN}") == f"echo {REDACTED}"

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, TypeVar
 
 from hushscript._config import acceptable_token
 from hushscript._errors import (
+    HushscriptError,
     OutcomeUnknownError,
     ValidationError,
     raise_for_response,
+    unexpected_error,
 )
 from hushscript._http import UNKNOWN_HINTS
 from hushscript._json import as_dict, as_list
@@ -20,6 +22,7 @@ from hushscript.resources._params import path_id
 from hushscript.resources.account import Balance, minutes_of
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from datetime import datetime
 
     import httpx
@@ -29,6 +32,8 @@ if TYPE_CHECKING:
 
 CLAIM_ROUTE: Final = "POST /v1/agent/accounts/{signup_id}/claim"
 ROTATE_ROUTE: Final = "POST /v1/agent/credentials/rotate"
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,34 +186,85 @@ def _decode(response: httpx.Response) -> dict[str, object]:
         return {}
 
 
+def _unknown(
+    route: str, hint_key: str, seen: str | None, credentials: Credentials
+) -> OutcomeUnknownError:
+    return OutcomeUnknownError(
+        credentials.scrub(f"The answer to {route} could not be used, so the token may be lost."),
+        hint=UNKNOWN_HINTS[hint_key],
+        received_token=seen,
+    )
+
+
 def lost_credential(  # one place that builds the spec 7.4 error
     response: httpx.Response, route: str, hint_key: str, seen: str | None, credentials: Credentials
 ) -> OutcomeUnknownError:
     """A claim or rotation answered 2xx without a usable credential: it was minted and may be
     lost, exactly as if the answer never arrived (spec 7.4). `seen` is whatever the answer carried
     in its `pat` field, kept on the error so it is not lost."""
-    failure = OutcomeUnknownError(
-        credentials.scrub(f"The answer to {route} could not be used, so the token may be lost."),
-        hint=UNKNOWN_HINTS[hint_key],
-        received_token=seen,
-    )
+    failure = _unknown(route, hint_key, seen, credentials)
     failure.__cause__ = bad_response(response, "credential response")
     return failure
+
+
+def _stray_credential(
+    failure: Exception, route: str, hint_key: str, seen: str | None, credentials: Credentials
+) -> OutcomeUnknownError:
+    """The same loss when the SDK itself failed on the answer (R61): the original rides along as
+    a redacted cause, and `seen` is kept on the error."""
+    lost = _unknown(route, hint_key, seen, credentials)
+    lost.__cause__ = unexpected_error(failure, credentials).__cause__
+    return lost
+
+
+def _pat_of(fields: dict[str, object]) -> str | None:
+    pat = fields.get("pat")
+    return pat if isinstance(pat, str) else None
+
+
+def _register(seen: str | None, credentials: Credentials) -> None:
+    """Scrubs a token the answer carried from every text from now on, trimmed, once it passes the
+    token check; anything else the server put in `pat` is never registered."""
+    if seen is not None and acceptable_token(seen.strip()):
+        credentials.remember(seen.strip())
 
 
 def read_answer(
     response: httpx.Response, credentials: Credentials
 ) -> tuple[dict[str, object], str | None]:
     """The fields and the `pat` of a claim or rotation answer; a non-2xx answer raises its API
-    error. A 2xx is decoded whatever its status, and the token it carried is scrubbed from every
-    text from now on, trimmed."""
+    error. A 2xx is decoded whatever its status."""
     raise_for_response(response, credentials=credentials)
     fields = _decode(response)
-    pat = fields.get("pat")
-    seen = pat if isinstance(pat, str) else None
-    if seen is not None:
-        credentials.remember(seen.strip())
+    seen = _pat_of(fields)
+    _register(seen, credentials)
     return fields, seen
+
+
+def settle(
+    response: httpx.Response,
+    credentials: Credentials,
+    route: str,
+    hint_key: str,
+    use: Callable[[dict[str, object], str | None], T],
+) -> T:
+    """`use` of a claim or rotation answer. A failure of the SDK's own while reading it, after the
+    answer came, is as lost as an answer that never arrived (spec 7.4 and R61): an
+    `OutcomeUnknownError` that keeps the `pat` the answer carried. It is raised once the handler
+    has ended, so the unredacted original is not left on its `__context__`."""
+    raise_for_response(response, credentials=credentials)
+    seen: str | None = None
+    lost: OutcomeUnknownError
+    try:
+        fields = _decode(response)
+        seen = _pat_of(fields)
+        _register(seen, credentials)
+        return use(fields, seen)
+    except HushscriptError:
+        raise
+    except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
+        lost = _stray_credential(failure, route, hint_key, seen, credentials)
+    raise lost
 
 
 def account_of(token: str, fields: dict[str, object]) -> AgentAccount:
@@ -250,25 +306,31 @@ def signed_up(response: httpx.Response, credentials: Credentials) -> AgentSignup
 
 
 def claimed(response: httpx.Response, credentials: Credentials) -> AgentAccount:
-    fields, seen = read_answer(response, credentials)
-    if seen is None or not acceptable_token(seen) or not _claim_usable(fields):
-        raise lost_credential(response, CLAIM_ROUTE, CLAIM, seen, credentials)
-    return account_of(seen, fields)
+    def use(fields: dict[str, object], seen: str | None) -> AgentAccount:
+        if seen is None or not acceptable_token(seen) or not _claim_usable(fields):
+            raise lost_credential(response, CLAIM_ROUTE, CLAIM, seen, credentials)
+        return account_of(seen, fields)
+
+    return settle(response, credentials, CLAIM_ROUTE, CLAIM, use)
 
 
 def rotated(response: httpx.Response, credentials: Credentials) -> RotatedToken:
     """The rotation answer. The server revoked the old token when it answered 2xx, so a token that
     passes the token check is the one the client sends from then on (spec 7.4), whatever else is
-    wrong with the answer. The one exception is an expiry that cannot be read, as in the TypeScript
-    SDK: the answer is then not trusted at all, the old token stays in use and the new one is only
-    kept on the error."""
-    fields, seen = read_answer(response, credentials)
-    token_usable = seen is not None and acceptable_token(seen)
-    if seen is not None and token_usable and _expiry_usable(fields):
-        credentials.replace(seen)
-    if seen is None or not token_usable or not _rotate_usable(fields):
-        raise lost_credential(response, ROTATE_ROUTE, ROTATE, seen, credentials)
-    return rotated_of(seen, fields)
+    wrong with the answer, and whatever the SDK then fails on: the error carries it as
+    `received_token`, so the caller always holds the token the client sends. The one exception is
+    an expiry that cannot be read, as in the TypeScript SDK: the answer is then not trusted at all,
+    the old token stays in use and the new one is only kept on the error."""
+
+    def use(fields: dict[str, object], seen: str | None) -> RotatedToken:
+        token_usable = seen is not None and acceptable_token(seen)
+        if seen is not None and token_usable and _expiry_usable(fields):
+            credentials.replace(seen)
+        if seen is None or not token_usable or not _rotate_usable(fields):
+            raise lost_credential(response, ROTATE_ROUTE, ROTATE, seen, credentials)
+        return rotated_of(seen, fields)
+
+    return settle(response, credentials, ROTATE_ROUTE, ROTATE, use)
 
 
 class Agent:

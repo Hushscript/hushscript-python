@@ -16,10 +16,19 @@ import hushscript.transcribe.apipeline as apipeline_module
 import hushscript.transcribe.pipeline as pipeline_module
 from conftest import TOKEN
 from fakeapi import FakeApi
-from helpers import FakeClock, Script, async_client, reply, sync_client, transcript_body
+from helpers import (
+    BASE_URL,
+    FakeClock,
+    Script,
+    async_client,
+    reply,
+    settings_for,
+    sync_client,
+    transcript_body,
+)
 from hushscript import HushscriptError, OutcomeUnknownError, Purchase, Transcript
 from hushscript._errors import parse_retry_after
-from hushscript._http import _Attempt
+from hushscript._http import AsyncRetryingTransport, RetryingTransport, _Attempt
 from hushscript._redact import Credentials
 from hushscript._response import parsed
 from hushscript._shape import finite_number, number
@@ -29,6 +38,7 @@ from routes import async_hs_on, hs_on
 from test_billing import PURCHASE, Shop
 
 SECRET_TEXT = f"stray failure with {TOKEN} in it"
+SECRET_FORMS = f"stray {TOKEN.upper()} and {TOKEN.rpartition('.')[2]} in it"
 OK = {"status": "ok", "balance_seconds": 600}
 
 
@@ -190,9 +200,32 @@ async def test_async_a_stray_failure_inside_the_transport_never_escapes_raw() ->
     assert raised.value.code == "unexpected_error"
 
 
-def test_a_stray_failure_on_a_claim_is_an_unknown_outcome() -> None:
-    client = sync_client(Script([TypeError(SECRET_TEXT)]), FakeClock())
-    with pytest.raises(OutcomeUnknownError) as raised:
+def written_then_failing(failure: Exception) -> httpx.MockTransport:
+    """A transport that takes the whole request body, as a socket does, and then fails."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        list(request.stream)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+        raise failure
+
+    return httpx.MockTransport(handler)
+
+
+def async_written_then_failing(failure: Exception) -> httpx.MockTransport:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        _ = [chunk async for chunk in request.stream]  # type: ignore[union-attr]  # pyright: ignore[reportGeneralTypeIssues, reportUnknownVariableType, reportUnknownMemberType]
+        raise failure
+
+    return httpx.MockTransport(handler)
+
+
+def test_a_stray_failure_on_a_claim_after_the_body_was_written_is_an_unknown_outcome() -> None:
+    transport = RetryingTransport(
+        written_then_failing(TypeError(SECRET_TEXT)), settings_for(FakeClock(), token=TOKEN)
+    )
+    with (
+        httpx.Client(base_url=BASE_URL, transport=transport) as client,
+        pytest.raises(OutcomeUnknownError) as raised,
+    ):
         client.post("/v1/agent/accounts/sg_1/claim", json={})
     assert raised.value.code == "outcome_unknown"
     assert raised.value.hint
@@ -200,10 +233,13 @@ def test_a_stray_failure_on_a_claim_is_an_unknown_outcome() -> None:
 
 
 @pytest.mark.anyio
-async def test_async_a_stray_failure_on_a_rotation_is_an_unknown_outcome() -> None:
-    client = async_client(Script([TypeError(SECRET_TEXT)]), FakeClock())
-    with pytest.raises(OutcomeUnknownError):
-        await client.post("/v1/agent/credentials/rotate")
+async def test_async_a_stray_failure_on_a_rotation_after_the_send_is_an_unknown_outcome() -> None:
+    transport = AsyncRetryingTransport(
+        async_written_then_failing(TypeError(SECRET_TEXT)), settings_for(FakeClock(), token=TOKEN)
+    )
+    async with httpx.AsyncClient(base_url=BASE_URL, transport=transport) as client:
+        with pytest.raises(OutcomeUnknownError):
+            await client.post("/v1/agent/credentials/rotate", json={})
 
 
 def test_a_stray_failure_after_the_create_carries_the_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -315,6 +351,204 @@ async def test_async_an_error_from_a_callback_after_the_send_propagates_unchange
             media(), duration_seconds=100, on_progress=on_progress
         )
     assert raised.value is mine
+
+
+# --- R63: an SDK error from the caller's callback is the caller's too ---
+
+
+def nested_failure() -> HushscriptError:
+    """What a `buy()` inside a callback raises: an SDK error with its own key."""
+    nested = HushscriptError("the nested buy failed", code="unexpected_error")
+    nested.idempotency_key = "buy-key"
+    return nested
+
+
+@pytest.mark.parametrize("callback", ["on_resume_token", "on_progress"])
+def test_an_sdk_error_from_a_callback_reaches_the_caller_with_its_own_key(
+    monkeypatch: pytest.MonkeyPatch, callback: str
+) -> None:
+    mine = nested_failure()
+    calls: list[object] = []
+
+    def raiser(event: object) -> None:
+        calls.append(event)
+        if callback == "on_resume_token" or len(calls) > 1:  # the first progress is pre-send
+            raise mine
+
+    with pytest.raises(HushscriptError) as raised:
+        hs_for(monkeypatch, FakeApi()).transcribe(
+            media(),
+            duration_seconds=100,
+            idempotency_key="k" * 24,
+            on_progress=raiser if callback == "on_progress" else None,
+            on_resume_token=raiser if callback == "on_resume_token" else None,
+        )
+    assert raised.value is mine
+    assert (mine.idempotency_key, mine.resume_token) == ("buy-key", None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("callback", ["on_resume_token", "on_progress"])
+async def test_async_an_sdk_error_from_a_callback_reaches_the_caller_with_its_own_key(
+    monkeypatch: pytest.MonkeyPatch, callback: str
+) -> None:
+    mine = nested_failure()
+    calls: list[object] = []
+
+    def raiser(event: object) -> None:
+        calls.append(event)
+        if callback == "on_resume_token" or len(calls) > 1:
+            raise mine
+
+    with pytest.raises(HushscriptError) as raised:
+        await async_hs_for(monkeypatch, FakeApi()).transcribe(
+            media(),
+            duration_seconds=100,
+            idempotency_key="k" * 24,
+            on_progress=raiser if callback == "on_progress" else None,
+            on_resume_token=raiser if callback == "on_resume_token" else None,
+        )
+    assert raised.value is mine
+    assert (mine.idempotency_key, mine.resume_token) == ("buy-key", None)
+
+
+# --- the cause of an unexpected error is redacted with every form of the credentials ---
+
+
+def check_forms_redacted(error: HushscriptError) -> None:
+    text = str(error.__cause__)
+    assert "TypeError" in text
+    assert TOKEN.upper() not in text
+    assert TOKEN.rpartition(".")[2] not in text
+
+
+def explode_forms(*_args: object, **_kwargs: object) -> object:
+    raise TypeError(SECRET_FORMS)
+
+
+def test_the_cause_of_an_unexpected_purchase_error_is_redacted_with_the_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(billing_module, "purchase_of", explode_forms)
+    hs, _ = hs_on(monkeypatch, Shop(purchases=[reply(200, OK)]))
+    with pytest.raises(HushscriptError) as raised:
+        hs.buy("300min", idempotency_key="my-key")
+    check_forms_redacted(raised.value)
+
+
+@pytest.mark.anyio
+async def test_async_the_cause_of_an_unexpected_purchase_error_is_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(billing_module, "purchase_of", explode_forms)
+    hs, _ = async_hs_on(monkeypatch, Shop(purchases=[reply(200, OK)]))
+    with pytest.raises(HushscriptError) as raised:
+        await hs.buy("300min", idempotency_key="my-key")
+    check_forms_redacted(raised.value)
+
+
+def test_the_cause_of_an_unexpected_pipeline_error_is_redacted_and_leaves_no_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pipeline_module, "parse_created", explode_forms)
+    with pytest.raises(HushscriptError) as raised:
+        hs_for(monkeypatch, FakeApi()).transcribe(
+            media(), duration_seconds=100, idempotency_key="k" * 24
+        )
+    check_forms_redacted(raised.value)
+    assert raised.value.__context__ is None
+    assert raised.value.idempotency_key == "k" * 24
+
+
+@pytest.mark.anyio
+async def test_async_the_cause_of_an_unexpected_pipeline_error_is_redacted_and_leaves_no_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def explode_async(*_args: object, **_kwargs: object) -> object:
+        raise TypeError(SECRET_FORMS)
+
+    monkeypatch.setattr(apipeline_module, "_upload", explode_async)
+    tokens: list[str] = []
+    with pytest.raises(HushscriptError) as raised:
+        await async_hs_for(monkeypatch, FakeApi()).transcribe(
+            media(), duration_seconds=100, idempotency_key="k" * 24, on_resume_token=tokens.append
+        )
+    check_forms_redacted(raised.value)
+    assert raised.value.__context__ is None
+    assert raised.value.resume_token == tokens[0]
+
+
+# --- a failure before the request went out lost nothing ---
+
+
+class UnreadingTransport(httpx.BaseTransport):
+    """Fails without ever reading the request body, as a transport that breaks before the send."""
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        raise TypeError(f"{SECRET_TEXT} ({request.method})")
+
+
+class AsyncUnreadingTransport(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        raise TypeError(f"{SECRET_TEXT} ({request.method})")
+
+
+class UnreadingAnswer(httpx.BaseTransport, httpx.AsyncBaseTransport):
+    """Answers 200 without reading the body: the answer alone proves the request went out."""
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={}, request=request)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={}, request=request)
+
+
+ROUTES = ["/v1/agent/accounts/sg_1/claim", "/v1/agent/credentials/rotate", "/v1/agent/accounts"]
+
+
+@pytest.mark.parametrize("path", ROUTES)
+def test_a_failure_before_a_claim_rotation_or_signup_was_sent_is_unexpected_not_unknown(
+    path: str,
+) -> None:
+    transport = RetryingTransport(UnreadingTransport(), settings_for(FakeClock(), token=TOKEN))
+    with (
+        httpx.Client(base_url=BASE_URL, transport=transport) as client,
+        pytest.raises(HushscriptError) as raised,
+    ):
+        client.post(path, json={})
+    assert type(raised.value) is HushscriptError
+    assert raised.value.code == "unexpected_error"
+    assert TOKEN not in str(raised.value.__cause__)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", ROUTES)
+async def test_async_a_failure_before_the_request_was_sent_is_unexpected_not_unknown(
+    path: str,
+) -> None:
+    transport = AsyncRetryingTransport(
+        AsyncUnreadingTransport(), settings_for(FakeClock(), token=TOKEN)
+    )
+    async with httpx.AsyncClient(base_url=BASE_URL, transport=transport) as client:
+        with pytest.raises(HushscriptError) as raised:
+            await client.post(path, json={})
+    assert type(raised.value) is HushscriptError
+    assert raised.value.code == "unexpected_error"
+
+
+def test_a_failure_after_the_answer_came_is_unknown_even_when_the_body_was_never_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(_attempt: _Attempt, _response: httpx.Response) -> object:
+        raise TypeError(SECRET_TEXT)
+
+    monkeypatch.setattr(_Attempt, "outcome_of", broken)
+    transport = RetryingTransport(UnreadingAnswer(), settings_for(FakeClock(), token=TOKEN))
+    with (
+        httpx.Client(base_url=BASE_URL, transport=transport) as client,
+        pytest.raises(OutcomeUnknownError),
+    ):
+        client.post("/v1/agent/credentials/rotate", json={})
 
 
 @pytest.mark.parametrize("wait_timeout", [10**400, -(10**400)])

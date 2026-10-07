@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Generator, Iterator
     from datetime import datetime
 
+    from hushscript._redact import Credentials
     from hushscript.transcribe.session import AsyncSession, SyncSession
 
 PURCHASE_KEY: Final = re.compile(r"[A-Za-z0-9_-]{1,128}")
@@ -296,7 +297,7 @@ def purchase_body(
 
 
 @contextmanager
-def purchase_sent(key: str) -> Generator[None]:
+def purchase_sent(key: str, credentials: Credentials) -> Generator[None]:
     """From the moment the purchase request goes out the card may have been charged, so every error
     carries the key (spec 6.5), whatever its kind; an interrupt is never converted, and carries it
     as a note."""
@@ -313,7 +314,7 @@ def purchase_sent(key: str) -> Generator[None]:
         error.idempotency_key = key
         raise
     except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
-        failed = unexpected_error(failure)
+        failed = unexpected_error(failure, credentials)
     if failed is not None:
         failed.idempotency_key = key
         raise failed
@@ -377,7 +378,7 @@ class Billing:
         key = purchase_key(idempotency_key)
         card_id = choose_card(self.cards())
         body = purchase_body(pack, key, card_id, acknowledge_no_refund=acknowledge_no_refund)
-        with purchase_sent(key):
+        with purchase_sent(key, self._session.credentials):
             response = self._session.http.post("/v1/billing/purchase", json=body)
             return parsed(response, self._session.credentials, purchase_of)
 
@@ -445,7 +446,7 @@ class AsyncBilling:
         key = purchase_key(idempotency_key)
         card_id = choose_card(await self.cards())
         body = purchase_body(pack, key, card_id, acknowledge_no_refund=acknowledge_no_refund)
-        with purchase_sent(key):
+        with purchase_sent(key, self._session.credentials):
             response = await self._session.http.post("/v1/billing/purchase", json=body)
             return parsed(response, self._session.credentials, purchase_of)
 
