@@ -186,10 +186,10 @@ class _Attempt:
         self.retry_class = (
             override if isinstance(override, RetryClass) else classify(request.method, path)
         )
-        key = _idempotency_key(request)
-        # R61: every error after a purchase went out carries its key, whoever made the request
-        self.purchase_key = key if on_base and path == PURCHASE_PATH else None
-        if self.retry_class is RetryClass.CREATE and key is None:
+        # R61: every error after a purchase went out carries its key, whoever made the request.
+        # Only that request's body is read for it: a part's body is megabytes of media.
+        self.purchase_key = _idempotency_key(request) if on_base and path == PURCHASE_PATH else None
+        if self.retry_class is RetryClass.CREATE and _idempotency_key(request) is None:
             # Only a keyed create is a safe replay; without a key it is any other mutation.
             self.retry_class = RetryClass.MUTATE
         self.stream = (

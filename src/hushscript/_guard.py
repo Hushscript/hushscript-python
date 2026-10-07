@@ -1,10 +1,10 @@
 """`hs.api` keeps one promise: nothing but an SDK error leaves it (R61).
 
-The generated functions parse the answer after the transport has returned it, with `response.json()`
-and `from_dict`, and a body that is not what they expect raises a bare `JSONDecodeError`, `KeyError`
-or `TypeError`. The transport cannot see a call is generated, but the generated function is on the
-stack that called it, so it runs that function's own parser on the answer before handing it back and
-turns a failure into an SDK error. Generated code is never edited (spec section 5).
+The generated functions parse the answer after the transport has returned it, reading its JSON and
+building a model from it, and a body that is not what they expect raises a bare `JSONDecodeError`,
+`KeyError` or `TypeError`. The transport cannot see a call is generated, but the generated function
+is on the stack that called it, so it runs that function's own parser on the answer before handing
+it back and turns a failure into an SDK error. Generated code is never edited (spec section 5).
 """
 
 from __future__ import annotations
