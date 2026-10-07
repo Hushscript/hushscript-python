@@ -193,7 +193,6 @@ class _Attempt:
         self.deadline = self.started + self.budget
         self.body: _WrittenBody | None = None
         self.phases: dict[str, float | None] = {}
-        self._authorize()
         self._track_body()
 
     def _authorize(self) -> None:
@@ -219,6 +218,9 @@ class _Attempt:
                 self.budget = min(self.settings.ceiling, max(self.settings.timeout, *asked))
 
     def begin(self) -> None:
+        # The token is read per attempt, after any pacing or backoff sleep, so a rotation applies
+        # to a request that was queued behind it (spec 7.4, R44).
+        self._authorize()
         self.started = self.settings.clock.now()
         self.deadline = self.started + self.budget
         if self.body is not None:
@@ -226,8 +228,8 @@ class _Attempt:
         self.tighten()
 
     def pace(self) -> float:
-        """Seconds to wait before an upload create may go out (spec 7.5); every one is paced,
-        whatever its retry class."""
+        """Seconds to wait before an upload create may go out (spec 7.5); every attempt takes a
+        token, whatever its retry class, a retry included."""
         bucket = self.settings.bucket
         if bucket is None or not self.on_base or self.request.method != "POST":
             return 0.0
@@ -330,9 +332,9 @@ class RetryingTransport(httpx.BaseTransport):
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         attempt = _Attempt(request, self._settings)
-        if (paced := attempt.pace()) > 0:
-            self._settings.clock.sleep(paced)
         while True:
+            if (paced := attempt.pace()) > 0:
+                self._settings.clock.sleep(paced)
             attempt.begin()
             try:
                 response = self._inner.handle_request(request)
@@ -365,9 +367,9 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         attempt = _Attempt(request, self._settings)
-        if (paced := attempt.pace()) > 0:
-            await self._settings.clock.asleep(paced)
         while True:
+            if (paced := attempt.pace()) > 0:
+                await self._settings.clock.asleep(paced)
             attempt.begin()
             try:
                 response = await self._send(attempt)
