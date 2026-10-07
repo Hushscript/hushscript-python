@@ -154,6 +154,20 @@ def test_retry_after_61_raises_at_once_without_sleeping(monkeypatch: pytest.Monk
     assert clock.sleeps == []
 
 
+def test_a_retry_after_of_400_digits_raises_at_once_without_sleeping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reply_429 = reply(429, error_body("rate_limited", 5000), {"Retry-After": "9" * 400})
+    script = Script([reply_429])
+    _patch(monkeypatch, script)
+    clock = FakeClock()
+    with pytest.raises(RateLimitError) as raised:
+        Hushscript(TOKEN, base_url="http://127.0.0.1:4010", clock=clock).balance()
+    assert raised.value.retry_after == float(2**53 - 1)
+    assert clock.sleeps == []
+    assert len(script.requests) == 1
+
+
 def test_context_manager_closes_the_client(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch(monkeypatch, Script([reply(200, ACCOUNT)]))
     with Hushscript(TOKEN, base_url="http://127.0.0.1:4010") as hs:

@@ -342,8 +342,11 @@ class Agent:
     def rotate_token(self) -> RotatedToken:
         """Mints a successor token and revokes the one in use. The client sends the new token from
         then on, to retries already queued as well; store the returned one right away. It is never
-        retried: a lost answer, or one without a usable token, is an `OutcomeUnknownError` whose
-        hint says what to check, and the client keeps its old token then."""
+        retried. Apart from an API error answer, a failure after the request was sent is an
+        `OutcomeUnknownError` whose hint says what to check: a lost answer, an answer without a
+        usable token, or a failure of the SDK's own while reading it. The error's `received_token`
+        holds the token the answer carried; the client sends it from then on when it passes the
+        token check and the expiry can be read, and keeps its old token otherwise."""
         response = self._session.http.post("/v1/agent/credentials/rotate")
         return rotated(response, self._session.credentials)
 
@@ -355,5 +358,7 @@ class AsyncAgent:
         self._session = session
 
     async def rotate_token(self) -> RotatedToken:
+        """`hs.agent.rotate_token()` on the asyncio client; failures after the request was sent, an API
+        error answer apart, are the same `OutcomeUnknownError` with `received_token`."""
         response = await self._session.http.post("/v1/agent/credentials/rotate")
         return rotated(response, self._session.credentials)

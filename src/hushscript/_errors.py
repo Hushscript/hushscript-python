@@ -25,6 +25,10 @@ _INT_LIMIT: Final = 2**63
 """Numbers the SDK reads stay inside a signed 64-bit range; beyond it, or not finite, they are
 absent."""
 _MAX_RETRY_AFTER_DIGITS: Final = 19
+RETRY_AFTER_CAP: Final = float(2**53 - 1)
+"""R71: a Retry-After that is a non-negative integer, however large, is "over 60" and reported at
+most this."""
+_MAX_JSON_INT_DIGITS: Final = 4000
 
 
 def _camel(key: str) -> str:
@@ -80,8 +84,18 @@ def _minutes(details: Mapping[str, object], keys: tuple[str, ...], *, up: bool) 
     return None
 
 
+def _retry_after_detail(value: object) -> float | None:
+    """R71: `retry_after_seconds` as a number of seconds, capped; negative, non-finite and
+    non-numeric values are absent."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return None if value < 0 else float(min(value, RETRY_AFTER_CAP))
+
+
 def _whole_seconds(retry_after: float | None, from_details: object) -> str | None:
-    seconds = retry_after if retry_after is not None else _number(from_details)
+    seconds = retry_after if retry_after is not None else _retry_after_detail(from_details)
     return None if seconds is None else str(math.ceil(seconds))
 
 
@@ -384,9 +398,9 @@ def parse_retry_after(value: str | None) -> float | None:
     if not text.isascii() or not text.isdigit():
         return None
     digits = text.lstrip("0") or "0"
-    if len(digits) > _MAX_RETRY_AFTER_DIGITS or int(digits) >= _INT_LIMIT:
-        return None
-    return float(int(digits))
+    if len(digits) > _MAX_RETRY_AFTER_DIGITS:
+        return RETRY_AFTER_CAP
+    return float(min(int(digits), RETRY_AFTER_CAP))
 
 
 def _extra_details(body: Mapping[str, object]) -> dict[str, object]:
@@ -411,9 +425,17 @@ def _operation_of(response: httpx.Response) -> str | None:
     return operation_key(request.method, request.url.path)
 
 
+def _bounded_int(text: str) -> int:
+    """An integer literal of any length: past what `int()` reads it is beyond every range the SDK
+    accepts, and keeps its sign."""
+    if len(text) <= _MAX_JSON_INT_DIGITS:
+        return int(text)
+    return -_INT_LIMIT * 2 if text.startswith("-") else _INT_LIMIT * 2
+
+
 def _parse_body(response: httpx.Response) -> dict[str, object]:
     try:
-        parsed: object = json.loads(response.content)
+        parsed: object = json.loads(response.content, parse_int=_bounded_int)
     except (ValueError, RecursionError):  # not JSON, or nested past what the parser reads
         return {}
     return as_dict(parsed) or {}

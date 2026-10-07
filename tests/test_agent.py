@@ -467,6 +467,25 @@ async def test_the_async_agent_calls_match_the_sync_ones(monkeypatch: pytest.Mon
 
 
 @pytest.mark.anyio
+async def test_async_a_rotation_returns_the_token_and_the_client_sends_it_from_then_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/agent/credentials/rotate":
+            return reply(201, ROTATED)
+        return reply(200, {"balance_seconds": 60, "held_seconds": 0})
+
+    hs, routes = async_hs_on(monkeypatch, handler)
+    rotated = await hs.agent.rotate_token()
+    assert (rotated.token, rotated.token_id, rotated.scopes) == (NEW_TOKEN, "pat_9", ["transcribe"])
+    assert rotated.expires_at is not None
+    assert rotated.expires_at.year == 2027
+    await hs.balance()
+    assert routes.requests[0].headers["authorization"] == f"Bearer {TOKEN}"
+    assert routes.requests[1].headers["authorization"] == f"Bearer {NEW_TOKEN}"
+
+
+@pytest.mark.anyio
 async def test_an_async_lost_claim_is_outcome_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     def lost(_request: httpx.Request) -> httpx.Response:
         raise httpx.ReadError("reset")
