@@ -22,6 +22,11 @@ with Hushscript() as hs:  # reads HUSHSCRIPT_TOKEN
     Path("meeting.srt").write_text(transcript.to_srt(), encoding="utf-8")
 ```
 
+Every call has an asyncio twin on `AsyncHushscript` with the same names (`await` the calls and use
+`async for` on the lists); the examples below use the synchronous client.
+
+## Inputs
+
 `transcribe()` and `resume()` take a path, `bytes` or a binary file object. A seekable file is
 probed and read like a path; a non-seekable one (a pipe, a socket) is read once, in order, one part
 at a time, so it needs its exact `size` and `duration_seconds`:
@@ -29,9 +34,6 @@ at a time, so it needs its exact `size` and `duration_seconds`:
 ```python
 transcript = hs.transcribe(sys.stdin.buffer, size=size_in_bytes, duration_seconds=1800)
 ```
-
-Every call has an asyncio twin on `AsyncHushscript` with the same names (`await` the calls and use
-`async for` on the lists); the examples below use the synchronous client.
 
 ## Check my balance
 
@@ -275,6 +277,21 @@ anything else, convert it first:
 ```sh
 ffmpeg -i input -vn -c:a libopus output.opus
 ```
+
+## Configuration
+
+| Option                   | Env var               | Default                                                              |
+| ------------------------ | --------------------- | -------------------------------------------------------------------- |
+| `token` (first argument) | `HUSHSCRIPT_TOKEN`    | none                                                                 |
+| `base_url`               | `HUSHSCRIPT_BASE_URL` | `https://api.hushscript.com`                                         |
+| `timeout`                | none                  | 60 s per request                                                     |
+| `max_retries`            | none                  | 3                                                                    |
+| `log_level`              | `HUSHSCRIPT_LOG`      | `off` (`debug` logs one metadata line per request to standard error) |
+| `clock`                  | none                  | `SystemClock`; pass a `Clock` in tests                               |
+
+An explicit option beats its environment variable. The base URL must be `https://`, or `http://` to
+`localhost`, `127.0.0.1` or `[::1]`, with no path. Each upload part has its own 300 s timeout, which
+you cannot change.
 
 ## Privacy
 
