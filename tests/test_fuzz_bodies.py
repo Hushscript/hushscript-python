@@ -83,7 +83,7 @@ TRANSLATED = transcript_body(
 
 def check_account_of(body: object) -> object:
     """The preflight read of `GET /v1/account`: it returns, or raises a HushscriptError."""
-    check_account(body, Media(size=1000, duration_seconds=60), Options())
+    check_account(body, Media(size=1000, duration_seconds=60))
     return True
 
 

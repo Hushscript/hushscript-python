@@ -16,6 +16,7 @@ from fakeapi import FakeApi, Job, error_reply
 from hushscript import (
     AuthenticationError,
     ConfigurationError,
+    DailyLimitError,
     FileLimitError,
     InsufficientBalanceError,
     JobFailedError,
@@ -511,15 +512,19 @@ def test_a_bad_option_is_refused_with_no_request(monkeypatch: pytest.MonkeyPatch
     assert api.requests == []
 
 
-def test_a_balance_below_the_estimate_is_refused_before_the_create(
+def test_a_balance_below_the_estimate_is_left_to_the_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    api = FakeApi(balance=10)
+    step = error_reply(
+        402, "insufficient_balance", 3001, needed_seconds=21, balance_seconds=10, held_seconds=0
+    )
+    api = FakeApi(balance=10, create_steps=[step])
     hs = hs_for(monkeypatch, api)
     with pytest.raises(InsufficientBalanceError) as raised:
         hs.transcribe(media(), duration_seconds=21)
-    assert raised.value.status is None
-    assert api.count("POST", CREATE) == 0
+    assert raised.value.status == 402
+    assert raised.value.details["balance_seconds"] == 10
+    assert api.count("POST", CREATE) == 1
     assert api.count("GET", "/v1/account") == 1
 
 
@@ -743,8 +748,8 @@ def test_an_error_from_the_create_itself_carries_the_key_but_no_token(
 
 
 def test_a_preflight_error_has_no_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    hs = hs_for(monkeypatch, FakeApi(balance=1))
-    with pytest.raises(InsufficientBalanceError) as raised:
+    hs = hs_for(monkeypatch, FakeApi(used_today=36000))
+    with pytest.raises(DailyLimitError) as raised:
         hs.transcribe(media(), duration_seconds=100)
     assert raised.value.idempotency_key is None
 

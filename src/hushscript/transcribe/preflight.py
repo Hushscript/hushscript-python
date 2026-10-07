@@ -8,12 +8,10 @@ from typing import TYPE_CHECKING, Final, cast
 from hushscript._errors import (
     DailyLimitError,
     FileLimitError,
-    InsufficientBalanceError,
     PreflightError,
     UnsupportedMediaError,
 )
 from hushscript._json import as_dict
-from hushscript.generated.catalog import ERROR_CATALOG
 
 from .probe import probe_duration
 from .sniff import sniff
@@ -35,7 +33,6 @@ KEY_MIN: Final = 16
 KEY_MAX: Final = 128
 _PRINTABLE_FIRST: Final = 0x21
 _PRINTABLE_LAST: Final = 0x7E
-TRANSLATION_SURCHARGE: Final = 0.25
 
 
 def invalid_option(message: str) -> PreflightError:
@@ -169,32 +166,14 @@ def check_media(source: Source, options: Options) -> Media:
     return Media(size=source.size, duration_seconds=declared)
 
 
-def estimate_seconds(duration_seconds: int, options: Options) -> int:
-    """The billable estimate: medical doubles it and each translation target adds a quarter."""
-    factor = (2 if options.medical else 1) + TRANSLATION_SURCHARGE * len(options.translate_to)
-    return math.ceil(duration_seconds * factor)
-
-
 def _whole(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def check_account(account: object, media: Media, options: Options) -> None:
-    """Spec 8.1 step 5, from one `GET /v1/account`. Advisory: the server decides."""
+def check_account(account: object, media: Media) -> None:
+    """Spec 8.1 step 5, from one `GET /v1/account`: the daily limit only. The balance is the server's
+    to judge at create (R77)."""
     fields = as_dict(account) or {}
-    needed = estimate_seconds(media.duration_seconds, options)
-    balance = _whole(fields.get("balance_seconds"))
-    if balance is not None and balance < needed:
-        entry = ERROR_CATALOG.get("insufficient_balance")
-        raise InsufficientBalanceError(
-            entry.meaning if entry is not None else "Not enough balance.",
-            code="insufficient_balance",
-            details={
-                "needed_seconds": needed,
-                "balance_seconds": balance,
-                "held_seconds": _whole(fields.get("held_seconds")) or 0,
-            },
-        )
     limits = as_dict(fields.get("limits")) or {}
     daily = _whole(limits.get("max_daily_seconds"))
     used = _whole(limits.get("used_today_seconds"))

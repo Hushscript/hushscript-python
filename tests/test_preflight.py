@@ -5,7 +5,6 @@ import pytest
 from hushscript import (
     DailyLimitError,
     FileLimitError,
-    InsufficientBalanceError,
     PreflightError,
     UnsupportedMediaError,
 )
@@ -15,7 +14,6 @@ from hushscript.transcribe.preflight import (
     check_account,
     check_media,
     create_body,
-    estimate_seconds,
 )
 from hushscript.transcribe.source import BytesSource
 from pipe import media
@@ -165,20 +163,6 @@ def test_an_mp3_with_no_readable_duration_asks_for_one() -> None:
     assert raised.value.code == "duration_unreadable"
 
 
-@pytest.mark.parametrize(
-    ("options", "expected"),
-    [
-        (Options(), 21),
-        (Options(medical=True, language="en"), 42),
-        (Options(translate_to=("de",)), 27),
-        (Options(translate_to=("de", "fr", "es"), medical=True, language="en"), 58),
-        (Options(multichannel=True), 21),
-    ],
-)
-def test_the_estimate_uses_the_multipliers_of_the_spec(options: Options, expected: int) -> None:
-    assert estimate_seconds(21, options) == expected
-
-
 MEDIA = Media(size=100, duration_seconds=21)
 
 
@@ -190,29 +174,18 @@ def _account(balance: int = 36000, used: int = 0, daily: int = 36000) -> dict[st
     }
 
 
-def test_enough_balance_and_headroom_passes() -> None:
-    check_account(_account(balance=21, used=36000 - 21), MEDIA, Options())
+def test_exactly_the_daily_headroom_passes() -> None:
+    check_account(_account(used=36000 - 21), MEDIA)
 
 
-def test_too_little_balance_is_refused_with_the_numbers() -> None:
-    with pytest.raises(InsufficientBalanceError) as raised:
-        check_account(_account(balance=10), MEDIA, Options())
-    error = raised.value
-    assert (error.code, error.status, error.numeric_code) == ("insufficient_balance", None, None)
-    assert error.details == {"needed_seconds": 21, "balance_seconds": 10, "held_seconds": 4}
-    assert error.hint is not None
-    assert "1 needed, 0 available" in error.hint
-    assert error.message
-
-
-def test_a_negative_balance_is_refused() -> None:
-    with pytest.raises(InsufficientBalanceError):
-        check_account(_account(balance=-5), MEDIA, Options())
+def test_a_balance_below_any_estimate_is_not_a_preflight_refusal() -> None:
+    check_account(_account(balance=0), MEDIA)
+    check_account(_account(balance=-5), MEDIA)
 
 
 def test_the_daily_limit_is_refused_with_the_numbers() -> None:
     with pytest.raises(DailyLimitError) as raised:
-        check_account(_account(used=36000 - 20, daily=36000), MEDIA, Options())
+        check_account(_account(used=36000 - 20, daily=36000), MEDIA)
     error = raised.value
     assert error.code == "daily_limit"
     assert error.details == {"used_today_seconds": 35980, "max_daily_seconds": 36000}
@@ -220,6 +193,6 @@ def test_the_daily_limit_is_refused_with_the_numbers() -> None:
     assert "599 of 600 min" in error.hint
 
 
-@pytest.mark.parametrize("account", [None, {}, {"limits": []}, {"balance_seconds": "7"}])
+@pytest.mark.parametrize("account", [None, {}, {"limits": []}, {"limits": {"max_daily_seconds": "7", "used_today_seconds": 1}}])
 def test_an_account_the_sdk_cannot_read_is_not_a_refusal(account: object) -> None:
-    check_account(account, MEDIA, Options())
+    check_account(account, MEDIA)

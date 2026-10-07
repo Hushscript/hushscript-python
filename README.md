@@ -235,7 +235,7 @@ carry on without a second charge.
 ## What the SDK does for you
 
 - **Checks before it spends.** It sniffs the format from the file's bytes, probes the duration,
-  and refuses a file the server would refuse, or one your balance or daily limit cannot cover,
+  and refuses a file the server would refuse, or one your daily limit cannot cover,
   before any minutes are held.
 - **Keeps retries from charging twice.** Every upload and purchase carries an idempotency key, and
   retries reuse it. A `resume_token` replays the same job instead of starting a new one, and the

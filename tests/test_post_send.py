@@ -133,13 +133,13 @@ def test_a_refused_purchase_with_unusable_numbers_is_an_sdk_error_with_the_key(
     [-(10**400), 10**400, float("inf"), 2**63, -(2**63)],
     ids=["-400-digits", "400-digits", "inf", "2**63", "-2**63"],
 )
-def test_the_preflight_balance_read_never_overflows(balance: float) -> None:
+def test_the_preflight_account_read_never_overflows(balance: float) -> None:
     account = {
         "balance_seconds": balance,
         "limits": {"max_daily_seconds": balance, "used_today_seconds": 10**400},
     }
     with contextlib.suppress(HushscriptError):
-        check_account(account, Media(size=1000, duration_seconds=60), Options())
+        check_account(account, Media(size=1000, duration_seconds=60))
 
 
 # --- a stray failure after the send ---

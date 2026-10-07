@@ -176,7 +176,7 @@ async def run_transcribe(
     source = make_source(file, size)
     media = await asyncio.to_thread(check_media, source, options)
     account = json_body(await session.http.get("/v1/account"), session.credentials)
-    check_account(account, media, options)
+    check_account(account, media)
     key = options.new_key()
     state = ResumeState("", key, media.size, media.duration_seconds)
     body = create_body(media, options, key, title=options.title)
