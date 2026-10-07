@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import threading
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -18,8 +20,16 @@ from hushscript import (
     UploadingProgress,
     WaitTimeoutError,
 )
+from hushscript._response import BadBodyError
 from hushscript.transcribe.source import PathSource
-from hushscript.transcribe.upload import Action, Mode, PartAttempts, UploadState
+from hushscript.transcribe.upload import (
+    MAX_PART_BYTES,
+    Action,
+    Mode,
+    PartAttempts,
+    UploadState,
+    parse_plan,
+)
 from pipe import PipeClock, async_hs_for, hs_for, media
 
 if TYPE_CHECKING:
@@ -235,7 +245,17 @@ def test_a_plan_that_does_not_describe_the_file_is_bad_part_plan(
 
 @pytest.mark.parametrize(
     ("part", "total"),
-    [(0, 3), (3000, 0), (-1, 3), (3000, -4), (1.5, 3), (3000, 2.0), ("3000", 2), (True, 2)],
+    [
+        (0, 3),
+        (3000, 0),
+        (-1, 3),
+        (3000, -4),
+        (1.5, 3),
+        (3000, 2.0),
+        ("3000", 2),
+        (True, 2),
+        (MAX_PART_BYTES + 1, 1),
+    ],
 )
 def test_a_plan_with_a_number_that_cannot_be_one_is_bad_response_with_the_key(
     monkeypatch: pytest.MonkeyPatch, part: object, total: object
@@ -551,3 +571,235 @@ def test_the_losing_direct_part_is_sent_through_the_api_with_no_direct_part_left
     assert api.part_calls == {1: 1, 2: 1, 3: 1}
     assert api.of("POST", COMPLETE)[0].content == b""
     assert all(not direct for _, _, direct in api.jobs["job_1"].parts.values())
+
+
+# --- R83: the part size ceiling ---
+
+PLAN: dict[str, object] = {
+    "part_size_bytes": 3000,
+    "total_parts": 3,
+    "part_urls": [],
+    "next_part_number": None,
+}
+
+
+def test_a_part_size_of_exactly_32_mib_is_a_plan_and_one_byte_more_is_not() -> None:
+    assert parse_plan({**PLAN, "part_size_bytes": MAX_PART_BYTES, "total_parts": 1}).part_size == (
+        MAX_PART_BYTES
+    )
+    with pytest.raises(BadBodyError):
+        parse_plan({**PLAN, "part_size_bytes": MAX_PART_BYTES + 1, "total_parts": 1})
+
+
+def test_a_part_url_page_above_the_part_size_ceiling_is_bad_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(parts=40)
+    page = {**PLAN, "part_size_bytes": MAX_PART_BYTES + 1, "total_parts": 40}
+    api.overrides.append(
+        ("GET", r"/v1/uploads/[^/]+/part-urls", lambda: httpx.Response(200, json=page))
+    )
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(ApiError) as raised:
+        hs.transcribe(media(4000), duration_seconds=100, concurrency=1)
+    assert raised.value.code == "bad_response"
+
+
+# --- R70: a null part_urls means direct upload is not available (spec 8.3, 8.4) ---
+
+R2 = r"/__r2/[^/]+/\d+"
+PARTS = r"/v1/uploads/[^/]+/parts/\d+"
+PART_URLS = r"/v1/uploads/[^/]+/part-urls"
+
+
+def _all_proxied(api: FakeApi, parts: int) -> None:
+    assert api.count("PUT", R2) == 0
+    assert api.count("PUT", PARTS) == parts
+    assert api.of("POST", COMPLETE)[0].content == b""
+
+
+@pytest.mark.parametrize(("parts", "size"), [(3, 9000), (40, 4000)], ids=["no-next", "next-part"])
+def test_a_null_part_urls_on_the_create_answer_goes_proxied(
+    monkeypatch: pytest.MonkeyPatch, parts: int, size: int
+) -> None:
+    api = FakeApi(parts=parts, null_part_urls="create")
+    hs = hs_for(monkeypatch, api)
+    hs.transcribe(media(size), duration_seconds=100, concurrency=1)
+    _all_proxied(api, parts)
+    assert api.count("GET", PART_URLS) == 0
+
+
+@pytest.mark.parametrize(("parts", "size"), [(3, 9000), (40, 4000)], ids=["no-next", "next-part"])
+async def test_async_a_null_part_urls_on_the_create_answer_goes_proxied(
+    monkeypatch: pytest.MonkeyPatch, parts: int, size: int
+) -> None:
+    api = FakeApi(parts=parts, null_part_urls="create")
+    hs = async_hs_for(monkeypatch, api)
+    await hs.transcribe(media(size), duration_seconds=100, concurrency=1)
+    _all_proxied(api, parts)
+    assert api.count("GET", PART_URLS) == 0
+
+
+def test_a_null_part_urls_page_before_any_direct_success_goes_proxied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(parts=3, null_part_urls="page")
+    hs = hs_for(monkeypatch, api)
+    hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    _all_proxied(api, 3)
+    assert api.count("GET", PART_URLS) == 1
+
+
+async def test_async_a_null_part_urls_page_before_any_direct_success_goes_proxied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(parts=3, null_part_urls="page")
+    hs = async_hs_for(monkeypatch, api)
+    await hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    _all_proxied(api, 3)
+    assert api.count("GET", PART_URLS) == 1
+
+
+def test_a_null_part_urls_page_after_a_direct_success_keeps_the_direct_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pins the other half of the Fallback rule; the switch itself is the tests above."""
+    api = FakeApi(parts=40, null_part_urls="late-page")
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(UploadError) as raised:
+        hs.transcribe(media(4000), duration_seconds=100, concurrency=1)
+    assert raised.value.code == "part_url_missing"
+    assert api.count("PUT", R2) == 16
+    assert api.count("PUT", PARTS) == 0
+
+
+async def test_async_a_null_part_urls_page_after_a_direct_success_keeps_the_direct_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(parts=40, null_part_urls="late-page")
+    hs = async_hs_for(monkeypatch, api)
+    with pytest.raises(UploadError) as raised:
+        await hs.transcribe(media(4000), duration_seconds=100, concurrency=1)
+    assert raised.value.code == "part_url_missing"
+    assert api.count("PUT", R2) == 16
+    assert api.count("PUT", PARTS) == 0
+
+
+# --- ids from the server go into paths as one encoded segment ---
+
+
+def _created(job_id: str) -> httpx.Response:
+    body = json.dumps({"job_id": job_id, "state": "uploading", "upload": None})  # ASCII escapes
+    return httpx.Response(200, content=body.encode(), headers=JSON)
+
+
+UNUSABLE_IDS = ["", ".", "..", "a/b", "../x", "a\\b", "\ud800"]
+
+
+@pytest.mark.parametrize("job_id", UNUSABLE_IDS)
+def test_a_create_answer_with_an_unusable_job_id_is_bad_response(
+    monkeypatch: pytest.MonkeyPatch, job_id: str
+) -> None:
+    api = FakeApi()
+    api.overrides.append(("POST", CREATE, lambda: _created(job_id)))
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(ApiError) as raised:
+        hs.transcribe(media(), duration_seconds=100)
+    assert (raised.value.code, raised.value.status) == ("bad_response", 200)
+    assert raised.value.idempotency_key
+    assert all(request.url.path in {"/v1/account", CREATE} for request in api.requests)
+
+
+@pytest.mark.parametrize("job_id", UNUSABLE_IDS)
+async def test_async_a_create_answer_with_an_unusable_job_id_is_bad_response(
+    monkeypatch: pytest.MonkeyPatch, job_id: str
+) -> None:
+    api = FakeApi()
+    api.overrides.append(("POST", CREATE, lambda: _created(job_id)))
+    hs = async_hs_for(monkeypatch, api)
+    with pytest.raises(ApiError) as raised:
+        await hs.transcribe(media(), duration_seconds=100)
+    assert (raised.value.code, raised.value.status) == ("bad_response", 200)
+    assert all(request.url.path in {"/v1/account", CREATE} for request in api.requests)
+
+
+def _raw_paths(api: FakeApi, prefix: str) -> list[str]:
+    return [
+        request.url.raw_path.decode().split("?")[0]
+        for request in api.requests
+        if request.url.raw_path.decode().startswith(prefix)
+    ]
+
+
+AWKWARD = "j #?%é-"
+
+
+@pytest.mark.parametrize("proxied", [False, True])
+def test_a_job_id_is_percent_encoded_in_every_path(
+    monkeypatch: pytest.MonkeyPatch, proxied: bool
+) -> None:
+    api = FakeApi(job_prefix=AWKWARD, proxied=proxied)
+    hs = hs_for(monkeypatch, api)
+    hs.transcribe(media(), duration_seconds=100)
+    encoded = quote(f"{AWKWARD}1", safe="")
+    paths = _raw_paths(api, "/v1/uploads/") + _raw_paths(api, "/v1/jobs/")
+    assert len(paths) >= 3
+    assert all(f"/{encoded}" in path and "/ " not in path for path in paths), paths
+
+
+@pytest.mark.parametrize("proxied", [False, True])
+async def test_async_a_job_id_is_percent_encoded_in_every_path(
+    monkeypatch: pytest.MonkeyPatch, proxied: bool
+) -> None:
+    api = FakeApi(job_prefix=AWKWARD, proxied=proxied)
+    hs = async_hs_for(monkeypatch, api)
+    await hs.transcribe(media(), duration_seconds=100)
+    encoded = quote(f"{AWKWARD}1", safe="")
+    paths = _raw_paths(api, "/v1/uploads/") + _raw_paths(api, "/v1/jobs/")
+    assert len(paths) >= 3
+    assert all(f"/{encoded}" in path for path in paths), paths
+
+
+def _done_job_with(transcript_id: str) -> httpx.Response:
+    job = {
+        "id": "job_1",
+        "state": "done",
+        "mode": "standard",
+        "declared_seconds": 24,
+        "verified_seconds": None,
+        "actual_seconds": None,
+        "billable_seconds": 0,
+        "retry_of": None,
+        "created_at": 1_700_000_000,
+        "options": {},
+        "transcript_id": transcript_id,
+        "error": None,
+        "failure_kind": None,
+    }
+    return httpx.Response(200, json=job)
+
+
+@pytest.mark.parametrize("transcript_id", ["..", "a/b"])
+def test_a_job_naming_an_unusable_transcript_id_is_bad_response(
+    monkeypatch: pytest.MonkeyPatch, transcript_id: str
+) -> None:
+    api = FakeApi()
+    api.overrides.append(("GET", r"/v1/jobs/[^/]+", lambda: _done_job_with(transcript_id)))
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(ApiError) as raised:
+        hs.transcribe(media(), duration_seconds=100)
+    assert (raised.value.code, raised.value.status) == ("bad_response", 200)
+    assert api.count("GET", r"/v1/transcripts/.*") == 0
+
+
+@pytest.mark.parametrize("transcript_id", ["..", "a/b"])
+async def test_async_a_job_naming_an_unusable_transcript_id_is_bad_response(
+    monkeypatch: pytest.MonkeyPatch, transcript_id: str
+) -> None:
+    api = FakeApi()
+    api.overrides.append(("GET", r"/v1/jobs/[^/]+", lambda: _done_job_with(transcript_id)))
+    hs = async_hs_for(monkeypatch, api)
+    with pytest.raises(ApiError) as raised:
+        await hs.transcribe(media(), duration_seconds=100)
+    assert (raised.value.code, raised.value.status) == ("bad_response", 200)
+    assert api.count("GET", r"/v1/transcripts/.*") == 0

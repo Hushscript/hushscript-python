@@ -8,6 +8,7 @@ from hushscript._http import STREAM_EXTENSION
 from hushscript._log import hiding_signed_url
 from hushscript._response import parsed
 
+from .segment import segment
 from .upload import (
     OCTET_STREAM,
     PART_TIMEOUTS,
@@ -20,6 +21,7 @@ from .upload import (
     etag_missing,
     etag_of,
     exhausted,
+    first_mode,
     parse_plan,
     part_url_missing,
     plan_for,
@@ -51,7 +53,7 @@ class AsyncUploader:
         self._job_id = job_id
         self._source = source
         self.plan = plan_for(plan, source.size)
-        self.state = UploadState(Mode.PROXIED if plan is None else Mode.UNDECIDED)
+        self.state = UploadState(first_mode(plan))
         self._book = UrlBook(session.clock)
         self._book.store(self.plan.urls, self.plan.next_part)
         self._pages = asyncio.Lock()
@@ -85,6 +87,8 @@ class AsyncUploader:
                 await self._put_proxied(n, data)
                 return len(data)
             url = await self._url_for(n)
+            if url is None:
+                continue
             status, etag = await self._put_direct(n, url, data)
             if etag is not None:
                 if not self.state.record(n, etag):
@@ -120,7 +124,7 @@ class AsyncUploader:
         client = self._session.http
         request = client.build_request(
             "PUT",
-            f"/v1/uploads/{self._job_id}/parts/{n}",
+            f"/v1/uploads/{segment(self._job_id)}/parts/{n}",
             content=data,
             headers=OCTET_STREAM,
             timeout=PART_TIMEOUTS,
@@ -137,11 +141,13 @@ class AsyncUploader:
         finally:
             release(request)
 
-    async def _url_for(self, n: int) -> str:
+    async def _url_for(self, n: int) -> str | None:
         async with self._pages:
             url = self._book.get(n)
             if url is None:
                 await self._fetch_for(n)
+                if self.state.proxied:
+                    return None
                 url = self._book.get(n)
             if url is None:
                 raise part_url_missing(n)
@@ -152,7 +158,11 @@ class AsyncUploader:
         if start is None or n < start:
             await self._fetch(n, advance=False)
             return
-        while self._book.get(n) is None and self._book.next_start is not None:
+        while (
+            self._book.get(n) is None
+            and self._book.next_start is not None
+            and not self.state.proxied
+        ):
             await self._fetch(self._book.next_start, advance=True)
 
     async def _refresh(self, n: int, failed_url: str) -> None:
@@ -162,9 +172,11 @@ class AsyncUploader:
 
     async def _fetch(self, start: int, *, advance: bool) -> None:
         response = await self._session.http.get(
-            f"/v1/uploads/{self._job_id}/part-urls", params={"start": start}
+            f"/v1/uploads/{segment(self._job_id)}/part-urls", params={"start": start}
         )
         plan = parsed(response, self._session.credentials, parse_plan)
+        if not plan.direct and self.state.fall_back():
+            return
         cursor = plan.next_part if advance else self._book.next_start
         if advance and cursor is not None and cursor <= start:
             cursor = None

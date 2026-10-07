@@ -4,8 +4,10 @@ from typing import TYPE_CHECKING, Final
 
 from hushscript._errors import JobFailedError, UploadError, WaitTimeoutError
 from hushscript._models import Job, ProcessingProgress
-from hushscript._response import parsed
+from hushscript._response import BadBodyError, parsed
 from hushscript.transcript import Transcript
+
+from .segment import usable_segment
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -98,8 +100,15 @@ async def await_job(  # the same loop on the event loop
         delay = next_delay(delay)
 
 
+def _usable_job(body: object) -> Job:
+    job = Job.from_body(body)
+    if job.transcript_id is not None and not usable_segment(job.transcript_id):
+        raise BadBodyError("job")
+    return job
+
+
 def job_from(response: httpx.Response, credentials: Credentials) -> Job:
-    return parsed(response, credentials, Job.from_body)
+    return parsed(response, credentials, _usable_job)
 
 
 def finish(job: Job) -> str:

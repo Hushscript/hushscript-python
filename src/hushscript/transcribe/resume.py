@@ -10,6 +10,7 @@ from typing import Final
 from hushscript._errors import ConfigurationError, ResumeMismatchError
 from hushscript._json import as_dict, loads
 
+from .segment import usable_segment
 from .source import FileInput, Source, make_source, path_size
 
 TOKEN_VERSION: Final = 1
@@ -55,6 +56,8 @@ def decode_token(token: str) -> ResumeState:
     size = _whole(fields.get("size"))
     duration = _whole(fields.get("durationSeconds"))
     if not isinstance(job_id, str) or not isinstance(key, str) or size is None or duration is None:
+        raise invalid
+    if not usable_segment(job_id):
         raise invalid
     return ResumeState(job_id=job_id, idempotency_key=key, size=size, duration_seconds=duration)
 

@@ -18,6 +18,8 @@ from hushscript._redact import Secret
 from hushscript._response import BadBodyError, parsed
 from hushscript._retry import RetryClass
 
+from .segment import segment, usable_segment
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -43,6 +45,9 @@ class Plan:
     urls: dict[int, Secret]
     """Signed URLs, held where no repr, copy or pickle shows them."""
     next_part: int | None
+    direct: bool = True
+    """False when `part_urls` was `null`: direct upload is not available (R70) and every part goes
+    through the API, whatever `next_part` says."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,13 +83,14 @@ def parse_plan(raw: object) -> Plan:
     fields = as_dict(raw)
     if fields is None:
         raise _unexpected("upload plan")
+    no_direct = "part_urls" in fields and fields["part_urls"] is None
     part_size = _whole(fields.get("part_size_bytes"))
     total = _whole(fields.get("total_parts"))
     next_part = _whole(fields.get("next_part_number"))
     if (
         part_size is None
         or total is None
-        or part_size < 1
+        or not 1 <= part_size <= MAX_PART_BYTES
         or total < 1
         or (next_part is not None and next_part < 1)
     ):
@@ -94,6 +100,7 @@ def parse_plan(raw: object) -> Plan:
         total_parts=total,
         urls=_urls(fields.get("part_urls")),
         next_part=next_part,
+        direct=not no_direct,
     )
 
 
@@ -106,7 +113,7 @@ def bad_part_plan() -> UploadError:
 def parse_created(body: object) -> Created:
     fields = as_dict(body)
     job_id = None if fields is None else fields.get("job_id")
-    if fields is None or not isinstance(job_id, str):
+    if fields is None or not isinstance(job_id, str) or not usable_segment(job_id):
         raise _unexpected("create response")
     upload = fields.get("upload")
     state = fields.get("state")
@@ -204,6 +211,16 @@ class UploadState:
             self.etags[n] = etag
             return True
 
+    def fall_back(self) -> bool:
+        """A part-urls page said direct upload is not available. True when the rest goes through
+        the API now; False once a direct PUT has succeeded, which keeps the direct retries (spec
+        8.4, Fallback rule)."""
+        with self._lock:
+            if self.mode is Mode.DIRECT:
+                return False
+            self.mode = Mode.PROXIED
+            return True
+
     def decide(self, attempts: PartAttempts, status: int | None) -> Action:
         """What a part does after its direct PUT failed even with the transport's retries.
 
@@ -229,6 +246,10 @@ class UploadState:
         if self.mode is Mode.PROXIED:
             return None
         return {"parts": [{"n": n, "etag": self.etags[n]} for n in sorted(self.etags)]}
+
+
+def first_mode(plan: Plan | None) -> Mode:
+    return Mode.UNDECIDED if plan is not None and plan.direct else Mode.PROXIED
 
 
 def exhausted(n: int) -> UploadError:
@@ -321,7 +342,7 @@ class SyncUploader:
         self._job_id = job_id
         self._source = source
         self.plan = plan_for(plan, source.size)
-        self.state = UploadState(Mode.PROXIED if plan is None else Mode.UNDECIDED)
+        self.state = UploadState(first_mode(plan))
         self._book = UrlBook(session.clock)
         self._book.store(self.plan.urls, self.plan.next_part)
         self._pages = threading.Lock()
@@ -361,6 +382,8 @@ class SyncUploader:
                 self._put_proxied(n, data)
                 return len(data)
             url = self._url_for(n)
+            if url is None:
+                continue
             status, etag = self._put_direct(n, url, data)
             if etag is not None:
                 if not self.state.record(n, etag):
@@ -396,7 +419,7 @@ class SyncUploader:
         client = self._session.http
         request = client.build_request(
             "PUT",
-            f"/v1/uploads/{self._job_id}/parts/{n}",
+            f"/v1/uploads/{segment(self._job_id)}/parts/{n}",
             content=data,
             headers=OCTET_STREAM,
             timeout=PART_TIMEOUTS,
@@ -413,11 +436,14 @@ class SyncUploader:
         finally:
             release(request)
 
-    def _url_for(self, n: int) -> str:
+    def _url_for(self, n: int) -> str | None:
+        """The URL of part `n`; None when a page said the rest goes through the API."""
         with self._pages:
             url = self._book.get(n)
             if url is None:
                 self._fetch_for(n)
+                if self.state.proxied:
+                    return None
                 url = self._book.get(n)
             if url is None:
                 raise part_url_missing(n)
@@ -428,7 +454,11 @@ class SyncUploader:
         if start is None or n < start:
             self._fetch(n, advance=False)
             return
-        while self._book.get(n) is None and self._book.next_start is not None:
+        while (
+            self._book.get(n) is None
+            and self._book.next_start is not None
+            and not self.state.proxied
+        ):
             self._fetch(self._book.next_start, advance=True)
 
     def _refresh(self, n: int, failed_url: str) -> None:
@@ -440,9 +470,11 @@ class SyncUploader:
         """One `part-urls` page. The pages after the first come in order (`advance`); a refresh
         of an earlier page leaves the cursor of the pages still to come where it was."""
         response = self._session.http.get(
-            f"/v1/uploads/{self._job_id}/part-urls", params={"start": start}
+            f"/v1/uploads/{segment(self._job_id)}/part-urls", params={"start": start}
         )
         plan = parsed(response, self._session.credentials, parse_plan)
+        if not plan.direct and self.state.fall_back():
+            return
         cursor = plan.next_part if advance else self._book.next_start
         if advance and cursor is not None and cursor <= start:
             cursor = None
