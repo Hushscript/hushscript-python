@@ -22,7 +22,7 @@ from hushscript import (
 from routes import async_hs_on, hs_on
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Generator, Iterator
 
 
 def row(number: int) -> dict[str, object]:
@@ -246,13 +246,13 @@ def test_a_list_body_that_does_not_fit_is_a_bad_response(
     monkeypatch: pytest.MonkeyPatch, path: str, body: object
 ) -> None:
     hs, _ = hs_on(monkeypatch, lambda _request: reply(200, body))
-    source = {
+    sources: dict[str, Callable[[], Iterator[object]]] = {
         "transcripts": hs.transcripts.list,
         "deleted": hs.transcripts.deleted,
         "jobs": hs.jobs.list,
-    }[path]
+    }
     with pytest.raises(ApiError) as raised:
-        list(source())
+        list(sources[path]())
     assert (raised.value.code, raised.value.status, raised.value.numeric_code) == (
         "bad_response",
         200,

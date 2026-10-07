@@ -449,7 +449,7 @@ def test_a_token_unset_since_an_earlier_attempt_is_not_sent_on_the_retry() -> No
     def handle(request: httpx.Request) -> httpx.Response:
         sent.append(request.headers.get("authorization"))
         if len(sent) == 1:
-            credentials._tokens.clear()
+            credentials._tokens.clear()  # pyright: ignore[reportPrivateUsage]
             return reply(503)
         return reply(200, {})
 

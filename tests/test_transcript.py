@@ -166,7 +166,7 @@ def test_get_refuses_an_id_that_is_not_a_name(
 ) -> None:
     hs, routes = hs_on(monkeypatch, lambda _request: reply(200, transcript_body()))
     with pytest.raises(PreflightError, match="id is a non-empty string") as raised:
-        hs.transcripts.get(bad_id)  # pyright: ignore[reportArgumentType]
+        hs.transcripts.get(bad_id)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
     assert raised.value.code == "invalid_option"
     assert routes.requests == []
 

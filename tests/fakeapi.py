@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 Reply = httpx.Response | Exception | None
 PAGE = 16
-TRANSCRIPT = {
+TRANSCRIPT: dict[str, object] = {
     "id": "tr_fake_0001",
     "title": "Fake",
     "language_detected": "en",

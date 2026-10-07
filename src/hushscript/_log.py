@@ -5,7 +5,7 @@ import re
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Final
 
 import httpx
 
@@ -58,16 +58,13 @@ class _SignedUrlFilter(logging.Filter):
             return True
         if isinstance(record.msg, str):
             record.msg = _hide(record.msg, label)
-        args: object = record.args
-        if isinstance(args, tuple):
+        if isinstance(record.args, tuple):
             record.args = tuple(
                 label if isinstance(arg, (str, httpx.URL)) and "://" in str(arg) else arg
-                for arg in cast("tuple[object, ...]", args)
+                for arg in record.args
             )
-        elif isinstance(args, dict):
-            record.args = {
-                key: _hide(item, label) for key, item in cast("dict[str, object]", args).items()
-            }
+        elif isinstance(record.args, dict):
+            record.args = {key: _hide(item, label) for key, item in record.args.items()}
         return True
 
 
