@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import platform
+from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING, BinaryIO, Self
 
 import httpx
 
 from ._clock import Clock, SystemClock
-from ._config import PART_TIMEOUT, Config, resolve_config
+from ._config import PART_TIMEOUT, Config, resolve_config, resolve_tokenless_config
 from ._errors import ConfigurationError
 from ._http import AsyncRetryingTransport, RetryingTransport, TransportSettings
 from ._log import RequestLog
@@ -16,6 +17,20 @@ from ._response import parsed
 from ._version import __version__
 from .generated.client import AuthenticatedClient
 from .resources.account import Account, Balance
+from .resources.agent import (
+    Agent,
+    AgentAccount,
+    AgentInfo,
+    AgentSignup,
+    AsyncAgent,
+    check_accept_terms,
+    claim_body,
+    claim_path,
+    claimed,
+    signed_up,
+    signup_body,
+)
+from .resources.billing import AsyncBilling, Billing, Purchase
 from .resources.jobs import AsyncJobs, Jobs
 from .resources.transcripts import AsyncTranscripts, Transcripts
 from .transcribe import apipeline, pipeline
@@ -26,7 +41,7 @@ from .transcribe.wait import DEFAULT_WAIT_TIMEOUT
 
 if TYPE_CHECKING:
     import os
-    from collections.abc import Callable, Sequence
+    from collections.abc import AsyncGenerator, Callable, Generator, Sequence
     from types import TracebackType
 
     from ._models import Progress
@@ -187,6 +202,37 @@ def _r2_settings(config: Config, clock: Clock) -> TransportSettings:
     )
 
 
+@contextmanager
+def _tokenless_http(config: Config, clock: Clock | None) -> Generator[httpx.Client]:
+    """A client for the calls that need no token: it sends none, and never retries."""
+    chosen = clock or SystemClock()
+    settings = _settings(config, chosen, TokenBucket(chosen))
+    with httpx.Client(
+        base_url=config.base_url,
+        timeout=config.timeout,
+        headers={"User-Agent": user_agent()},
+        transport=RetryingTransport(_sync_inner(), settings),
+        follow_redirects=False,
+    ) as http:
+        yield http
+
+
+@asynccontextmanager
+async def _tokenless_async_http(
+    config: Config, clock: Clock | None
+) -> AsyncGenerator[httpx.AsyncClient]:
+    chosen = clock or SystemClock()
+    settings = _settings(config, chosen, TokenBucket(chosen))
+    async with httpx.AsyncClient(
+        base_url=config.base_url,
+        timeout=config.timeout,
+        headers={"User-Agent": user_agent()},
+        transport=AsyncRetryingTransport(_async_inner(), settings),
+        follow_redirects=False,
+    ) as http:
+        yield http
+
+
 def _options(  # noqa: PLR0913  the keyword surface of `transcribe()`, validated before any request
     *,
     title: str | None,
@@ -269,6 +315,8 @@ class Hushscript:
         )
         self.jobs = Jobs(self._session)
         self.transcripts = Transcripts(self._session)
+        self.billing = Billing(self._session)
+        self.agent = Agent(self._session)
 
     def balance(self) -> Balance:
         """What the account can spend. Net of holds: `held_seconds` says how much of it is already
@@ -280,6 +328,69 @@ class Hushscript:
         """The account: balance, limits, card on file and data region."""
         response = self._http.get("/v1/account")
         return parsed(response, self._config.credentials, Account.from_body)
+
+    def buy(
+        self,
+        pack: str,
+        *,
+        acknowledge_no_refund: bool = False,
+        idempotency_key: str | None = None,
+    ) -> Purchase:
+        """Buys a minute pack with the saved card; it is `hs.billing.buy`."""
+        return self.billing.buy(
+            pack, acknowledge_no_refund=acknowledge_no_refund, idempotency_key=idempotency_key
+        )
+
+    @staticmethod
+    def agent_signup(  # noqa: PLR0913  the keyword surface of spec 6.6
+        *,
+        email: str,
+        pack: str,
+        accept_terms: str,
+        agent: AgentInfo,
+        data_region: str | None = None,
+        dry_run: bool = False,
+        base_url: str | None = None,
+        timeout: float = 60,
+        log_level: str | None = None,
+        clock: Clock | None = None,
+    ) -> AgentSignup:
+        """Opens an agent account. It needs no token (HUSHSCRIPT_TOKEN is not read or sent): the
+        agent then has the checkout paid at `checkout_url` and claims the account with
+        `agent_claim`. `accept_terms`, the policy version being accepted, is never defaulted. The
+        request is never retried; a lost answer is an `OutcomeUnknownError`."""
+        check_accept_terms(accept_terms)
+        config = resolve_tokenless_config(base_url=base_url, timeout=timeout, log_level=log_level)
+        body = signup_body(
+            email=email,
+            pack=pack,
+            accept_terms=accept_terms,
+            agent=agent,
+            data_region=data_region,
+            dry_run=dry_run,
+        )
+        with _tokenless_http(config, clock) as http:
+            return signed_up(http.post("/v1/agent/accounts", json=body), config.credentials)
+
+    @staticmethod
+    def agent_claim(
+        signup_id: str,
+        claim_secret: str,
+        *,
+        base_url: str | None = None,
+        timeout: float = 60,
+        log_level: str | None = None,
+        clock: Clock | None = None,
+    ) -> AgentAccount:
+        """Claims a paid agent signup and returns the account's token, which the server shows
+        once: write it down before doing anything else. It answers `wrong_state` (a
+        `ConflictError`) until the checkout is paid, and is never retried: a lost answer, or one
+        without a usable token, is an `OutcomeUnknownError` whose hint says what to check."""
+        path = claim_path(signup_id)
+        config = resolve_tokenless_config(base_url=base_url, timeout=timeout, log_level=log_level)
+        with _tokenless_http(config, clock) as http:
+            response = http.post(path, json=claim_body(claim_secret))
+            return claimed(response, config.credentials)
 
     def transcribe(  # noqa: PLR0913  the keyword surface of spec 6.1
         self,
@@ -409,6 +520,8 @@ class AsyncHushscript:
         )
         self.jobs = AsyncJobs(self._session)
         self.transcripts = AsyncTranscripts(self._session)
+        self.billing = AsyncBilling(self._session)
+        self.agent = AsyncAgent(self._session)
 
     async def balance(self) -> Balance:
         response = await self._http.get("/v1/account")
@@ -417,6 +530,61 @@ class AsyncHushscript:
     async def account(self) -> Account:
         response = await self._http.get("/v1/account")
         return parsed(response, self._config.credentials, Account.from_body)
+
+    async def buy(
+        self,
+        pack: str,
+        *,
+        acknowledge_no_refund: bool = False,
+        idempotency_key: str | None = None,
+    ) -> Purchase:
+        return await self.billing.buy(
+            pack, acknowledge_no_refund=acknowledge_no_refund, idempotency_key=idempotency_key
+        )
+
+    @staticmethod
+    async def agent_signup(  # noqa: PLR0913  the keyword surface of spec 6.6
+        *,
+        email: str,
+        pack: str,
+        accept_terms: str,
+        agent: AgentInfo,
+        data_region: str | None = None,
+        dry_run: bool = False,
+        base_url: str | None = None,
+        timeout: float = 60,  # noqa: ASYNC109  the same `timeout` as the constructor
+        log_level: str | None = None,
+        clock: Clock | None = None,
+    ) -> AgentSignup:
+        check_accept_terms(accept_terms)
+        config = resolve_tokenless_config(base_url=base_url, timeout=timeout, log_level=log_level)
+        body = signup_body(
+            email=email,
+            pack=pack,
+            accept_terms=accept_terms,
+            agent=agent,
+            data_region=data_region,
+            dry_run=dry_run,
+        )
+        async with _tokenless_async_http(config, clock) as http:
+            response = await http.post("/v1/agent/accounts", json=body)
+            return signed_up(response, config.credentials)
+
+    @staticmethod
+    async def agent_claim(
+        signup_id: str,
+        claim_secret: str,
+        *,
+        base_url: str | None = None,
+        timeout: float = 60,  # noqa: ASYNC109  the same `timeout` as the constructor
+        log_level: str | None = None,
+        clock: Clock | None = None,
+    ) -> AgentAccount:
+        path = claim_path(signup_id)
+        config = resolve_tokenless_config(base_url=base_url, timeout=timeout, log_level=log_level)
+        async with _tokenless_async_http(config, clock) as http:
+            response = await http.post(path, json=claim_body(claim_secret))
+            return claimed(response, config.credentials)
 
     async def transcribe(  # noqa: PLR0913  the keyword surface of spec 6.1
         self,

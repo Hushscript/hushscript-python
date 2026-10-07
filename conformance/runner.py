@@ -1,8 +1,8 @@
 """Runs the conformance scenarios against the mock (the conformance repo's runner contract).
 
-Only the ops in OPS are mapped so far. A scenario that needs any other op is reported as SKIP and
-does not fail the run; CONFORMANCE_STRICT=1 turns every skip into a failure, which is what the
-runner contract asks for once the friendly layer is complete.
+A scenario that needs an op that is not in OPS is reported as SKIP and does not fail the run;
+CONFORMANCE_STRICT=1 turns every skip into a failure, which is what the runner contract asks for
+now that the friendly layer is complete, and what `just ci` sets.
 """
 
 from __future__ import annotations
@@ -318,8 +318,32 @@ def _format(_hs: Hushscript, _args: Json, files: Files) -> Json:
     return {"checked": len(goldens), "mismatches": mismatches}
 
 
+def _buy(hs: Hushscript, args: Json, _files: Files) -> Json:
+    purchase = hs.buy(args["pack"])
+    return {"seconds": purchase.seconds, "minutes": purchase.minutes}
+
+
+def _claim(hs: Hushscript, args: Json, _files: Files) -> Json:
+    """The static claim needs no client; it runs on the scenario's virtual clock."""
+    account = Hushscript.agent_claim(
+        args["signupId"],
+        args["claimSecret"],
+        base_url=BASE_URL,
+        clock=hs._clock,  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    )
+    return {"userId": account.user_id, "scopes": account.scopes, "seconds": account.balance.seconds}
+
+
+def _rotate(hs: Hushscript, _args: Json, _files: Files) -> Json:
+    rotated = hs.agent.rotate_token()
+    return {"tokenId": rotated.token_id, "scopes": rotated.scopes}
+
+
 OPS: dict[str, Callable[[Hushscript, Json, Files], Json]] = {
     "balance": _balance,
+    "buy": _buy,
+    "claim": _claim,
+    "rotate": _rotate,
     "listTranscripts": _list_transcripts,
     "getTranscript": _get_transcript,
     "format": _format,

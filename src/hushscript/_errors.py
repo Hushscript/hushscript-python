@@ -6,7 +6,7 @@ import re
 from typing import TYPE_CHECKING, Any, ClassVar, Final
 
 from ._json import as_dict, as_list
-from ._redact import Credentials, redact
+from ._redact import Credentials, Secret, redact
 from .generated.catalog import ERROR_CATALOG
 from .generated.hints import HINTS
 from .generated.scopes import OPERATION_SCOPES
@@ -270,6 +270,23 @@ class NetworkError(HushscriptError):
 
 class OutcomeUnknownError(HushscriptError):
     default_code = "outcome_unknown"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        received_token: str | None = None,
+        **kwargs: Any,  # noqa: ANN401  # forwarded to HushscriptError, which types them
+    ) -> None:
+        super().__init__(message, **kwargs)
+        self._received = Secret(received_token if received_token and received_token.strip() else "")
+
+    @property
+    def received_token(self) -> str | None:
+        """The token a claim or rotation answer carried when the rest of it could not be used, so
+        the credential the server shows once is not lost; None when there is none. It is never part
+        of the message, the repr, a pickle or a log line; treat it like any token."""
+        return self._received.reveal() or None
 
 
 _CLASS_BY_SLUG: Final[dict[str, type[HushscriptError]]] = {

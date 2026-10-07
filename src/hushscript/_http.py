@@ -45,7 +45,7 @@ _PHASES: Final = ("connect", "read", "write", "pool")
 _STREAMABLE: Final = frozenset({RetryClass.SAFE, RetryClass.PART})
 
 # Spec 7.4. A lost signup has no hint in v0.1.
-_UNKNOWN_HINTS: Final = {
+UNKNOWN_HINTS: Final = {
     CLAIM: (
         "The claim may have succeeded. Retrying will fail with agent_claim_invalid. "
         "If you have no token, contact support with the signup id."
@@ -309,7 +309,7 @@ class _Attempt:
             return OutcomeUnknownError(
                 f"No response arrived for {where} ({reason}).",
                 code="outcome_unknown",
-                hint=_UNKNOWN_HINTS.get(self.route or ""),
+                hint=UNKNOWN_HINTS.get(self.route or ""),
             )
         return NetworkError(f"Could not reach the Hushscript API: {where} ({reason}).")
 
@@ -319,7 +319,7 @@ class _Attempt:
         depend on it), so the outcome rides along as a note."""
         if not self.sent():
             return
-        hint = _UNKNOWN_HINTS.get(self.route or "")
+        hint = UNKNOWN_HINTS.get(self.route or "")
         text = (
             f"Cancelled after {self.request.method} {self.label} was sent: its outcome is unknown."
         )
