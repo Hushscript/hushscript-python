@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections import deque
 from typing import TYPE_CHECKING, Final
 
@@ -31,8 +32,13 @@ class TokenBucket:
         self._capacity = capacity
         self._window = window
         self._slots: deque[float] = deque()
+        self._lock = threading.Lock()
 
     def reserve(self) -> float:
+        with self._lock:
+            return self._reserve()
+
+    def _reserve(self) -> float:
         now = self._clock.now()
         while self._slots and self._slots[0] <= now - self._window:
             self._slots.popleft()

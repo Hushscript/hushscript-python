@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from conftest import TOKEN
 from hushscript import ConfigurationError, Hushscript
-from hushscript._config import resolve_config
+from hushscript._config import SETUP_HINT, resolve_config
+from hushscript.generated.hints import HINTS
 
 
 def test_refuses_construction_without_a_token_and_says_where_to_get_one() -> None:
@@ -138,3 +141,22 @@ def test_a_token_in_the_environment_is_checked_too() -> None:
 
 def test_the_whitespace_around_a_token_is_still_stripped() -> None:
     assert resolve_config(f" \t{TOKEN}\r\n", env={}).credentials.token == TOKEN
+
+
+def test_only_the_missing_token_carries_a_hint() -> None:
+    assert "config_invalid" not in HINTS
+    cases: list[dict[str, Any]] = [
+        {"token": "nope"},
+        {"token": TOKEN, "timeout": 0},
+        {"token": TOKEN, "max_retries": -1},
+        {"token": TOKEN, "base_url": "http://example.com"},
+        {"token": TOKEN, "log_level": "loud"},
+        {"token": "hsr1:eu:pat.\x01"},
+    ]
+    for kwargs in cases:
+        with pytest.raises(ConfigurationError) as raised:
+            resolve_config(env={}, **kwargs)
+        assert raised.value.hint is None
+    with pytest.raises(ConfigurationError) as missing:
+        resolve_config(env={})
+    assert missing.value.hint == SETUP_HINT

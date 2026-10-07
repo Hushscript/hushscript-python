@@ -24,7 +24,14 @@ from ._errors import (
     ValidationError,
     WaitTimeoutError,
 )
-from ._models import Balance
+from ._models import (
+    Balance,
+    Job,
+    ProcessingProgress,
+    Progress,
+    Transcript,
+    UploadingProgress,
+)
 from ._version import __version__
 from .generated.catalog import ERROR_CATALOG, ErrorCatalogEntry
 from .generated.hints import HINTS
@@ -48,6 +55,7 @@ __all__ = [
     "Hushscript",
     "HushscriptError",
     "InsufficientBalanceError",
+    "Job",
     "JobFailedError",
     "NetworkError",
     "NotFoundError",
@@ -55,11 +63,15 @@ __all__ = [
     "PaymentMethodRequiredError",
     "PermissionDeniedError",
     "PreflightError",
+    "ProcessingProgress",
+    "Progress",
     "RateLimitError",
     "ResumeMismatchError",
     "SystemClock",
+    "Transcript",
     "UnsupportedMediaError",
     "UploadError",
+    "UploadingProgress",
     "ValidationError",
     "WaitTimeoutError",
     "__version__",

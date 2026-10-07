@@ -3,8 +3,8 @@
 from typing import Final
 
 HINTS: Final[dict[str, str]] = {
-    "unauthorized": "Your token is invalid, revoked or expired. Create a new one in the Hushscript app under Account → Connected apps. Changing your password revokes all tokens.",
-    "pat_scope_missing": "This call needs the \"{scope}\" permission. Create a token that includes it. For billing, also turn on \"Let connected apps buy minutes\" in the app under Account → Connected apps.",
+    "unauthorized": "Your token is invalid, revoked or expired. Create a new one in the Hushscript app under Account → MCP. Changing your password revokes all tokens.",
+    "pat_scope_missing": "This call needs the \"{scope}\" permission. Create a token that includes it. For billing, the token also needs \"Let this token buy minutes\" turned on when you create it, and \"Let connected apps buy minutes\" must be on in the app under Account → MCP.",
     "insufficient_balance": "Not enough minutes: {needed} needed, {balance} available. Buy a pack with hs.buy(\"300min\") or in the app.",
     "rate_limited": "Too many requests. The SDK already waited and retried; slow down or try again in {retryAfter} s.",
     "too_many_active_jobs": "50 jobs are already in progress. Wait for some to finish.",
@@ -22,5 +22,7 @@ HINTS: Final[dict[str, str]] = {
     "wrong_state": "The job has already moved on. Call hs.jobs.get(id) to see where it is.",
     "resume_file_mismatch": "This is not the file the upload started with. Pass the original file, or start a new transcription.",
     "resume_file_required": "The upload was not finished. Pass the original file to resume it.",
-    "config_invalid": "(message carries the specific reason)",
+    "resume_job_missing": "This job no longer exists. Start a new transcription.",
+    "stream_size_mismatch": "The stream did not match the size you passed. Pass the exact size in bytes.",
+    "default_card_required": "You have more than one saved card and none is the default. Pick one with hs.billing.setDefaultCard(id) or in the app.",
 }

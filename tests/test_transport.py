@@ -124,7 +124,7 @@ def test_network_errors_are_retried_for_gets_and_then_raised() -> None:
 def test_create_backs_off_15_30_60_without_a_retry_after() -> None:
     script, clock = Script([reply(429, RATE_LIMITED)]), FakeClock()
     with sync_client(script, clock, max_retries=5) as client:
-        assert client.post("/v1/uploads", json={}).status_code == 429
+        assert client.post("/v1/uploads", json={"idempotency_key": "k" * 20}).status_code == 429
     assert clock.sleeps == [15.0, 30.0, 60.0]
     assert script.calls == 4
 
@@ -132,7 +132,7 @@ def test_create_backs_off_15_30_60_without_a_retry_after() -> None:
 def test_create_waits_30_seconds_ten_tries_on_too_many_active_jobs() -> None:
     script, clock = Script([reply(429, error_body("too_many_active_jobs", 5001))]), FakeClock()
     with sync_client(script, clock, max_retries=1) as client:
-        response = client.post("/v1/uploads", json={})
+        response = client.post("/v1/uploads", json={"idempotency_key": "k" * 20})
     assert response.json()["error"] == "too_many_active_jobs"
     assert script.calls == 10
     assert clock.sleeps == [30.0] * 9
@@ -141,14 +141,14 @@ def test_create_waits_30_seconds_ten_tries_on_too_many_active_jobs() -> None:
 def test_max_retries_zero_disables_the_active_jobs_wait() -> None:
     script = Script([reply(429, error_body("too_many_active_jobs", 5001))])
     with sync_client(script, FakeClock(), max_retries=0) as client:
-        client.post("/v1/uploads", json={})
+        client.post("/v1/uploads", json={"idempotency_key": "k" * 20})
     assert script.calls == 1
 
 
 def test_create_with_a_non_json_429_backs_off_too() -> None:
     script, clock = Script([reply(429), reply(200, {"ok": True})]), FakeClock()
     with sync_client(script, clock) as client:
-        assert client.post("/v1/uploads", json={}).status_code == 200
+        assert client.post("/v1/uploads", json={"idempotency_key": "k" * 20}).status_code == 200
     assert clock.sleeps == [15.0]
 
 
@@ -300,11 +300,13 @@ async def test_async_network_errors_and_create_pacing() -> None:
     assert script.calls == 4
     create, create_clock = Script([reply(429, RATE_LIMITED)]), FakeClock()
     async with async_client(create, create_clock, max_retries=5) as client:
-        assert (await client.post("/v1/uploads", json={})).status_code == 429
+        assert (
+            await client.post("/v1/uploads", json={"idempotency_key": "k" * 20})
+        ).status_code == 429
     assert create_clock.sleeps == [15.0, 30.0, 60.0]
     active = Script([reply(429, error_body("too_many_active_jobs", 5001))])
     async with async_client(active, FakeClock()) as client:
-        await client.post("/v1/uploads", json={})
+        await client.post("/v1/uploads", json={"idempotency_key": "k" * 20})
     assert active.calls == 10
 
 
@@ -400,7 +402,7 @@ def test_the_create_429_schedule_counts_only_429s_after_other_retries() -> None:
     )
     clock = FakeClock()
     with sync_client(script, clock, max_retries=5) as client:
-        assert client.post("/v1/uploads", json={}).status_code == 200
+        assert client.post("/v1/uploads", json={"idempotency_key": "k" * 20}).status_code == 200
     assert script.calls == 4
     assert clock.sleeps[1:] == [15.0, 30.0]
 
@@ -409,7 +411,7 @@ def test_the_create_429_schedule_still_ends_after_three_waits_following_a_500() 
     script = Script([reply(500), reply(429, RATE_LIMITED)])
     clock = FakeClock()
     with sync_client(script, clock, max_retries=9) as client:
-        assert client.post("/v1/uploads", json={}).status_code == 429
+        assert client.post("/v1/uploads", json={"idempotency_key": "k" * 20}).status_code == 429
     assert clock.sleeps[1:] == [15.0, 30.0, 60.0]
 
 
@@ -418,6 +420,6 @@ def test_the_active_jobs_wait_counts_only_active_jobs_429s() -> None:
     script = Script([reply(429, RATE_LIMITED), reply(500), active])
     clock = FakeClock()
     with sync_client(script, clock, max_retries=3) as client:
-        assert client.post("/v1/uploads", json={}).status_code == 429
+        assert client.post("/v1/uploads", json={"idempotency_key": "k" * 20}).status_code == 429
     assert script.calls == 12
     assert clock.sleeps[2:] == [30.0] * 9

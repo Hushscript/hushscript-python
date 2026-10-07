@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Final, cast
 
 import httpx
 
+from ._config import PART_TIMEOUT
 from ._errors import NetworkError, OutcomeUnknownError, parse_retry_after
 from ._json import as_dict
 from ._retry import (
@@ -28,13 +29,20 @@ if TYPE_CHECKING:
 
     from ._clock import Clock
     from ._log import RequestLog
+    from ._pacing import TokenBucket
     from ._redact import Credentials
 
 LABEL_EXTENSION: Final = "hushscript_label"
 CLASS_EXTENSION: Final = "hushscript_class"
 ANONYMOUS_EXTENSION: Final = "hushscript_anonymous"
+# Set on a part PUT: the transport still guards the attempt but leaves the response body unread,
+# so the caller decides whether to read it (a large download must not be buffered whole).
+STREAM_EXTENSION: Final = "hushscript_stream"
+IDEMPOTENCY_FIELD: Final = "idempotency_key"
 
 _PHASES: Final = ("connect", "read", "write", "pool")
+# Classes whose decision needs no response body, so the body may be left for the caller.
+_STREAMABLE: Final = frozenset({RetryClass.SAFE, RetryClass.PART})
 
 # Spec 7.4. A lost signup has no hint in v0.1.
 _UNKNOWN_HINTS: Final = {
@@ -58,6 +66,14 @@ class TransportSettings:
     base_url: httpx.URL
     timeout: float
     rng: random.Random = field(default_factory=random.SystemRandom)
+    bucket: TokenBucket | None = None
+    """Paces `POST /v1/uploads` for the client (spec 7.5), keyed or not."""
+
+    @property
+    def ceiling(self) -> float:
+        """The longest deadline any request can ask for: a per-request timeout above the
+        configured one (an upload part's, `hs.api.with_timeout`) is honored up to this bound."""
+        return max(self.timeout, PART_TIMEOUT)
 
 
 def _same_origin(url: httpx.URL, other: httpx.URL) -> bool:
@@ -67,6 +83,15 @@ def _same_origin(url: httpx.URL, other: httpx.URL) -> bool:
 def _label(request: httpx.Request) -> str:
     label = request.extensions.get(LABEL_EXTENSION)
     return label if isinstance(label, str) else request.url.path
+
+
+def _has_idempotency_key(request: httpx.Request) -> bool:
+    try:
+        parsed: object = json.loads(request.content)
+    except (ValueError, httpx.RequestNotRead):
+        return False
+    key = (as_dict(parsed) or {}).get(IDEMPOTENCY_FIELD)
+    return isinstance(key, str) and bool(key)
 
 
 def _slug_of(body: bytes) -> str | None:
@@ -154,11 +179,18 @@ class _Attempt:
         self.retry_class = (
             override if isinstance(override, RetryClass) else classify(request.method, path)
         )
+        if self.retry_class is RetryClass.CREATE and not _has_idempotency_key(request):
+            # Only a keyed create is a safe replay; without a key it is any other mutation.
+            self.retry_class = RetryClass.MUTATE
+        self.stream = (
+            bool(request.extensions.get(STREAM_EXTENSION)) and self.retry_class in _STREAMABLE
+        )
         self.label = _label(request)
         self.number = 0
         self.limited: dict[str, int] = {}
         self.started = settings.clock.now()
-        self.deadline = self.started + settings.timeout
+        self.budget = settings.timeout
+        self.deadline = self.started + self.budget
         self.body: _WrittenBody | None = None
         self.phases: dict[str, float | None] = {}
         self._authorize()
@@ -182,25 +214,44 @@ class _Attempt:
         if isinstance(configured, dict):
             known = cast("dict[str, float | None]", configured)
             self.phases = {phase: known.get(phase) for phase in _PHASES}
+            asked = [limit for limit in self.phases.values() if limit is not None]
+            if asked:
+                self.budget = min(self.settings.ceiling, max(self.settings.timeout, *asked))
 
     def begin(self) -> None:
         self.started = self.settings.clock.now()
-        self.deadline = self.started + self.settings.timeout
+        self.deadline = self.started + self.budget
         if self.body is not None:
             self.body.done = False
         self.tighten()
 
+    def pace(self) -> float:
+        """Seconds to wait before an upload create may go out (spec 7.5); every one is paced,
+        whatever its retry class."""
+        bucket = self.settings.bucket
+        if bucket is None or not self.on_base or self.request.method != "POST":
+            return 0.0
+        if (
+            self.request.url.path.removeprefix(self.settings.base_url.path.rstrip("/"))
+            != "/v1/uploads"
+        ):
+            return 0.0
+        return bucket.reserve()
+
+    def remaining(self) -> float:
+        return self.deadline - self.settings.clock.now()
+
     def tighten(self) -> None:
-        """Holds the attempt to one overall deadline of `timeout` seconds (spec 3 and 7.1).
+        """Holds the attempt to one overall deadline of `budget` seconds (spec 3 and 7.1).
 
         httpx's own timeout is per phase. Before the request and before every body chunk the
         remaining time is computed and the phase timeouts are cut to it; with none left the attempt
         fails like any other timeout.
         """
-        remaining = self.deadline - self.settings.clock.now()
+        remaining = self.remaining()
         if remaining <= 0:
             raise httpx.ReadTimeout(
-                f"the request took longer than {self.settings.timeout:g} s", request=self.request
+                f"the request took longer than {self.budget:g} s", request=self.request
             )
         if self.phases:
             self.request.extensions["timeout"] = {
@@ -248,7 +299,7 @@ class _Attempt:
             slug=slug,
         )
 
-    def failure_error(self, failure: httpx.TransportError) -> NetworkError | OutcomeUnknownError:
+    def failure_error(self, failure: httpx.RequestError) -> NetworkError | OutcomeUnknownError:
         reason = type(failure).__name__
         where = f"{self.request.method} {self.label}"
         if self.retry_class is RetryClass.NEVER and not is_not_sent(failure):
@@ -279,17 +330,20 @@ class RetryingTransport(httpx.BaseTransport):
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         attempt = _Attempt(request, self._settings)
+        if (paced := attempt.pace()) > 0:
+            self._settings.clock.sleep(paced)
         while True:
             attempt.begin()
             try:
                 response = self._inner.handle_request(request)
                 try:
                     attempt.read(response)
-                    response.read()
+                    if not attempt.stream:
+                        response.read()
                 except BaseException:
                     response.close()
                     raise
-            except httpx.TransportError as failure:
+            except httpx.RequestError as failure:
                 decision = attempt.judge(Outcome(failure=failure))
                 if not decision.retry:
                     raise attempt.failure_error(failure) from failure
@@ -311,17 +365,13 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         attempt = _Attempt(request, self._settings)
+        if (paced := attempt.pace()) > 0:
+            await self._settings.clock.asleep(paced)
         while True:
             attempt.begin()
             try:
-                response = await self._inner.handle_async_request(request)
-                try:
-                    attempt.read(response)
-                    await response.aread()
-                except BaseException:
-                    await response.aclose()
-                    raise
-            except httpx.TransportError as failure:
+                response = await self._send(attempt)
+            except httpx.RequestError as failure:
                 decision = attempt.judge(Outcome(failure=failure))
                 if not decision.retry:
                     raise attempt.failure_error(failure) from failure
@@ -334,6 +384,25 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
                     return response
                 await response.aclose()
             await self._settings.clock.asleep(decision.delay)
+
+    async def _send(self, attempt: _Attempt) -> httpx.Response:
+        """One attempt, held to its deadline even while blocked on the network. Only the expiry of
+        this timeout becomes a failure; a cancellation from the caller passes through."""
+        try:
+            async with asyncio.timeout(max(attempt.remaining(), 0.0)):
+                response = await self._inner.handle_async_request(attempt.request)
+                try:
+                    attempt.read(response)
+                    if not attempt.stream:
+                        await response.aread()
+                except BaseException:
+                    await response.aclose()
+                    raise
+        except TimeoutError as expired:
+            raise httpx.ReadTimeout(
+                f"the request took longer than {attempt.budget:g} s", request=attempt.request
+            ) from expired
+        return response
 
     async def aclose(self) -> None:
         await self._inner.aclose()
