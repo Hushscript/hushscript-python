@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=false
 """R54 over a real socket: a request that must not go out twice (rotate, a mutation, an unkeyed
 create) is sent exactly once when the pooled connection it rides on dies after the server has read
 the whole body. The GET control shows the server would see a second send, so "once" is not vacuous.
@@ -10,11 +11,13 @@ import struct
 import threading
 from typing import TYPE_CHECKING
 
+import httpx
 import pytest
 
 from conftest import TOKEN
 from helpers import FakeClock
 from hushscript import AsyncHushscript, Hushscript, HushscriptError
+from hushscript._client import _async_inner, _sync_inner
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -197,3 +200,13 @@ async def test_async_a_mutation_on_a_connection_that_dies_after_the_body_is_sent
     assert server.count(method, path) == 1
     assert server.connections_of(method, path) == server.connections_of(*WARM)
     await hs.aclose()
+
+
+def test_the_api_transports_never_offer_http2() -> None:
+    """R54 rests on HTTP/1.1: an HTTP/2 stream reset is retried inside httpcore, below the SDK's
+    one-send rule. Turning h2 on must fail here, not in production."""
+    for transport in (_sync_inner(), _async_inner()):
+        assert isinstance(transport, httpx.HTTPTransport | httpx.AsyncHTTPTransport)
+        pool = transport._pool
+        assert pool._http1 is True
+        assert pool._http2 is False
