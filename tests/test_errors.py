@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import cast
 
@@ -43,7 +44,9 @@ from hushscript._errors import (
     raise_for_response,
     render_hint,
 )
+from hushscript._json import loads
 from hushscript._redact import Credentials
+from hushscript._response import json_body
 
 
 def response(
@@ -563,3 +566,34 @@ def test_the_transport_survives_a_deep_body_on_a_create_that_was_rate_limited() 
     response = client.post("/v1/uploads", json={"idempotency_key": "k" * 20})
     assert response.status_code == 200
     assert script.calls == 2
+
+
+def test_a_success_body_with_an_unused_5000_digit_integer_parses() -> None:
+    body = b'{"balance_seconds":60,"unused":' + b"9" * 5000 + b"}"
+    parsed = json_body(httpx.Response(200, content=body), Credentials())
+    assert isinstance(parsed, dict)
+    assert parsed["balance_seconds"] == 60
+    assert parsed["unused"] == 2**64
+
+
+def test_an_integer_literal_past_a_lowered_interpreter_limit_is_beyond_range() -> None:
+    before = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(640)
+    try:
+        assert loads(b"[" + b"9" * 600 + b"]") == [int("9" * 600)]
+        assert loads(b"[" + b"9" * 700 + b"," + b"-" + b"9" * 700 + b"]") == [2**64, -(2**64)]
+    finally:
+        sys.set_int_max_str_digits(before)
+
+
+def test_no_source_file_reads_json_but_through_the_shared_loader() -> None:
+    source = Path(hushscript.__file__).parent
+    reads = re.compile(r"\bjson\.loads?\(|\.json\(\)")
+    offenders = [
+        str(path.relative_to(source))
+        for path in source.rglob("*.py")
+        if path.name != "_json.py"
+        and "generated" not in path.relative_to(source).parts  # the unused generated endpoints
+        and reads.search(path.read_text(encoding="utf-8"))
+    ]
+    assert offenders == []

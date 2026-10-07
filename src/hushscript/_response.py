@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, TypeVar
 
 from ._errors import ApiError, raise_for_response
+from ._json import loads
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -29,7 +30,7 @@ def json_body(response: httpx.Response, credentials: Credentials) -> object:
     """The JSON of a 2xx response; a non-2xx one raises the spec 9.2 error."""
     raise_for_response(response, credentials=credentials)
     try:
-        return response.json()
+        return loads(response.content)
     except (
         ValueError,
         RecursionError,
