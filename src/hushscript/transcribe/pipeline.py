@@ -19,8 +19,8 @@ from .resume import (
     job_missing,
     late_source,
 )
-from .source import FileInput, Source, make_source
 from .segment import segment
+from .source import FileInput, Source, make_source
 from .upload import SyncUploader, parse_created, stream_size_mismatch
 from .wait import finish, job_from, transcript_of, wait_for_job
 

@@ -32,7 +32,7 @@ from hushscript._http import AsyncRetryingTransport, RetryingTransport, _Attempt
 from hushscript._redact import Credentials
 from hushscript._response import parsed
 from hushscript._shape import finite_number, number
-from hushscript.transcribe.preflight import Media, Options, check_account, check_wait_timeout
+from hushscript.transcribe.preflight import Media, check_account, check_wait_timeout
 from pipe import async_hs_for, hs_for, media
 from routes import async_hs_on, hs_on
 from test_billing import PURCHASE, Shop

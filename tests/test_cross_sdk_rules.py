@@ -736,7 +736,8 @@ AWKWARD = "j #?%é-"
 
 @pytest.mark.parametrize("proxied", [False, True])
 def test_a_job_id_is_percent_encoded_in_every_path(
-    monkeypatch: pytest.MonkeyPatch, proxied: bool
+    monkeypatch: pytest.MonkeyPatch,
+    proxied: bool,  # noqa: FBT001
 ) -> None:
     api = FakeApi(job_prefix=AWKWARD, proxied=proxied)
     hs = hs_for(monkeypatch, api)
@@ -749,7 +750,8 @@ def test_a_job_id_is_percent_encoded_in_every_path(
 
 @pytest.mark.parametrize("proxied", [False, True])
 async def test_async_a_job_id_is_percent_encoded_in_every_path(
-    monkeypatch: pytest.MonkeyPatch, proxied: bool
+    monkeypatch: pytest.MonkeyPatch,
+    proxied: bool,  # noqa: FBT001
 ) -> None:
     api = FakeApi(job_prefix=AWKWARD, proxied=proxied)
     hs = async_hs_for(monkeypatch, api)

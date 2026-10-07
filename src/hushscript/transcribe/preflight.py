@@ -171,8 +171,10 @@ def _whole(value: object) -> int | None:
 
 
 def check_account(account: object, media: Media) -> None:
-    """Spec 8.1 step 5, from one `GET /v1/account`: the daily limit only. The balance is the server's
-    to judge at create (R77)."""
+    """Spec 8.1 step 5, from one `GET /v1/account`: the daily limit only.
+
+    The balance is the server's to judge at create (R77).
+    """
     fields = as_dict(account) or {}
     limits = as_dict(fields.get("limits")) or {}
     daily = _whole(limits.get("max_daily_seconds"))

@@ -28,8 +28,8 @@ from .resume import (
     job_missing,
     late_source,
 )
-from .source import FileInput, Source, make_source
 from .segment import segment
+from .source import FileInput, Source, make_source
 from .upload import parse_created, stream_size_mismatch
 from .wait import await_job, finish, job_from, transcript_of
 

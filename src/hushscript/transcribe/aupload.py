@@ -13,7 +13,6 @@ from .upload import (
     OCTET_STREAM,
     PART_TIMEOUTS,
     Action,
-    Mode,
     PartAttempts,
     Plan,
     UploadState,
