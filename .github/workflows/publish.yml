@@ -126,6 +126,8 @@ jobs:
           allowed-endpoints: >
             github.com:443
             api.github.com:443
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
             pypi.org:443
             files.pythonhosted.org:443
             upload.pypi.org:443
@@ -172,6 +174,7 @@ jobs:
             ${{ runner.temp }}/out/dist/*
             ${{ runner.temp }}/out/sbom.cdx.json
       - name: Publish to PyPI
+        # The action runs in a container pulled from ghcr.io, hence the two registry endpoints above.
         # No registry secret: PyPI exchanges the job's OIDC token for a short-lived upload token through
         # the trusted publisher attached to the project, and the action uploads PEP 740 attestations.
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

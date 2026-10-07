@@ -9,7 +9,13 @@ from typing import TYPE_CHECKING, Final, cast
 import httpx
 
 from ._config import PART_TIMEOUT
-from ._errors import NetworkError, OutcomeUnknownError, parse_retry_after
+from ._errors import (
+    HushscriptError,
+    NetworkError,
+    OutcomeUnknownError,
+    parse_retry_after,
+    unexpected_error,
+)
 from ._json import as_dict
 from ._retry import (
     CLAIM,
@@ -313,6 +319,21 @@ class _Attempt:
             )
         return NetworkError(f"Could not reach the Hushscript API: {where} ({reason}).")
 
+    def unexpected(self, failure: Exception) -> HushscriptError:
+        """Spec 9.2 and R61: a failure of the SDK's own after the request went out. A claim,
+        rotation or signup answer lost this way is as lost as one that never came (spec 7.4)."""
+        error = unexpected_error(failure, self.settings.credentials)
+        if self.retry_class is not RetryClass.NEVER:
+            return error
+        unknown = OutcomeUnknownError(
+            f"The answer to {self.request.method} {self.label} could not be used "
+            f"({type(failure).__name__}).",
+            code="outcome_unknown",
+            hint=UNKNOWN_HINTS.get(self.route or ""),
+        )
+        unknown.__cause__ = error.__cause__
+        return unknown
+
     def note_cancellation(self, cancelled: asyncio.CancelledError) -> None:
         """Spec 7.4: a cancel after a claim, rotate or signup body was written leaves the outcome
         unknown. The cancellation itself must reach asyncio untouched (timeouts and task groups
@@ -337,25 +358,48 @@ class RetryingTransport(httpx.BaseTransport):
             if (paced := attempt.pace()) > 0:
                 self._settings.clock.sleep(paced)
             attempt.begin()
-            try:
-                response = self._inner.handle_request(request)
-                try:
-                    attempt.read(response)
-                    if not attempt.stream:
-                        response.read()
-                except BaseException:
-                    response.close()
-                    raise
-            except httpx.RequestError as failure:
-                decision = attempt.judge(Outcome(failure=failure))
-                if not decision.retry:
-                    raise attempt.failure_error(failure) from failure
-            else:
-                decision = attempt.judge(attempt.outcome_of(response))
+            decision, response = self._once(attempt, request)
+            if response is not None:
                 if not decision.retry:
                     return response
                 response.close()
             self._settings.clock.sleep(decision.delay)
+
+    def _once(
+        self, attempt: _Attempt, request: httpx.Request
+    ) -> tuple[Decision, httpx.Response | None]:
+        """One attempt: what to do next and the response, if one came. Nothing but an SDK error
+        leaves it (R61)."""
+        unexpected: HushscriptError | None = None
+        try:
+            try:
+                response = self._send(attempt, request)
+            except httpx.RequestError as failure:
+                decision = attempt.judge(Outcome(failure=failure))
+                if not decision.retry:
+                    raise attempt.failure_error(failure) from failure
+                return decision, None
+            try:
+                return attempt.judge(attempt.outcome_of(response)), response
+            except BaseException:
+                response.close()
+                raise
+        except HushscriptError:
+            raise
+        except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
+            unexpected = attempt.unexpected(failure)
+        raise unexpected
+
+    def _send(self, attempt: _Attempt, request: httpx.Request) -> httpx.Response:
+        response = self._inner.handle_request(request)
+        try:
+            attempt.read(response)
+            if not attempt.stream:
+                response.read()
+        except BaseException:
+            response.close()
+            raise
+        return response
 
     def close(self) -> None:
         self._inner.close()
@@ -372,21 +416,38 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
             if (paced := attempt.pace()) > 0:
                 await self._settings.clock.asleep(paced)
             attempt.begin()
+            decision, response = await self._once(attempt)
+            if response is not None:
+                if not decision.retry:
+                    return response
+                await response.aclose()
+            await self._settings.clock.asleep(decision.delay)
+
+    async def _once(self, attempt: _Attempt) -> tuple[Decision, httpx.Response | None]:
+        """One attempt: what to do next and the response, if one came. Nothing but an SDK error
+        leaves it (R61); a cancellation passes through, with the note a lost secret needs."""
+        unexpected: HushscriptError | None = None
+        try:
             try:
                 response = await self._send(attempt)
             except httpx.RequestError as failure:
                 decision = attempt.judge(Outcome(failure=failure))
                 if not decision.retry:
                     raise attempt.failure_error(failure) from failure
+                return decision, None
             except asyncio.CancelledError as cancelled:
                 attempt.note_cancellation(cancelled)
                 raise
-            else:
-                decision = attempt.judge(attempt.outcome_of(response))
-                if not decision.retry:
-                    return response
+            try:
+                return attempt.judge(attempt.outcome_of(response)), response
+            except BaseException:
                 await response.aclose()
-            await self._settings.clock.asleep(decision.delay)
+                raise
+        except HushscriptError:
+            raise
+        except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
+            unexpected = attempt.unexpected(failure)
+        raise unexpected
 
     async def _send(self, attempt: _Attempt) -> httpx.Response:
         """One attempt, held to its deadline even while blocked on the network. Only the expiry of

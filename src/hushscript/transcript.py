@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 from ._json import as_dict, as_list
 from ._response import BadBodyError
@@ -12,6 +12,7 @@ from ._shape import (
     as_text,
     as_whole,
     check_shape,
+    finite_number,
     maybe_text,
     to_datetime,
 )
@@ -64,9 +65,9 @@ def _utterances(language: object, names: Mapping[str, str]) -> list[Utterance]:
 
 def _milliseconds(value: object) -> int:
     """Whole milliseconds, floored: the app's timestamps are."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if not finite_number(value):
         raise BadBodyError("a number of milliseconds")
-    return math.floor(value)
+    return math.floor(cast("float", value))
 
 
 def _no_fields() -> Mapping[str, object]:
@@ -99,10 +100,10 @@ class Transcript:
     cleaned: list[Utterance] | None
     """The AI-cleaned body, when there is one."""
     _raw: Mapping[str, object] = field(
-        init=False, default_factory=_no_fields, repr=False, compare=False
+        kw_only=True, default_factory=_no_fields, repr=False, compare=False
     )
     _translations: Mapping[str, list[Utterance]] = field(
-        init=False, default_factory=_no_translations, repr=False, compare=False
+        kw_only=True, default_factory=_no_translations, repr=False, compare=False
     )
 
     __hash__ = None  # type: ignore[assignment]  # holds lists, so it is unhashable by design
@@ -122,7 +123,7 @@ class Transcript:
             for locale, language in (as_dict(envelope["translations"]) or {}).items()
         }
         auto_delete = fields["auto_delete_at"]
-        transcript = cls(
+        return cls(
             id=as_text(fields["id"]),
             title=as_text(fields["title"]),
             language=maybe_text(fields["language_detected"]),
@@ -136,10 +137,9 @@ class Transcript:
             utterances=_utterances(envelope["original"], names),
             languages=[locale for locale in translations if locale != CLEANED],
             cleaned=translations.get(CLEANED),
+            _raw=fields,
+            _translations=translations,
         )
-        object.__setattr__(transcript, "_raw", fields)
-        object.__setattr__(transcript, "_translations", translations)
-        return transcript
 
     @property
     def text(self) -> str:

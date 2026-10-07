@@ -2,11 +2,32 @@ from __future__ import annotations
 
 import re
 from typing import Final
+from urllib.parse import quote
 
 from ._json import as_dict, as_list
 
 REDACTED: Final = "hsr…[redacted]"
 TOKEN_PATTERN: Final = re.compile(r"hsr\d+:[a-z]+:pat\.[0-9a-f]+\.[0-9a-f]+")
+MIN_SECRET_TAIL: Final = 16
+_WHOLE_TOKEN_FORMS: Final = 2
+"""A shorter echoed piece of a token is an ordinary substring, not worth redacting everywhere."""
+
+
+def _patterns(token: str) -> list[re.Pattern[str]]:
+    """What an API could echo of `token`, most specific first: the whole token as it is and
+    percent-encoded, then what follows `pat.` and the bare secret after the last dot. Matching
+    ignores case. A later piece is only ever a substring of an earlier one, so the order keeps the
+    id from being left behind."""
+    pieces = [token, quote(token, safe="")]
+    _, found, tail = token.partition("pat.")
+    if found:
+        pieces.append(tail)
+    pieces.append(token.rpartition(".")[2])
+    return [
+        re.compile(re.escape(piece), re.IGNORECASE)
+        for index, piece in enumerate(pieces)
+        if piece and (index < _WHOLE_TOKEN_FORMS or len(piece) >= MIN_SECRET_TAIL)
+    ]
 
 
 def redact(text: str) -> str:
@@ -80,7 +101,8 @@ class Credentials:
 
     def scrub(self, text: str) -> str:
         for token in (*self._tokens, *self._known):
-            text = text.replace(token, REDACTED)
+            for pattern in _patterns(token):
+                text = pattern.sub(REDACTED, text)
         return redact(text)
 
     def scrub_value(self, value: object) -> object:

@@ -43,7 +43,9 @@ def invalid_option(message: str) -> PreflightError:
 
 
 def _is_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return isinstance(value, int) or math.isfinite(value)
 
 
 def check_wait_timeout(wait_timeout: object) -> None:

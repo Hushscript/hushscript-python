@@ -47,7 +47,7 @@ def keep(path: Path, token: str) -> None:
         raise
 
 
-def run(terms: str, token_file: Path) -> None:
+def run(terms: str, token_file: Path, kept: list[Path]) -> None:
     signup = Hushscript.agent_signup(
         email="agent@example.com",
         pack="45min",
@@ -66,12 +66,14 @@ def run(terms: str, token_file: Path) -> None:
                 raise
             time.sleep(POLL_SECONDS)
     keep(token_file, account.token)  # before anything else can fail
+    kept.append(token_file)
     print(f"claimed {account.user_id}; token saved to {token_file}")
 
     with Hushscript(account.token) as hs:
         print(f"{hs.balance().minutes} minutes")
         rotated = hs.agent.rotate_token()  # revokes the claimed token; the client sends the new one
         keep(token_file, rotated.token)
+        kept.append(token_file)
         print(f"rotated; scopes: {', '.join(rotated.scopes)}; new token saved to {token_file}")
 
 
@@ -80,17 +82,21 @@ def main() -> int:
     arguments.add_argument("--terms", required=True, help="the policy version you accept")
     arguments.add_argument("--token-file", required=True, type=Path, help="where tokens are kept")
     options = arguments.parse_args()
+    kept: list[Path] = []
     try:
-        run(options.terms, options.token_file)
+        run(options.terms, options.token_file, kept)
     except HushscriptError as error:
         print(f"{error.code}: {error.hint or error.message}", file=sys.stderr)
-        if isinstance(error, OutcomeUnknownError) and looks_like_token(error.received_token):
-            keep(options.token_file, error.received_token or "")
+        received = error.received_token if isinstance(error, OutcomeUnknownError) else None
+        received = (received or "").strip()
+        if looks_like_token(received):
+            keep(options.token_file, received)
             print(
                 f"A token that came with the failed answer is in {options.token_file}.",
                 file=sys.stderr,
             )
-        print(f"Any token that was issued is in {options.token_file}.", file=sys.stderr)
+        elif kept:
+            print(f"Any token that was issued is in {options.token_file}.", file=sys.stderr)
         return 1
     return 0
 

@@ -20,6 +20,11 @@ _PLACEHOLDER: Final = re.compile(r"\{(\w+)\}")
 _SENTENCE_BREAK: Final = re.compile(r"(?<=\.) ")
 _TEMPLATE_PARAMETER: Final = re.compile(r"\\\{[^}/]+\\\}")
 _JOB_OR_UPLOAD: Final = re.compile(r"^[A-Z]+ /v1/(?:jobs|uploads)(?:/|$)")
+_URL_QUERY: Final = re.compile(r"(https?://[^\s\"'<>?#]+)\?[^\s\"'<>#]*")
+_INT_LIMIT: Final = 2**63
+"""Numbers the SDK reads stay inside a signed 64-bit range; beyond it, or not finite, they are
+absent."""
+_MAX_RETRY_AFTER_DIGITS: Final = 19
 
 
 def _camel(key: str) -> str:
@@ -43,20 +48,24 @@ def _snake_keys(value: object) -> object:
 
 
 def _number(value: object) -> float | None:
+    """`value` when it is a finite number inside the 64-bit range, else None (absent)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return value
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value if abs(value) < _INT_LIMIT else None
 
 
 def _format_number(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else str(value)
 
 
-def _format_context_value(value: object) -> str:
+def _format_context_value(value: object) -> str | None:
     if isinstance(value, bool):
         return str(value).lower()
     if isinstance(value, (int, float)):
-        return _format_number(value)
+        usable = _number(value)
+        return None if usable is None else _format_number(usable)
     items = as_list(value)
     if items is not None:
         return ", ".join(str(item) for item in items)
@@ -79,7 +88,8 @@ def _whole_seconds(retry_after: float | None, from_details: object) -> str | Non
 def _hint_context(
     details: Mapping[str, object], retry_after: float | None, scope: str | None
 ) -> dict[str, str]:
-    context = {_camel(key): _format_context_value(value) for key, value in details.items()}
+    formatted = {_camel(key): _format_context_value(value) for key, value in details.items()}
+    context = {name: text for name, text in formatted.items() if text is not None}
     derived = {
         "needed": _minutes(details, ("needed_seconds",), up=True),
         "balance": _minutes(details, ("balance_seconds",), up=False),
@@ -151,6 +161,32 @@ class HushscriptError(Exception):
             f"{type(self).__name__}(code={self.code!r}, status={self.status!r}, "
             f"message={self.message!r})"
         )
+
+
+class _RedactedCause(Exception):  # noqa: N818  # a stand-in for an exception, never raised by name
+    """What an unexpected failure looked like, with tokens and signed-URL queries removed."""
+
+
+UNEXPECTED: Final = "unexpected_error"
+
+
+def unexpected_error(
+    failure: BaseException, credentials: Credentials | None = None
+) -> HushscriptError:
+    """Spec 9.2: a failure inside the SDK, after a request was sent, that fits no other class. The
+    original rides along as a redacted cause."""
+    name = type(failure).__name__
+    error = HushscriptError(
+        f"An unexpected {name} interrupted the SDK after the request was sent.", code=UNEXPECTED
+    )
+    try:
+        text = f"{name}: {failure}"
+    except Exception:  # noqa: BLE001  # an exception whose own text breaks still has a name
+        text = name
+    scrubbed = credentials.scrub(text) if credentials is not None else redact(text)
+    cause = _RedactedCause(_URL_QUERY.sub(r"\1?…[redacted]", scrubbed))
+    error.__cause__ = cause.with_traceback(failure.__traceback__)
+    return error
 
 
 class ConfigurationError(HushscriptError):
@@ -345,7 +381,12 @@ def parse_retry_after(value: str | None) -> float | None:
     if value is None:
         return None
     text = value.strip()
-    return float(int(text)) if text.isascii() and text.isdigit() else None
+    if not text.isascii() or not text.isdigit():
+        return None
+    digits = text.lstrip("0") or "0"
+    if len(digits) > _MAX_RETRY_AFTER_DIGITS or int(digits) >= _INT_LIMIT:
+        return None
+    return float(int(digits))
 
 
 def _extra_details(body: Mapping[str, object]) -> dict[str, object]:
@@ -395,7 +436,8 @@ def error_from_response(
     credentials = credentials or Credentials()
     status = response.status_code
     body = _parse_body(response)
-    slug = body.get("error")
+    raw_slug = body.get("error")
+    slug = credentials.scrub(raw_slug) if isinstance(raw_slug, str) else raw_slug
     code_value = body.get("code")
     numeric_code = (
         code_value if isinstance(code_value, int) and not isinstance(code_value, bool) else None

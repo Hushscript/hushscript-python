@@ -56,7 +56,7 @@ async def wait_job(
         lambda: get_job(session, job_id),
         session.clock,
         wait_timeout,
-        callbacks.on_progress,
+        callbacks.progress,
         token,
         first,
     )
@@ -136,8 +136,7 @@ async def _after_create(  # the upload, wait and fetch that follow a create
         ResumeState(created.job_id, state.idempotency_key, state.size, state.duration_seconds)
     )
     tracker.token = token
-    if callbacks.on_resume_token is not None:
-        callbacks.on_resume_token(token)
+    callbacks.resume_token(token)
     if created.state == UPLOADING:
         if source is None:
             raise file_required()
@@ -161,7 +160,7 @@ async def run_transcribe(
     key = options.new_key()
     state = ResumeState("", key, media.size, media.duration_seconds)
     body = create_body(media, options, key, title=options.title)
-    tracker = Tracker(key)
+    tracker = Tracker(key, callers=callbacks.raised)
     with annotated(tracker):
         callbacks.progress(UploadingProgress(0, 0, state.size))
         tracker.sent = True
@@ -186,7 +185,7 @@ async def run_resume(
     options.validate()
     state = decode_token(token)
     source = early_source(state, file)
-    tracker = Tracker(state.idempotency_key, token, sent=True)
+    tracker = Tracker(state.idempotency_key, token, sent=True, callers=callbacks.raised)
     with annotated(tracker):
         job = await read_job_to_resume(session, state.job_id)
         if job.state != UPLOADING:

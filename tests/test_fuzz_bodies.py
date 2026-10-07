@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
-from hypothesis import given
+from hypothesis import example, given
 from hypothesis import strategies as st
 
 from conftest import TOKEN
@@ -196,6 +196,17 @@ def test_job_only_ever_answers_with_a_value_or_a_hushscript_error(body: object) 
 
 
 @given(mutated(CASES["transcript"][1]))
+@example(
+    transcript_body(
+        body={
+            "version": 1,
+            "original": {
+                "utterances": [{"speaker": "A", "start_ms": 10**400, "end_ms": 1, "text": "x"}]
+            },
+            "translations": {},
+        }
+    )
+)
 def test_transcript_only_ever_answers_with_a_value_or_a_hushscript_error(body: object) -> None:
     run("transcript", body)
 
@@ -226,6 +237,8 @@ def test_part_urls_only_ever_answer_with_a_value_or_a_hushscript_error(body: obj
 
 
 @given(mutated(CASES["account_check"][1]))
+@example({**account_body(), "balance_seconds": -(10**400)})  # the flaky one: a huge int in a hint
+@example({**account_body(), "limits": {"max_daily_seconds": -1, "used_today_seconds": 10**400}})
 def test_the_preflight_account_read_only_ever_answers_with_a_value_or_an_error(
     body: object,
 ) -> None:

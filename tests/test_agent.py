@@ -268,6 +268,25 @@ def test_an_unusable_2xx_claim_is_a_lost_credential_that_keeps_what_it_saw(
     assert len(routes.requests) == 1
 
 
+@pytest.mark.parametrize("seconds", [-1, 2**63, 10**400])
+def test_a_claim_whose_balance_is_not_a_non_negative_int64_is_a_lost_credential(
+    monkeypatch: pytest.MonkeyPatch, seconds: int
+) -> None:
+    static(monkeypatch, lambda _r: reply(201, {**CLAIMED, "balance_seconds": seconds}))
+    with pytest.raises(OutcomeUnknownError) as raised:
+        claim()
+    assert raised.value.hint == CLAIM_HINT
+    assert raised.value.received_token == NEW_TOKEN
+
+
+@pytest.mark.parametrize("seconds", [0, 2**63 - 1])
+def test_a_claim_with_a_balance_at_the_ends_of_the_range_is_usable(
+    monkeypatch: pytest.MonkeyPatch, seconds: int
+) -> None:
+    static(monkeypatch, lambda _r: reply(201, {**CLAIMED, "balance_seconds": seconds}))
+    assert claim().balance.seconds == seconds  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+
+
 @pytest.mark.parametrize("answer", [httpx.Response(204), httpx.Response(200, content=b"nope")])
 def test_a_claim_with_no_json_body_is_a_lost_credential(
     monkeypatch: pytest.MonkeyPatch, answer: httpx.Response
