@@ -252,7 +252,7 @@ def test_the_agent_flow_keeps_the_claimed_token_and_then_the_rotated_one(
         reply(201, ROTATED),
     )
     path = tmp_path / "agent-token"
-    agent_signup.run("2026-10-01", path)
+    agent_signup.run("2026-10-01", path, [])
     assert path.read_text() == f"{SECOND_TOKEN}\n"
     assert mode(path) == 0o600
     assert "claimed u_1" in capsys.readouterr().out
@@ -263,9 +263,11 @@ def test_a_failed_rotation_leaves_the_claimed_token_in_the_file(
 ) -> None:
     agent_api(monkeypatch, [reply(201, CLAIMED)], reply(401, error_body("unauthorized", 2000)))
     path = tmp_path / "agent-token"
+    kept: list[Path] = []
     with pytest.raises(HushscriptError):
-        agent_signup.run("2026-10-01", path)
+        agent_signup.run("2026-10-01", path, kept)
     assert path.read_text() == f"{NEW_TOKEN}\n"
+    assert kept == [path]
 
 
 def test_a_token_that_came_with_an_unusable_answer_is_kept_only_when_it_passes_the_check(
@@ -284,4 +286,41 @@ def test_a_token_that_came_with_an_unusable_answer_is_kept_only_when_it_passes_t
     assert path.read_text() == f"{NEW_TOKEN}\n"
     assert mode(path) == 0o600
     assert isinstance(OutcomeUnknownError("x"), HushscriptError)
-    assert "Any token that was issued" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "A token that came with the failed answer" in err
+    assert "Any token that was issued" not in err
+
+
+def test_a_token_with_padding_in_a_failed_answer_is_saved_trimmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "agent-token"
+    padded = {**CLAIMED, "pat": f"  {NEW_TOKEN}\n", "user_id": 5}
+    agent_api(monkeypatch, [reply(201, padded)], reply(201, ROTATED))
+    monkeypatch.setattr(sys, "argv", ["x", "--terms", "t", "--token-file", str(path)])
+    assert agent_signup.main() == 1
+    assert path.read_text() == f"{NEW_TOKEN}\n"
+
+
+def test_a_signup_that_failed_before_any_token_does_not_claim_one_was_issued(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    routes = Routes(lambda _request: reply(422, error_body("bad_request", 1000)))
+    monkeypatch.setattr(client_module, "_sync_inner", routes.sync)
+    monkeypatch.setenv("HUSHSCRIPT_BASE_URL", "http://127.0.0.1:4010")
+    path = tmp_path / "agent-token"
+    monkeypatch.setattr(sys, "argv", ["x", "--terms", "t", "--token-file", str(path)])
+    assert agent_signup.main() == 1
+    err = capsys.readouterr().err
+    assert "Any token that was issued" not in err
+    assert not path.exists()
+
+
+def test_a_failure_after_a_saved_token_says_where_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    agent_api(monkeypatch, [reply(201, CLAIMED)], reply(401, error_body("unauthorized", 2000)))
+    path = tmp_path / "agent-token"
+    monkeypatch.setattr(sys, "argv", ["x", "--terms", "t", "--token-file", str(path)])
+    assert agent_signup.main() == 1
+    assert f"Any token that was issued is in {path}." in capsys.readouterr().err
