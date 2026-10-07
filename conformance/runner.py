@@ -17,13 +17,14 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import golden_table
 import httpx
 
 import hushscript
 import hushscript._client as client_module
+import hushscript._http as http_module
 from hushscript import Hushscript, HushscriptError
 from hushscript._json import as_dict, as_list
 from hushscript.transcribe.probe import probe_duration
@@ -35,9 +36,10 @@ BASE_URL = "http://127.0.0.1:4010"
 TEST_TOKEN = "hsr1:eu:pat." + "0123456789abcdef" * 2 + "." + "fedcba9876543210" * 4
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 Json = Any
+Attempt = http_module._Attempt  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
 # Scenarios of the pinned conformance tag still name the spec 9.2 class PermissionError (R12 renamed
 # it PermissionDeniedError); drop this once the pin moves past the rename.
@@ -111,7 +113,7 @@ class VirtualClock:
 
 
 class InFlight:
-    """Requests the SDK has sent and not yet had an answer to, counted under its transport."""
+    """Requests the SDK has started and not yet finished reading: attempt start to body close."""
 
     def __init__(self) -> None:
         self.value = 0
@@ -128,20 +130,83 @@ class InFlight:
             self.value -= 1
 
 
-class CountingTransport(httpx.BaseTransport):
-    def __init__(self, inner: httpx.BaseTransport, counter: InFlight) -> None:
-        self._inner = inner
+HOLD_EXTENSION = "conformance.hold"
+
+
+class Hold:
+    """One request's place in the in-flight count, given back exactly once."""
+
+    def __init__(self, counter: InFlight) -> None:
         self._counter = counter
+        self._lock = threading.Lock()
+        self._held = True
+        counter.enter()
+
+    def release(self) -> None:
+        with self._lock:
+            if not self._held:
+                return
+            self._held = False
+        self._counter.leave()
+
+
+class CountedStream(httpx.SyncByteStream):
+    """The response body; the request stays in flight until it is closed."""
+
+    def __init__(self, inner: httpx.SyncByteStream, hold: Hold) -> None:
+        self._inner = inner
+        self._hold = hold
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield from self._inner
+
+    def close(self) -> None:
+        try:
+            self._inner.close()
+        finally:
+            self._hold.release()
+
+
+class CountingTransport(httpx.BaseTransport):
+    """Hands the attempt's hold to the response body. The hold is taken when the attempt starts
+    (`counted_begin`), so the settle never sees the SDK quiet between its own steps."""
+
+    def __init__(self, inner: httpx.BaseTransport) -> None:
+        self._inner = inner
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
-        self._counter.enter()
+        hold = request.extensions.pop(HOLD_EXTENSION, None)
         try:
-            return self._inner.handle_request(request)
-        finally:
-            self._counter.leave()
+            response = self._inner.handle_request(request)
+        except BaseException:
+            if hold is not None:
+                hold.release()
+            raise
+        if hold is not None:
+            response.stream = CountedStream(cast("httpx.SyncByteStream", response.stream), hold)
+        return response
 
     def close(self) -> None:
         self._inner.close()
+
+
+def counted_begin(
+    counter: InFlight,
+    begin: Callable[[Attempt], None],
+) -> Callable[[Attempt], None]:
+    """Wraps `_Attempt.begin`: a request counts as in flight from the moment its attempt sets its
+    deadline from the virtual clock until its response body is closed or the attempt fails."""
+
+    def wrapper(attempt: Attempt) -> None:
+        hold = Hold(counter)
+        try:
+            begin(attempt)
+        except BaseException:
+            hold.release()
+            raise
+        attempt.request.extensions[HOLD_EXTENSION] = hold
+
+    return wrapper
 
 
 SETTLE_SECONDS = 0.02
@@ -537,8 +602,9 @@ def main() -> int:
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0}
     counter = InFlight()
     client_module._sync_inner = lambda: CountingTransport(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        httpx.HTTPTransport(), counter
+        httpx.HTTPTransport()
     )
+    Attempt.begin = counted_begin(counter, Attempt.begin)  # type: ignore[method-assign,assignment]
     with (
         httpx.Client(base_url=BASE_URL, timeout=30) as control,
         tempfile.TemporaryDirectory() as tmp,
