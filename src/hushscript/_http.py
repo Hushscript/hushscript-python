@@ -15,6 +15,7 @@ from ._errors import (
     parse_retry_after,
     unexpected_error,
 )
+from ._guard import generated_parser, unusable_answer
 from ._json import as_dict, loads
 from ._retry import (
     CLAIM,
@@ -44,6 +45,7 @@ ANONYMOUS_EXTENSION: Final = "hushscript_anonymous"
 # so the caller decides whether to read it (a large download must not be buffered whole).
 STREAM_EXTENSION: Final = "hushscript_stream"
 IDEMPOTENCY_FIELD: Final = "idempotency_key"
+PURCHASE_PATH: Final = "/v1/billing/purchase"
 
 _PHASES: Final = ("connect", "read", "write", "pool")
 # Classes whose decision needs no response body, so the body may be left for the caller.
@@ -90,13 +92,13 @@ def _label(request: httpx.Request) -> str:
     return label if isinstance(label, str) else request.url.path
 
 
-def _has_idempotency_key(request: httpx.Request) -> bool:
+def _idempotency_key(request: httpx.Request) -> str | None:
     try:
         parsed: object = loads(request.content)
     except (ValueError, RecursionError, httpx.RequestNotRead):
-        return False
+        return None
     key = (as_dict(parsed) or {}).get(IDEMPOTENCY_FIELD)
-    return isinstance(key, str) and bool(key)
+    return key if isinstance(key, str) and key else None
 
 
 def _slug_of(body: bytes) -> str | None:
@@ -184,7 +186,10 @@ class _Attempt:
         self.retry_class = (
             override if isinstance(override, RetryClass) else classify(request.method, path)
         )
-        if self.retry_class is RetryClass.CREATE and not _has_idempotency_key(request):
+        key = _idempotency_key(request)
+        # R61: every error after a purchase went out carries its key, whoever made the request
+        self.purchase_key = key if on_base and path == PURCHASE_PATH else None
+        if self.retry_class is RetryClass.CREATE and key is None:
             # Only a keyed create is a safe replay; without a key it is any other mutation.
             self.retry_class = RetryClass.MUTATE
         self.stream = (
@@ -272,6 +277,19 @@ class _Attempt:
     def read(self, response: httpx.Response) -> None:
         response.stream = _DeadlineBody(response.stream, self)
 
+    def stamp(self, error: HushscriptError) -> None:
+        if self.purchase_key is not None and error.idempotency_key is None:
+            error.idempotency_key = self.purchase_key
+
+    def unusable(self, response: httpx.Response) -> HushscriptError | None:
+        """For a call made through a generated function (`hs.api`): the error for an answer its
+        parser cannot read, which would otherwise leave as a bare `JSONDecodeError`, `KeyError` or
+        `TypeError` (R61)."""
+        parse = None if self.stream else generated_parser()
+        if parse is None:
+            return None
+        return unusable_answer(parse, response, self.settings.credentials)
+
     def sent(self) -> bool:
         """The body was fully written, or an answer came, which a transport that never reads the
         body proves just as well."""
@@ -358,6 +376,13 @@ class RetryingTransport(httpx.BaseTransport):
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         attempt = _Attempt(request, self._settings)
+        try:
+            return self._run(attempt, request)
+        except HushscriptError as error:
+            attempt.stamp(error)
+            raise
+
+    def _run(self, attempt: _Attempt, request: httpx.Request) -> httpx.Response:
         while True:
             if (paced := attempt.pace()) > 0:
                 self._settings.clock.sleep(paced)
@@ -365,6 +390,9 @@ class RetryingTransport(httpx.BaseTransport):
             decision, response = self._once(attempt, request)
             if response is not None:
                 if not decision.retry:
+                    if (unusable := attempt.unusable(response)) is not None:
+                        response.close()
+                        raise unusable
                     return response
                 response.close()
             self._settings.clock.sleep(decision.delay)
@@ -417,6 +445,13 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         attempt = _Attempt(request, self._settings)
+        try:
+            return await self._run(attempt)
+        except HushscriptError as error:
+            attempt.stamp(error)
+            raise
+
+    async def _run(self, attempt: _Attempt) -> httpx.Response:
         while True:
             if (paced := attempt.pace()) > 0:
                 await self._settings.clock.asleep(paced)
@@ -424,6 +459,9 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
             decision, response = await self._once(attempt)
             if response is not None:
                 if not decision.retry:
+                    if (unusable := attempt.unusable(response)) is not None:
+                        await response.aclose()
+                        raise unusable
                     return response
                 await response.aclose()
             await self._settings.clock.asleep(decision.delay)
