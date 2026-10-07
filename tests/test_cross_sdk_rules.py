@@ -763,7 +763,7 @@ async def test_async_a_job_id_is_percent_encoded_in_every_path(
 
 
 def _done_job_with(transcript_id: str) -> httpx.Response:
-    job = {
+    job: dict[str, object] = {
         "id": "job_1",
         "state": "done",
         "mode": "standard",
