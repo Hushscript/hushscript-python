@@ -198,12 +198,13 @@ class _Attempt:
     def _authorize(self) -> None:
         credentials = self.settings.credentials
         token = None if credentials is None else credentials.token
-        if (
-            token is not None
-            and self.on_base
-            and not self.request.extensions.get(ANONYMOUS_EXTENSION)
-        ):
+        if not self.on_base or self.request.extensions.get(ANONYMOUS_EXTENSION):
+            return
+        if token is not None:
             self.request.headers["Authorization"] = f"Bearer {token}"
+        else:
+            # A token that was unset since an earlier attempt must not ride along on this one.
+            self.request.headers.pop("Authorization", None)
 
     def _track_body(self) -> None:
         if self.retry_class is RetryClass.NEVER:

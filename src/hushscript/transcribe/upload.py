@@ -68,7 +68,7 @@ def _urls(raw: object) -> dict[int, str]:
         entry = as_dict(item) or {}
         n = _whole(entry.get("n"))
         url = entry.get("url")
-        if n is None or not isinstance(url, str):
+        if n is None or n < 1 or not isinstance(url, str):
             raise _unexpected("part URL list")
         urls[n] = url
     return urls
@@ -80,7 +80,8 @@ def parse_plan(raw: object) -> Plan:
         raise _unexpected("upload plan")
     part_size = _whole(fields.get("part_size_bytes"))
     total = _whole(fields.get("total_parts"))
-    if part_size is None or total is None:
+    next_part = _whole(fields.get("next_part_number"))
+    if part_size is None or total is None or (next_part is not None and next_part < 1):
         raise _unexpected("upload plan")
     if part_size < 1 or total < 1:
         raise bad_part_plan()
@@ -88,7 +89,7 @@ def parse_plan(raw: object) -> Plan:
         part_size=part_size,
         total_parts=total,
         urls=_urls(fields.get("part_urls")),
-        next_part=_whole(fields.get("next_part_number")),
+        next_part=next_part,
     )
 
 

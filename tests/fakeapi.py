@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from helpers import BASE_URL
+from helpers import BASE_URL, OPTIONS
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -30,8 +30,16 @@ TRANSCRIPT = {
     "title": "Fake",
     "language_detected": "en",
     "duration_seconds": 24,
+    "speaker_names": {},
+    "tags": [],
+    "created_at": 1_700_000_000,
+    "updated_at": 1_700_000_100,
+    "auto_delete_at": None,
+    "edited": False,
     "body": {
-        "original": {"utterances": [{"speaker": "A", "start_ms": 0, "end_ms": 900, "text": "Hi."}]}
+        "version": 1,
+        "original": {"utterances": [{"speaker": "A", "start_ms": 0, "end_ms": 900, "text": "Hi."}]},
+        "translations": {},
     },
 }
 
@@ -157,8 +165,13 @@ class FakeApi:
             json={
                 "balance_seconds": self.balance,
                 "held_seconds": self.held,
+                "credits_expire_at": None,
+                "card_on_file": True,
+                "data_region": "eu",
                 "limits": {
                     "max_daily_seconds": self.max_daily,
+                    "max_active_jobs": 50,
+                    "active_jobs": 0,
                     "used_today_seconds": self.used_today,
                 },
             },
@@ -319,6 +332,14 @@ class FakeApi:
             json={
                 "id": job.id,
                 "state": job.state,
+                "mode": "standard",
+                "declared_seconds": 24,
+                "verified_seconds": None,
+                "actual_seconds": None,
+                "billable_seconds": 0,
+                "retry_of": None,
+                "created_at": 1_700_000_000,
+                "options": OPTIONS,
                 "transcript_id": None if self.drop_transcript_id else job.transcript_id,
                 "error": failed.get("error"),
                 "failure_kind": failed.get("failure_kind"),

@@ -155,7 +155,7 @@ minversion = "9.0"
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config", "-p", "no:cacheprovider"]
 filterwarnings = ["error"]
-pythonpath = ["src"]
+pythonpath = ["src", "conformance"]
 
 [tool.coverage.run]
 source = ["hushscript"]

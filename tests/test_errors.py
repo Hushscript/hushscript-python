@@ -396,3 +396,60 @@ def test_details_keys_are_snake_cased_recursively() -> None:
     body = error_body("bad_request", 1000, neededSeconds=1, nested={"innerKey": [{"deepKey": 2}]})
     error = error_from_response(response(400, body))
     assert error.details == {"needed_seconds": 1, "nested": {"inner_key": [{"deep_key": 2}]}}
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/v1/jobs/job_1"),
+        ("GET", "/v1/jobs"),
+        ("POST", "/v1/uploads/job_1/heartbeat"),
+        ("POST", "/v1/uploads/job_1/complete"),
+        ("PUT", "/v1/uploads/job_1/parts/2"),
+    ],
+)
+def test_wrong_state_carries_its_hint_on_job_and_upload_operations(method: str, path: str) -> None:
+    error = error_from_response(
+        response(409, error_body("wrong_state", 4001), method=method, path=path)
+    )
+    assert isinstance(error, ConflictError)
+    assert error.hint == "The job has already moved on. Call hs.jobs.get(id) to see where it is."
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/v1/billing/purchase"),
+        ("POST", "/v1/agent/accounts/sig_1/claim"),
+        ("POST", "/v1/agent/credentials/rotate"),
+        ("GET", "/v1/transcripts/tr_1"),
+        ("POST", "/v1/billing/setup-session"),
+        ("GET", "/v1/account"),
+    ],
+)
+def test_wrong_state_has_no_job_hint_on_any_other_operation(method: str, path: str) -> None:
+    error = error_from_response(
+        response(409, error_body("wrong_state", 4001), method=method, path=path)
+    )
+    assert isinstance(error, ConflictError)
+    assert (error.code, error.numeric_code, error.status) == ("wrong_state", 4001, 409)
+    assert error.hint is None
+    assert "hs.jobs.get" not in str(error)
+
+
+def test_wrong_state_without_a_request_has_no_hint_unless_the_operation_says_so() -> None:
+    bare = httpx.Response(409, json=error_body("wrong_state", 4001))
+    assert error_from_response(bare).hint is None
+    assert error_from_response(bare, operation="GET /v1/jobs/{id}").hint is not None
+    assert error_from_response(bare, operation="POST /v1/billing/purchase").hint is None
+
+
+def test_other_hints_are_unaffected_by_the_wrong_state_rule() -> None:
+    error = error_from_response(
+        response(
+            402,
+            error_body("insufficient_balance", 3001, needed_seconds=60),
+            path="/v1/billing/purchase",
+        )
+    )
+    assert error.hint is not None

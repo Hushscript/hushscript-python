@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import io
 import math
-import struct
 from typing import TYPE_CHECKING
 
 import pytest
 
 from hushscript import UnsupportedMediaError
+from hushscript.transcribe.preflight import Options, check_media
 from hushscript.transcribe.probe import probe_duration, scan_mp3_duration
+from hushscript.transcribe.sniff import HEAD_BYTES, sniff
 from hushscript.transcribe.source import BytesSource, PathSource, make_source
 
 if TYPE_CHECKING:
@@ -31,6 +32,8 @@ def test_every_fixture_is_declared_at_or_above_its_true_duration(
 ) -> None:
     assert len(durations) == 20
     for name, true in durations.items():
+        if name == "webm-renamed.mp3":  # R46: refused by the sniffer, never probed
+            continue
         got = probe_duration(PathSource(media_dir / name))
         assert math.ceil(got) >= true, name
         assert got - true <= 1, name
@@ -79,34 +82,15 @@ def test_a_file_with_no_mpeg_frames_has_no_scan() -> None:
     assert raised.value.code == "duration_unreadable"
 
 
-def _element(element_id: bytes, payload: bytes, size: bytes | None = None) -> bytes:
-    return element_id + (size if size is not None else bytes([0x80 | len(payload)])) + payload
-
-
-def _webm(*, scale: bytes | None, duration: bytes | None, unknown: bool = False) -> bytes:
-    info = b""
-    if scale is not None:
-        info += _element(b"\x2a\xd7\xb1", scale)
-    if duration is not None:
-        info += _element(b"\x44\x89", duration)
-    segment_body = _element(b"\x15\x49\xa9\x66", info)
-    size = b"\x01\xff\xff\xff\xff\xff\xff\xff" if unknown else None
-    return _element(b"\x1a\x45\xdf\xa3", b"") + _element(b"\x18\x53\x80\x67", segment_body, size)
-
-
-def test_a_matroska_duration_is_read_from_its_info_element() -> None:
-    data = _webm(scale=(1_000_000).to_bytes(3, "big"), duration=struct.pack(">f", 20008.0))
-    assert probe_duration(BytesSource(data)) == pytest.approx(20.008)
-
-
-def test_a_matroska_with_a_double_duration_and_unknown_segment_size() -> None:
-    data = _webm(scale=None, duration=struct.pack(">d", 5000.0), unknown=True)
-    assert probe_duration(BytesSource(data)) == pytest.approx(5.0)
-
-
-def test_a_matroska_without_a_duration_is_unreadable() -> None:
-    with pytest.raises(UnsupportedMediaError):
-        probe_duration(BytesSource(_webm(scale=b"\x0f\x42\x40", duration=None)))
+def test_a_webm_renamed_to_mp3_is_refused_not_probed(media_dir: Path) -> None:
+    webm = media_dir / "webm-renamed.mp3"
+    assert sniff(webm.read_bytes()[:HEAD_BYTES]) is None
+    with pytest.raises(UnsupportedMediaError) as raised:
+        check_media(PathSource(webm), Options())
+    assert raised.value.code == "unsupported_media"
+    with pytest.raises(UnsupportedMediaError) as unreadable:
+        probe_duration(PathSource(webm))
+    assert unreadable.value.code == "duration_unreadable"
 
 
 @pytest.mark.parametrize(

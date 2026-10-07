@@ -3,8 +3,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Final
 
 from hushscript._errors import JobFailedError, UploadError, WaitTimeoutError
-from hushscript._models import Job, ProcessingProgress, to_transcript
+from hushscript._models import Job, ProcessingProgress
 from hushscript._response import parsed
+from hushscript.transcript import Transcript
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -12,7 +13,7 @@ if TYPE_CHECKING:
     import httpx
 
     from hushscript._clock import Clock
-    from hushscript._models import Progress, Transcript
+    from hushscript._models import Progress
     from hushscript._redact import Credentials
 
 FIRST_POLL_DELAY: Final = 5.0
@@ -111,4 +112,4 @@ def finish(job: Job) -> str:
 
 
 def transcript_of(response: httpx.Response, credentials: Credentials) -> Transcript:
-    return parsed(response, credentials, to_transcript)
+    return parsed(response, credentials, Transcript.from_api)

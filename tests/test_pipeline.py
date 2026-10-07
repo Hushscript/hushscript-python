@@ -54,7 +54,7 @@ def test_a_direct_upload_sends_the_parts_to_r2_without_the_token(
     api = FakeApi()
     hs = hs_for(monkeypatch, api)
     transcript = hs.transcribe(media(), duration_seconds=100, title="My call")
-    assert transcript.raw["title"] == "Fake"
+    assert transcript.to_json()["title"] == "Fake"
     assert transcript.id.startswith("tr_job_1")
     assert api.count("POST", CREATE) == 1
     assert api.count("PUT", R2) == 3

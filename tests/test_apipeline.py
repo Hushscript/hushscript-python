@@ -44,7 +44,7 @@ async def test_a_direct_upload_runs_on_tasks_and_sends_no_token_to_r2(
     hs = async_hs_for(monkeypatch, api)
     seen: list[Progress] = []
     transcript = await hs.transcribe(media(), duration_seconds=100, on_progress=seen.append)
-    assert transcript.raw["title"] == "Fake"
+    assert transcript.to_json()["title"] == "Fake"
     assert api.count("PUT", R2) == 6
     assert all("authorization" not in r.headers for r in api.of("PUT", R2))
     assert [p.percent for p in seen if isinstance(p, UploadingProgress)][-1] == 100

@@ -1,51 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
-from ._json import as_dict
-from ._response import BadBodyError
+from ._json import as_dict, as_list
+from ._shape import (
+    as_flag,
+    as_text,
+    check_shape,
+    maybe_flag,
+    maybe_text,
+    maybe_whole,
+    to_datetime,
+)
+from ._shapes import JOB
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-
-def _int_field(body: Mapping[str, object], key: str) -> int:
-    value = body.get(key)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise BadBodyError(f"account response (no integer {key})")
-    return value
-
-
-@dataclass(frozen=True, slots=True)
-class Balance:
-    seconds: int
-    """Spendable now, already net of holds; may be negative (clawback debt)."""
-    minutes: int
-    held_seconds: int
-    expires_at: datetime | None
-    purchases_remaining: int | None
-
-    @classmethod
-    def from_account(cls, body: object) -> Balance:
-        fields = as_dict(body)
-        if fields is None:
-            raise BadBodyError("account response (not an object)")
-        seconds = _int_field(fields, "balance_seconds")
-        expires = fields.get("credits_expire_at")
-        remaining = fields.get("purchases_remaining_in_window")
-        return cls(
-            seconds=seconds,
-            minutes=int(seconds / 60),
-            held_seconds=_int_field(fields, "held_seconds"),
-            expires_at=datetime.fromtimestamp(expires, tz=UTC)
-            if isinstance(expires, int) and not isinstance(expires, bool)
-            else None,
-            purchases_remaining=remaining
-            if isinstance(remaining, int) and not isinstance(remaining, bool)
-            else None,
-        )
+    from datetime import datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,52 +41,74 @@ Progress = UploadingProgress | ProcessingProgress
 
 
 @dataclass(frozen=True, slots=True)
-class Job:
-    id: str
-    state: str
-    """`uploading`, `fetching`, `queued`, `processing`, `done` or `failed`; an unknown state passes
-    through untouched."""
-    transcript_id: str | None
-    error: str | None
-    failure_kind: str | None
-    raw: Mapping[str, object]
+class JobOptions:
+    """What the job was submitted with, from the API's content-free summary: it says whether
+    keyterms and a prompt were set, never what they were. A key the API adds later is not kept
+    here; `hs.api` returns the whole body."""
 
-    @classmethod
-    def from_body(cls, body: object) -> Job:
-        fields = as_dict(body)
-        if fields is None or not isinstance(fields.get("id"), str):
-            raise BadBodyError("job response (no id)")
-        return cls(
-            id=str(fields["id"]),
-            state=str(fields.get("state")),
-            transcript_id=_text(fields.get("transcript_id")),
-            error=_text(fields.get("error")),
-            failure_kind=_text(fields.get("failure_kind")),
-            raw=fields,
-        )
-
-
-def _text(value: object) -> str | None:
-    return value if isinstance(value, str) else None
+    language_code: str | None
+    """The forced language, or None when it was auto-detected."""
+    speaker_detection: bool
+    medical_mode: bool
+    multichannel: bool
+    translation_targets: list[str]
+    keyterms: bool
+    prompt: bool
+    auto_generate_insights: bool | None
+    """The upload's insights override, or None when it used the account default."""
 
 
 @dataclass(frozen=True, slots=True)
-class Transcript:
-    """The transcript as the API returns it. The formatters and typed fields arrive with the
-    transcript task; until then `raw` is the body of `GET /v1/transcripts/{id}`."""
+class Job:
+    """A processing job (spec 6.4). The private-result and from-URL fetch fields are left out;
+    `hs.api` still returns them."""
 
-    raw: Mapping[str, object]
+    id: str
+    state: str
+    """`uploading`, `fetching`, `queued`, `processing`, `done` or `failed`; a state the SDK does
+    not know yet passes through as the API's own string."""
+    transcript_id: str | None
+    error: str | None
+    """The failure text of a failed job; opaque."""
+    failure_kind: str | None
+    """`media_unreadable` or `media_undecodable` when the file itself could not be read."""
+    mode: str
+    declared_seconds: int | None
+    verified_seconds: int | None
+    actual_seconds: int | None
+    billable_seconds: int | None
+    retry_of: str | None
+    created_at: datetime
+    options: JobOptions
 
-    @property
-    def id(self) -> str:
-        return str(self.raw.get("id"))
-
-    def to_json(self) -> Mapping[str, object]:
-        return self.raw
-
-
-def to_transcript(body: object) -> Transcript:
-    fields = as_dict(body)
-    if fields is None:
-        raise BadBodyError("transcript response (not an object)")
-    return Transcript(raw=fields)
+    @classmethod
+    def from_body(cls, body: object) -> Job:
+        check_shape(body, JOB, "job response")
+        fields = as_dict(body) or {}
+        options = as_dict(fields["options"]) or {}
+        return cls(
+            id=as_text(fields["id"]),
+            state=as_text(fields["state"]),
+            transcript_id=maybe_text(fields["transcript_id"]),
+            error=maybe_text(fields["error"]),
+            failure_kind=maybe_text(fields["failure_kind"]),
+            mode=as_text(fields["mode"]),
+            declared_seconds=maybe_whole(fields["declared_seconds"]),
+            verified_seconds=maybe_whole(fields["verified_seconds"]),
+            actual_seconds=maybe_whole(fields["actual_seconds"]),
+            billable_seconds=maybe_whole(fields["billable_seconds"]),
+            retry_of=maybe_text(fields["retry_of"]),
+            created_at=to_datetime(fields["created_at"]),
+            options=JobOptions(
+                language_code=maybe_text(options["language_code"]),
+                speaker_detection=as_flag(options["speaker_detection"]),
+                medical_mode=as_flag(options["medical_mode"]),
+                multichannel=as_flag(options["multichannel"]),
+                translation_targets=[
+                    as_text(t) for t in as_list(options["translation_targets"]) or []
+                ],
+                keyterms=as_flag(options["keyterms"]),
+                prompt=as_flag(options["prompt"]),
+                auto_generate_insights=maybe_flag(options["auto_generate_insights"]),
+            ),
+        )

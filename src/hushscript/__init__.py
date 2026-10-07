@@ -24,24 +24,22 @@ from ._errors import (
     ValidationError,
     WaitTimeoutError,
 )
-from ._models import (
-    Balance,
-    Job,
-    ProcessingProgress,
-    Progress,
-    Transcript,
-    UploadingProgress,
-)
+from ._models import Job, JobOptions, ProcessingProgress, Progress, UploadingProgress
 from ._version import __version__
 from .generated.catalog import ERROR_CATALOG, ErrorCatalogEntry
 from .generated.hints import HINTS
 from .generated.scopes import OPERATION_SCOPES
+from .paginate import Page
+from .resources.account import Account, Balance, UploadLimits
+from .resources.transcripts import DeletedTranscript, TranscriptSummary
+from .transcript import Transcript, Utterance
 
 __all__ = [
     "ERROR_CATALOG",
     "HINTS",
     "OPERATION_SCOPES",
     "AbortError",
+    "Account",
     "ApiError",
     "AsyncHushscript",
     "AuthenticationError",
@@ -50,6 +48,7 @@ __all__ = [
     "ConfigurationError",
     "ConflictError",
     "DailyLimitError",
+    "DeletedTranscript",
     "ErrorCatalogEntry",
     "FileLimitError",
     "Hushscript",
@@ -57,9 +56,11 @@ __all__ = [
     "InsufficientBalanceError",
     "Job",
     "JobFailedError",
+    "JobOptions",
     "NetworkError",
     "NotFoundError",
     "OutcomeUnknownError",
+    "Page",
     "PaymentMethodRequiredError",
     "PermissionDeniedError",
     "PreflightError",
@@ -69,9 +70,12 @@ __all__ = [
     "ResumeMismatchError",
     "SystemClock",
     "Transcript",
+    "TranscriptSummary",
     "UnsupportedMediaError",
     "UploadError",
+    "UploadLimits",
     "UploadingProgress",
+    "Utterance",
     "ValidationError",
     "WaitTimeoutError",
     "__version__",

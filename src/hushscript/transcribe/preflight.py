@@ -38,7 +38,7 @@ _PRINTABLE_LAST: Final = 0x7E
 TRANSLATION_SURCHARGE: Final = 0.25
 
 
-def _invalid(message: str) -> PreflightError:
+def invalid_option(message: str) -> PreflightError:
     return PreflightError(message, code="invalid_option")
 
 
@@ -72,32 +72,32 @@ class Options:
             or isinstance(concurrency, bool)
             or not 1 <= concurrency <= MAX_CONCURRENCY
         ):
-            raise _invalid(f"concurrency must be a whole number from 1 to {MAX_CONCURRENCY}.")
+            raise invalid_option(f"concurrency must be a whole number from 1 to {MAX_CONCURRENCY}.")
         if not _is_number(self.wait_timeout) or self.wait_timeout <= 0:
-            raise _invalid("wait_timeout must be a positive number of seconds.")
+            raise invalid_option("wait_timeout must be a positive number of seconds.")
         if self.duration_seconds is not None and (
             not _is_number(self.duration_seconds) or self.duration_seconds <= 0
         ):
-            raise _invalid("duration_seconds must be a positive number of seconds.")
+            raise invalid_option("duration_seconds must be a positive number of seconds.")
         key = self.idempotency_key
         if key is not None and not (
             KEY_MIN <= len(key) <= KEY_MAX
             and all(_PRINTABLE_FIRST <= ord(char) <= _PRINTABLE_LAST for char in key)
         ):
-            raise _invalid(
+            raise invalid_option(
                 f"idempotency_key must be {KEY_MIN} to {KEY_MAX} visible ASCII characters,"
                 " no spaces."
             )
         if self.medical and self.language not in MEDICAL_LANGUAGES:
-            raise _invalid("medical needs language to be one of en, es, fr, de.")
+            raise invalid_option("medical needs language to be one of en, es, fr, de.")
         if len(self.keyterms) > MAX_KEYTERMS or any(
             len(term.split()) > MAX_KEYTERM_WORDS for term in self.keyterms
         ):
-            raise _invalid(
+            raise invalid_option(
                 f"keyterms takes up to {MAX_KEYTERMS} terms of at most {MAX_KEYTERM_WORDS} words."
             )
         if self.matter_code is not None and len(self.matter_code) > MAX_MATTER_CODE:
-            raise _invalid(f"matter_code must be at most {MAX_MATTER_CODE} characters.")
+            raise invalid_option(f"matter_code must be at most {MAX_MATTER_CODE} characters.")
         return self
 
     def new_key(self) -> str:

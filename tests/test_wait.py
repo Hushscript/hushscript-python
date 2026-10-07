@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import pytest
 
-from helpers import FakeClock
+from helpers import FakeClock, job_body
 from hushscript import JobFailedError, ProcessingProgress, UploadError, WaitTimeoutError
 from hushscript._models import Job, Progress
+from hushscript._response import BadBodyError
 from hushscript.transcribe.wait import (
     await_job,
     finish,
@@ -15,7 +16,7 @@ from hushscript.transcribe.wait import (
 
 
 def _job(state: str, **fields: object) -> Job:
-    return Job.from_body({"id": "job_1", "state": state, **fields})
+    return Job.from_body(job_body("job_1", state, **fields))
 
 
 def _flow(*states: str) -> list[Job]:
@@ -96,15 +97,10 @@ def test_a_done_job_without_a_transcript_id_is_an_upload_error() -> None:
 
 
 def test_a_job_body_without_an_id_is_refused() -> None:
-    with pytest.raises(Exception, match="no id"):
-        Job.from_body({"state": "done"})
-    with pytest.raises(Exception, match="no id"):
+    with pytest.raises(BadBodyError, match="id: expected a value"):
+        Job.from_body({k: v for k, v in job_body("job_1", "done").items() if k != "id"})
+    with pytest.raises(BadBodyError, match="expected an object"):
         Job.from_body([])
-
-
-def test_a_job_keeps_the_fields_it_does_not_know() -> None:
-    job = _job("done", transcript_id="t", x_new=1)
-    assert job.raw["x_new"] == 1
 
 
 @pytest.mark.anyio

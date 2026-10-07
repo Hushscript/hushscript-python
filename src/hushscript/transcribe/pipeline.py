@@ -27,7 +27,8 @@ from .wait import finish, job_from, transcript_of, wait_for_job
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Mapping
 
-    from hushscript._models import Progress, Transcript
+    from hushscript._models import Progress
+    from hushscript.transcript import Transcript
 
     from .session import SyncSession
     from .upload import Created

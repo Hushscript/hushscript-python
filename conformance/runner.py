@@ -8,6 +8,7 @@ runner contract asks for once the friendly layer is complete.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import sys
@@ -18,6 +19,7 @@ import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import golden_table
 import httpx
 
 import hushscript
@@ -27,6 +29,7 @@ from hushscript._json import as_dict, as_list
 from hushscript.transcribe.probe import probe_duration
 from hushscript.transcribe.sniff import sniff
 from hushscript.transcribe.source import make_source
+from hushscript.transcript import Transcript
 
 BASE_URL = "http://127.0.0.1:4010"
 TEST_TOKEN = "hsr1:eu:pat." + "0123456789abcdef" * 2 + "." + "fedcba9876543210" * 4
@@ -237,7 +240,7 @@ def _balance(hs: Hushscript, _args: Json, _files: Files) -> Json:
     }
 
 
-def _transcript_result(raw: Json) -> Json:
+def _transcript_result(raw: Json, text: str) -> Json:
     utterances = raw.get("body", {}).get("original", {}).get("utterances", [])
     return {
         "id": raw.get("id"),
@@ -245,6 +248,7 @@ def _transcript_result(raw: Json) -> Json:
         "language": raw.get("language_detected"),
         "durationSeconds": raw.get("duration_seconds"),
         "utteranceCount": len(utterances),
+        "text": text,
         "raw": raw,
     }
 
@@ -255,7 +259,7 @@ def _options(args: Json) -> Json:
 
 def _transcribe(hs: Hushscript, args: Json, files: Files) -> Json:
     transcript = hs.transcribe(str(files[args["file"]]), **_options(args))
-    return _transcript_result(dict(transcript.raw))
+    return _transcript_result(dict(transcript.to_json()), transcript.text)
 
 
 def _probe(_hs: Hushscript, args: Json, files: Files) -> Json:
@@ -285,8 +289,40 @@ def _probe(_hs: Hushscript, args: Json, files: Files) -> Json:
     }
 
 
+def _list_transcripts(hs: Hushscript, args: Json, _files: Files) -> Json:
+    page_size = args.get("pageSize")
+    rows = list(hs.transcripts.list(page_size=page_size))
+    return {
+        "count": len(rows),
+        "firstId": rows[0].id if rows else None,
+        "lastId": rows[-1].id if rows else None,
+    }
+
+
+def _get_transcript(hs: Hushscript, args: Json, _files: Files) -> Json:
+    transcript = hs.transcripts.get(args["id"])
+    return _transcript_result(dict(transcript.to_json()), transcript.text)
+
+
+def _format(_hs: Hushscript, _args: Json, files: Files) -> Json:
+    """Every golden rendered from its transcript fixture; a mismatch is the golden's file name.
+    The files come from the mock and the SDK sends no request."""
+    goldens = golden_table.all_goldens()
+    mismatches: list[str] = []
+    for golden in goldens:
+        transcript = Transcript.from_api(
+            json.loads(files.text(f"transcripts/{golden.transcript}.json"))
+        )
+        if golden.render(transcript) != files.text(f"exports/{golden.file}"):
+            mismatches.append(golden.file)
+    return {"checked": len(goldens), "mismatches": mismatches}
+
+
 OPS: dict[str, Callable[[Hushscript, Json, Files], Json]] = {
     "balance": _balance,
+    "listTranscripts": _list_transcripts,
+    "getTranscript": _get_transcript,
+    "format": _format,
     "transcribe": _transcribe,
     "probe": _probe,
 }
@@ -307,6 +343,11 @@ class Files:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(body)
         return path
+
+    def text(self, name: str) -> str:
+        """A fixture file as text, with its line endings exactly as stored."""
+        body = self._control.get(f"/__files/fixtures/{name}").raise_for_status().content
+        return body.decode("utf-8")
 
     def __getitem__(self, name: str) -> Path:
         return self.fetch(name if "/" in name else f"media/{name}")
@@ -415,7 +456,7 @@ def _call(hs: Hushscript, call: Json, files: Files, token: str | None) -> Json:
 
 def _resume(hs: Hushscript, call: Json, files: Files, token: str | None) -> Json:
     transcript = hs.resume(token or "", str(files[call["args"]["file"]]))
-    return _transcript_result(dict(transcript.raw))
+    return _transcript_result(dict(transcript.to_json()), transcript.text)
 
 
 def run_scenario(  # noqa: C901
