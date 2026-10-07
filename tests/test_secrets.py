@@ -9,7 +9,7 @@ import logging
 import pickle
 import pprint
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 import pytest
@@ -40,7 +40,7 @@ from pipe import async_hs_for, hs_for, media
 from routes import Routes, hs_on
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
     from types import TracebackType
 
 ODD = "hsr1-oddé-RECEIVED-SECRET"
@@ -247,9 +247,13 @@ def holds_text(value: object, secret: str, depth: int = 0) -> bool:
     if isinstance(value, bytes):
         return secret.encode() in value
     if isinstance(value, dict):
-        return any(holds_text(part, secret, depth + 1) for item in value.items() for part in item)
+        pairs = cast("dict[object, object]", value)
+        return any(
+            holds_text(key, secret, depth + 1) or holds_text(part, secret, depth + 1)
+            for key, part in pairs.items()
+        )
     if isinstance(value, (list, tuple, set, frozenset)):
-        return any(holds_text(part, secret, depth + 1) for part in value)
+        return any(holds_text(part, secret, depth + 1) for part in cast("Iterable[object]", value))
     return False
 
 
