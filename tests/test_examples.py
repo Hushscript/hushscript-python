@@ -49,7 +49,7 @@ def sent_error(status: int | None, key: str | None) -> HushscriptError:
     return error
 
 
-@pytest.mark.parametrize("status", [400, 401, 402, 403, 404, 422, 429])
+@pytest.mark.parametrize("status", [400, 402, 403, 404, 422])
 def test_a_refusal_says_nothing_was_charged(
     status: int, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -60,7 +60,7 @@ def test_a_refusal_says_nothing_was_charged(
     assert "--key" not in err
 
 
-@pytest.mark.parametrize("status", [None, 408, 409, 500, 502, 503, 200, 201])
+@pytest.mark.parametrize("status", [None, 401, 408, 409, 429, 500, 502, 503, 200, 201])
 def test_any_other_outcome_after_the_send_says_it_may_have_been_charged(
     status: int | None, capsys: pytest.CaptureFixture[str]
 ) -> None:

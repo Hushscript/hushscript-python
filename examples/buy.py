@@ -16,10 +16,12 @@ NOTICE = (
     "Minutes are added to your account instantly after payment. "
     "All purchases are final and non-refundable."
 )
-# The statuses of an answer that charged nothing: the API refused the purchase (4021 and 4023 are
-# 403, a rate limit 429). Any other outcome after the request was sent, a 408, a 409, a 5xx, no
-# status at all or an unusable answer, may have reached the card.
-REFUSALS = frozenset({400, 401, 402, 403, 404, 422, 429})
+# The statuses of an answer that charged nothing: a refusal the body alone decides (400, 403 with
+# 4021 or 4023, 404, 422) or a 402, which the API answers after its completed-purchase replay. A 401
+# or a 429 is answered before that replay, so after the SDK's one retry it can follow a first
+# attempt that charged. Any other outcome after the request was sent, a 401, a 408, a 409, a 429, a
+# 5xx, no status at all or an unusable answer, may have reached the card.
+REFUSALS = frozenset({400, 402, 403, 404, 422})
 
 
 def may_have_charged(error: HushscriptError) -> bool:
