@@ -15,6 +15,7 @@ from hushscript._log import RequestLog
 from hushscript._redact import Credentials
 
 if TYPE_CHECKING:
+    import threading
     from collections.abc import AsyncIterator, Iterator, Sequence
 
 BASE_URL = "http://127.0.0.1:4010"
@@ -34,6 +35,11 @@ class FakeClock:
     def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
         self.time += seconds
+
+    def wait(self, stop: threading.Event, seconds: float) -> bool:
+        if not stop.is_set():
+            self.sleep(seconds)
+        return stop.is_set()
 
     async def asleep(self, seconds: float) -> None:
         self.sleep(seconds)

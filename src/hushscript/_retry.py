@@ -97,7 +97,7 @@ def unrecoverable_route(method: str, path: str) -> str | None:
     return None if route is None else route[1]
 
 
-def is_not_sent(failure: httpx.TransportError) -> bool:
+def is_not_sent(failure: httpx.RequestError) -> bool:
     """True when the failure happened before the request body was written (spec 7.4)."""
     return isinstance(failure, _NOT_SENT)
 
@@ -118,7 +118,7 @@ class Outcome:
     status: int | None = None
     retry_after: float | None = None
     slug: str | None = None
-    failure: httpx.TransportError | None = None
+    failure: httpx.RequestError | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,7 +131,7 @@ STOP: Final = Decision(retry=False)
 
 
 def _after_failure(
-    policy: RetryPolicy, attempt: int, failure: httpx.TransportError, rng: random.Random
+    policy: RetryPolicy, attempt: int, failure: httpx.RequestError, rng: random.Random
 ) -> Decision:
     if policy.network is NetworkRetry.NONE:
         return STOP
