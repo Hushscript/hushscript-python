@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import cast
 
@@ -183,6 +184,57 @@ def test_retry_after_is_parsed_and_fills_the_hint() -> None:
     assert "try again in 61 s" in error.hint
 
 
+CAP = float(2**53 - 1)
+CAP_TEXT = "9007199254740991"
+
+
+@pytest.mark.parametrize("digits", ["9" * 400, "9" * 5000, str(2**63), "1" + "0" * 30])
+def test_a_huge_retry_after_header_is_over_60_and_reported_capped(digits: str) -> None:
+    error = error_from_response(
+        response(429, error_body("rate_limited", 5000), {"Retry-After": digits})
+    )
+    assert error.retry_after == CAP
+    assert error.hint is not None
+    assert f"try again in {CAP_TEXT} s" in error.hint
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [b"9" * 400, b"9" * 5000, b"1e30", b"1" + b"0" * 30, b"9007199254740992"],
+    ids=["400-digits", "5000-digits", "1e30", "31-digits", "2**53"],
+)
+def test_a_huge_retry_after_seconds_detail_is_over_60_and_reported_capped(literal: bytes) -> None:
+    body = b'{"error":"rate_limited","code":5000,"retry_after_seconds":' + literal + b"}"
+    error = error_from_response(httpx.Response(429, content=body))
+    assert error.hint is not None
+    assert f"try again in {CAP_TEXT} s" in error.hint
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [b"-1", b"-" + b"9" * 400, b"Infinity", b"-Infinity", b"NaN", b'"90"', b"true", b"null"],
+)
+def test_a_negative_or_non_numeric_retry_after_seconds_detail_is_absent(literal: bytes) -> None:
+    body = b'{"error":"rate_limited","code":5000,"retry_after_seconds":' + literal + b"}"
+    error = error_from_response(httpx.Response(429, content=body))
+    assert error.hint == "Too many requests."
+
+
+def test_the_header_wins_over_the_detail() -> None:
+    body = {"error": "rate_limited", "code": 5000, "retry_after_seconds": 90}
+    assert "in 7 s" in (error_from_response(response(429, body, {"Retry-After": "7"})).hint or "")
+    assert "in 90 s" in (error_from_response(response(429, body)).hint or "")
+
+
+@pytest.mark.parametrize("header", ["-1", "NaN", "Infinity", "1e400", "1.5", ""])
+def test_a_negative_or_non_numeric_retry_after_header_is_absent(header: str) -> None:
+    error = error_from_response(
+        response(429, error_body("rate_limited", 5000), {"Retry-After": header})
+    )
+    assert error.retry_after is None
+    assert error.hint == "Too many requests."
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -226,7 +278,9 @@ def test_raise_for_response_ignores_success_and_raises_otherwise() -> None:
 
 def test_render_hint_drops_sentences_with_unfilled_placeholders() -> None:
     assert render_hint("no_such_slug") is None
-    assert render_hint("insufficient_balance") == 'Buy a pack with hs.buy("300min") or in the app.'
+    assert render_hint("insufficient_balance") == (
+        "Buy a pack with the SDK's buy method or in the app."
+    )
     assert render_hint("rate_limited") == "Too many requests."
     assert render_hint("config_invalid") is None
     assert render_hint("daily_limit") is None
@@ -236,11 +290,12 @@ def test_render_hint_drops_sentences_with_unfilled_placeholders() -> None:
         " (59 of 600 min used in the last 24 h)."
     )
     assert render_hint("insufficient_balance", {"needed_seconds": 61, "balance_seconds": 119}) == (
-        'Not enough minutes: 2 needed, 1 available. Buy a pack with hs.buy("300min") or in the app.'
+        "Not enough minutes: 2 needed, 1 available."
+        " Buy a pack with the SDK's buy method or in the app."
     )
     assert render_hint("insufficient_balance", {"needed_seconds": 60, "balance_seconds": -1}) == (
         "Not enough minutes: 1 needed, -1 available."
-        ' Buy a pack with hs.buy("300min") or in the app.'
+        " Buy a pack with the SDK's buy method or in the app."
     )
     assert render_hint("daily_limit", {"used": 3, "max": 10}) == (
         "This upload would pass your daily transcription limit (3 of 10 min used in the last 24 h)."
@@ -320,6 +375,13 @@ def test_hint_rendering_matches_the_conformance_fixture() -> None:
         if actual != case["expected"]:
             mismatches.append(f"{case['slug']} {details}: {actual!r} != {case['expected']!r}")
     assert not mismatches
+
+
+def test_no_hint_names_an_sdk_method() -> None:
+    """R62: hint text is shared by every SDK, so it names no method of any of them."""
+    method = re.compile(r"\bhs\b|\w\(|add_?card|set_?default|jobs\.|\.buy", re.IGNORECASE)
+    named = {slug: text for slug, text in hushscript.HINTS.items() if method.search(text)}
+    assert not named
 
 
 def test_the_error_tree_matches_spec_9_2() -> None:
@@ -413,7 +475,7 @@ def test_wrong_state_carries_its_hint_on_job_and_upload_operations(method: str, 
         response(409, error_body("wrong_state", 4001), method=method, path=path)
     )
     assert isinstance(error, ConflictError)
-    assert error.hint == "The job has already moved on. Call hs.jobs.get(id) to see where it is."
+    assert error.hint == "The job has already moved on. Fetch the job to see where it is."
 
 
 @pytest.mark.parametrize(

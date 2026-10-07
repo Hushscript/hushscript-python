@@ -3,9 +3,8 @@ from __future__ import annotations
 import asyncio
 import re
 import uuid
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, TypeVar
 
 from hushscript._errors import (
     HushscriptError,
@@ -31,7 +30,7 @@ from hushscript.resources.account import minutes_of
 from hushscript.transcribe.preflight import invalid_option
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Generator, Iterator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
     from datetime import datetime
 
     from hushscript._redact import Credentials
@@ -39,6 +38,7 @@ if TYPE_CHECKING:
 
 PURCHASE_KEY: Final = re.compile(r"[A-Za-z0-9_-]{1,128}")
 OK: Final = "ok"
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,28 +296,47 @@ def purchase_body(
     }
 
 
-@contextmanager
-def purchase_sent(key: str, credentials: Credentials) -> Generator[None]:
+def _interrupted(interrupted: BaseException, key: str) -> None:
+    interrupted.add_note(
+        f"The purchase request was sent, so the card may have been charged. Idempotency key: {key}"
+    )
+
+
+def sent_purchase(key: str, credentials: Credentials, send: Callable[[], T]) -> T:
     """From the moment the purchase request goes out the card may have been charged, so every error
     carries the key (spec 6.5), whatever its kind; an interrupt is never converted, and carries it
-    as a note."""
-    failed: HushscriptError | None = None
+    as a note. A failure of the SDK's own is raised once the handler has ended, so the unredacted
+    original is on neither the cause nor the `__context__` of what the caller gets."""
     try:
-        yield
+        return send()
     except (asyncio.CancelledError, KeyboardInterrupt) as interrupted:
-        interrupted.add_note(
-            "The purchase request was sent, so the card may have been charged. "
-            f"Idempotency key: {key}"
-        )
+        _interrupted(interrupted, key)
         raise
     except HushscriptError as error:
         error.idempotency_key = key
         raise
     except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
         failed = unexpected_error(failure, credentials)
-    if failed is not None:
-        failed.idempotency_key = key
-        raise failed
+    failed.idempotency_key = key
+    raise failed
+
+
+async def sent_purchase_async(
+    key: str, credentials: Credentials, send: Callable[[], Awaitable[T]]
+) -> T:
+    """`sent_purchase` for the asyncio client."""
+    try:
+        return await send()
+    except (asyncio.CancelledError, KeyboardInterrupt) as interrupted:
+        _interrupted(interrupted, key)
+        raise
+    except HushscriptError as error:
+        error.idempotency_key = key
+        raise
+    except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
+        failed = unexpected_error(failure, credentials)
+    failed.idempotency_key = key
+    raise failed
 
 
 def check_card_id(card_id: object) -> str:
@@ -378,9 +397,12 @@ class Billing:
         key = purchase_key(idempotency_key)
         card_id = choose_card(self.cards())
         body = purchase_body(pack, key, card_id, acknowledge_no_refund=acknowledge_no_refund)
-        with purchase_sent(key, self._session.credentials):
+
+        def send() -> Purchase:
             response = self._session.http.post("/v1/billing/purchase", json=body)
             return parsed(response, self._session.credentials, purchase_of)
+
+        return sent_purchase(key, self._session.credentials, send)
 
     def transactions(self) -> Iterator[Transaction]:
         """Every purchase, newest first, fetching pages as it goes."""
@@ -446,9 +468,12 @@ class AsyncBilling:
         key = purchase_key(idempotency_key)
         card_id = choose_card(await self.cards())
         body = purchase_body(pack, key, card_id, acknowledge_no_refund=acknowledge_no_refund)
-        with purchase_sent(key, self._session.credentials):
+
+        async def send() -> Purchase:
             response = await self._session.http.post("/v1/billing/purchase", json=body)
             return parsed(response, self._session.credentials, purchase_of)
+
+        return await sent_purchase_async(key, self._session.credentials, send)
 
     def transactions(self) -> AsyncIterator[Transaction]:
         return apaginate(self._transactions)

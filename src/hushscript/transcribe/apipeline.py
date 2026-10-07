@@ -9,7 +9,15 @@ from hushscript._response import json_body, parsed
 
 from .aupload import AsyncUploader
 from .heartbeat import Heartbeat
-from .pipeline import UPLOADING, Callbacks, Tracker, annotated, percent, replay_body
+from .pipeline import (
+    UPLOADING,
+    Callbacks,
+    Tracker,
+    annotate,
+    note_interrupt,
+    percent,
+    replay_body,
+)
 from .preflight import Options, check_account, check_media, create_body
 from .resume import (
     ResumeState,
@@ -145,6 +153,18 @@ async def _after_create(  # the upload, wait and fetch that follow a create
     return await fetch_transcript(session, job)
 
 
+async def annotated(tracker: Tracker, run: Callable[[], Awaitable[T]]) -> T:
+    """`pipeline.annotated` for the asyncio client."""
+    try:
+        return await run()
+    except (asyncio.CancelledError, KeyboardInterrupt) as interrupted:
+        note_interrupt(tracker, interrupted)
+        raise
+    except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
+        failed = annotate(tracker, failure)
+    raise failed
+
+
 async def run_transcribe(
     session: AsyncSession,
     file: FileInput,
@@ -161,12 +181,14 @@ async def run_transcribe(
     state = ResumeState("", key, media.size, media.duration_seconds)
     body = create_body(media, options, key, title=options.title)
     tracker = Tracker(key, callers=callbacks.raised, credentials=session.credentials)
-    with annotated(tracker):
+
+    async def run() -> Transcript:
         callbacks.progress(UploadingProgress(0, 0, state.size))
         tracker.sent = True
         created = await create(session, body)
         return await _after_create(session, created, tracker, state, source, options, callbacks)
-    raise tracker.pending()
+
+    return await annotated(tracker, run)
 
 
 async def read_job_to_resume(session: AsyncSession, job_id: str) -> Job:
@@ -193,17 +215,19 @@ async def run_resume(
         callers=callbacks.raised,
         credentials=session.credentials,
     )
-    with annotated(tracker):
+
+    async def run() -> Transcript:
         job = await read_job_to_resume(session, state.job_id)
         if job.state != UPLOADING:
             waited = await wait_job(
                 session, state.job_id, options.wait_timeout, callbacks, token, job
             )
             return await fetch_transcript(session, waited)
-        source = late_source(state, file, source)
+        late = late_source(state, file, source)
         callbacks.progress(UploadingProgress(0, 0, state.size))
         created = await create(session, replay_body(state))
         if created.job_id != state.job_id:
             raise job_missing()
-        return await _after_create(session, created, tracker, state, source, options, callbacks)
-    raise tracker.pending()
+        return await _after_create(session, created, tracker, state, late, options, callbacks)
+
+    return await annotated(tracker, run)

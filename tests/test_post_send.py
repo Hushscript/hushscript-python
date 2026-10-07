@@ -65,6 +65,8 @@ def raw(status: int, content: bytes, headers: dict[str, str] | None = None) -> h
 
 # --- total numbers ---
 
+CAP = float(2**53 - 1)
+
 
 @pytest.mark.parametrize(
     ("header", "expected"),
@@ -72,10 +74,13 @@ def raw(status: int, content: bytes, headers: dict[str, str] | None = None) -> h
         ("7", 7.0),
         (" 12 ", 12.0),
         ("0" * 5000 + "7", 7.0),
-        ("9" * 400, None),
-        ("9" * 5000, None),
-        (str(2**63), None),
-        (str(2**63 - 1), float(2**63 - 1)),
+        ("61", 61.0),
+        (str(2**53 - 1), CAP),
+        (str(2**53), CAP),
+        ("9" * 400, CAP),
+        ("9" * 5000, CAP),
+        (str(2**63), CAP),
+        (str(2**63 - 1), CAP),
         ("1e400", None),
         ("NaN", None),
         ("Infinity", None),
@@ -118,7 +123,7 @@ def test_a_refused_purchase_with_unusable_numbers_is_an_sdk_error_with_the_key(
         hs.buy("300min", idempotency_key="my-key")
     assert raised.value.status == status
     assert raised.value.idempotency_key == "my-key"
-    assert raised.value.retry_after is None
+    assert raised.value.retry_after == CAP
     assert "inf" not in (raised.value.hint or "").lower()
     assert "nan" not in (raised.value.hint or "").lower()
 
@@ -447,6 +452,53 @@ async def test_async_the_cause_of_an_unexpected_purchase_error_is_redacted(
     check_forms_redacted(raised.value)
 
 
+def whole_chain(error: BaseException) -> list[BaseException]:
+    """The error and all that is reachable through `__cause__` and `__context__`."""
+    seen: list[BaseException] = []
+    pending: list[BaseException | None] = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or any(current is known for known in seen):
+            continue
+        seen.append(current)
+        pending.extend([current.__cause__, current.__context__])
+    return seen
+
+
+def check_no_original_in_chain(error: HushscriptError) -> None:
+    chain = whole_chain(error)
+    assert error.__cause__ is not None
+    assert error.__context__ is None
+    assert not any(isinstance(link, TypeError) for link in chain)
+    text = " ".join(f"{link} {link!r}" for link in chain)
+    assert "TypeError" in text
+    assert TOKEN not in text
+    assert TOKEN.rpartition(".")[2] not in text
+
+
+def test_an_unexpected_purchase_error_holds_no_unredacted_original_anywhere_in_its_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(billing_module, "purchase_of", explode)
+    hs, _ = hs_on(monkeypatch, Shop(purchases=[reply(200, OK)]))
+    with pytest.raises(HushscriptError) as raised:
+        hs.buy("300min", idempotency_key="my-key")
+    assert raised.value.idempotency_key == "my-key"
+    check_no_original_in_chain(raised.value)
+
+
+@pytest.mark.anyio
+async def test_async_an_unexpected_purchase_error_holds_no_unredacted_original_in_its_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(billing_module, "purchase_of", explode)
+    hs, _ = async_hs_on(monkeypatch, Shop(purchases=[reply(200, OK)]))
+    with pytest.raises(HushscriptError) as raised:
+        await hs.buy("300min", idempotency_key="my-key")
+    assert raised.value.idempotency_key == "my-key"
+    check_no_original_in_chain(raised.value)
+
+
 def test_the_cause_of_an_unexpected_pipeline_error_is_redacted_and_leaves_no_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -580,3 +632,44 @@ def test_a_huge_int_in_a_timestamp_of_a_transcript_is_a_bad_response() -> None:
     with pytest.raises(HushscriptError) as raised:
         parsed(response, Credentials(TOKEN), Transcript.from_api)
     assert raised.value.code == "bad_response"
+
+
+# --- `annotated` surfaces what it swallowed without help from its caller ---
+
+
+def sent_tracker() -> pipeline_module.Tracker:
+    return pipeline_module.Tracker("k" * 24, "tok", sent=True, credentials=Credentials(TOKEN))
+
+
+def test_annotated_raises_an_unexpected_failure_itself() -> None:
+    def run() -> object:
+        raise TypeError(SECRET_TEXT)
+
+    with pytest.raises(HushscriptError) as raised:
+        pipeline_module.annotated(sent_tracker(), run)
+    assert (raised.value.idempotency_key, raised.value.resume_token) == ("k" * 24, "tok")
+    check_no_original_in_chain(raised.value)
+
+
+@pytest.mark.anyio
+async def test_async_annotated_raises_an_unexpected_failure_itself() -> None:
+    async def run() -> object:
+        raise TypeError(SECRET_TEXT)
+
+    with pytest.raises(HushscriptError) as raised:
+        await apipeline_module.annotated(sent_tracker(), run)
+    assert (raised.value.idempotency_key, raised.value.resume_token) == ("k" * 24, "tok")
+    check_no_original_in_chain(raised.value)
+
+
+def test_annotated_returns_what_the_block_returns_and_leaves_an_unsent_failure_alone() -> None:
+    assert pipeline_module.annotated(sent_tracker(), lambda: 7) == 7
+    unsent = pipeline_module.Tracker("k" * 24, credentials=Credentials(TOKEN))
+    mine = TypeError("before the create")
+
+    def run() -> object:
+        raise mine
+
+    with pytest.raises(TypeError) as raised:
+        pipeline_module.annotated(unsent, run)
+    assert raised.value is mine
