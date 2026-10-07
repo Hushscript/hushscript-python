@@ -298,8 +298,7 @@ def purchase_body(
 
 def _interrupted(interrupted: BaseException, key: str) -> None:
     interrupted.add_note(
-        "The purchase request was sent, so the card may have been charged. "
-        f"Idempotency key: {key}"
+        f"The purchase request was sent, so the card may have been charged. Idempotency key: {key}"
     )
 
 
