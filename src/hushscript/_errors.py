@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 _PLACEHOLDER: Final = re.compile(r"\{(\w+)\}")
 _SENTENCE_BREAK: Final = re.compile(r"(?<=\.) ")
 _TEMPLATE_PARAMETER: Final = re.compile(r"\\\{[^}/]+\\\}")
+_JOB_OR_UPLOAD: Final = re.compile(r"^[A-Z]+ /v1/(?:jobs|uploads)(?:/|$)")
 
 
 def _camel(key: str) -> str:
@@ -383,7 +384,7 @@ def error_from_response(
     retry_after = parse_retry_after(response.headers.get("retry-after"))
     details = as_dict(_snake_keys(credentials.scrub_value(_extra_details(body)))) or {}
     error_class = _CLASS_BY_SLUG.get(code) or _CLASS_BY_STATUS.get(status) or ApiError
-    return error_class(
+    error = error_class(
         credentials.scrub(message),
         code=code,
         numeric_code=numeric_code,
@@ -392,6 +393,10 @@ def error_from_response(
         retry_after=retry_after,
         scope=OPERATION_SCOPES.get(operation) if operation else None,
     )
+    if code == "wrong_state" and not _JOB_OR_UPLOAD.match(operation or ""):
+        # The hint names a job call, so only job and upload operations carry it (spec 9.3).
+        error.hint = None
+    return error
 
 
 def raise_for_response(

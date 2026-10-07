@@ -6,9 +6,23 @@ import httpx
 import pytest
 
 from conftest import TOKEN
-from helpers import FakeClock, Script, async_client, error_body, reply, sync_client
+from helpers import (
+    BASE_URL,
+    FakeClock,
+    Script,
+    async_client,
+    error_body,
+    reply,
+    settings_for,
+    sync_client,
+)
 from hushscript import NetworkError, OutcomeUnknownError
-from hushscript._http import ANONYMOUS_EXTENSION, CLASS_EXTENSION, LABEL_EXTENSION
+from hushscript._http import (
+    ANONYMOUS_EXTENSION,
+    CLASS_EXTENSION,
+    LABEL_EXTENSION,
+    RetryingTransport,
+)
 from hushscript._retry import RetryClass
 
 RATE_LIMITED = error_body("rate_limited", 5000)
@@ -423,3 +437,24 @@ def test_the_active_jobs_wait_counts_only_active_jobs_429s() -> None:
         assert client.post("/v1/uploads", json={"idempotency_key": "k" * 20}).status_code == 429
     assert script.calls == 12
     assert clock.sleeps[2:] == [30.0] * 9
+
+
+def test_a_token_unset_since_an_earlier_attempt_is_not_sent_on_the_retry() -> None:
+    clock = FakeClock()
+    settings = settings_for(clock, token=TOKEN)
+    assert settings.credentials is not None
+    credentials = settings.credentials
+    sent: list[str | None] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers.get("authorization"))
+        if len(sent) == 1:
+            credentials._tokens.clear()  # pyright: ignore[reportPrivateUsage]
+            return reply(503)
+        return reply(200, {})
+
+    with httpx.Client(
+        base_url=BASE_URL, transport=RetryingTransport(httpx.MockTransport(handle), settings)
+    ) as client:
+        assert client.get("/v1/account").status_code == 200
+    assert sent == [f"Bearer {TOKEN}", None]

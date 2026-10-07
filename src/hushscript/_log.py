@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -22,20 +23,48 @@ _LOGGER: Final = logging.getLogger("hushscript")
 _SIGNED_REQUEST: ContextVar[str | None] = ContextVar("hushscript_signed_request", default=None)
 
 
+_URL_TEXT: Final = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
+# The query keys that make a URL signed: S3/R2 presigned (X-Amz-*), the mock's `sig`, and the
+# generic names other signers use.
+_SIGNED_QUERY: Final = re.compile(
+    r"[?&](?:sig|signature|token|expires|x-amz-[a-z0-9-]+|x-goog-[a-z0-9-]+)=", re.IGNORECASE
+)
+
+
+def _looks_signed(url: str) -> bool:
+    return _SIGNED_QUERY.search(url) is not None
+
+
+def _hide(value: object, label: str) -> object:
+    """`value` with every signed-looking URL in it swapped for `label`."""
+    if isinstance(value, httpx.URL):
+        return label if _looks_signed(str(value)) else value
+    if isinstance(value, str):
+        return _URL_TEXT.sub(lambda m: label if _looks_signed(m.group(0)) else m.group(0), value)
+    return value
+
+
 class _SignedUrlFilter(logging.Filter):
     """Swaps the URL in an httpx record for the request's label while a signed request is out.
 
     It only rewrites records logged by the thread or task that is sending the signed request, so
-    other httpx users in the process keep their log lines, and it never touches a level.
+    other httpx users in the process keep their log lines, and it never touches a level. A URL
+    that httpx has already formatted into the message, or put in a mapping argument, goes too.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         label = _SIGNED_REQUEST.get()
-        if label is not None and isinstance(record.args, tuple):
+        if label is None:
+            return True
+        if isinstance(record.msg, str):
+            record.msg = _hide(record.msg, label)
+        if isinstance(record.args, tuple):
             record.args = tuple(
                 label if isinstance(arg, (str, httpx.URL)) and "://" in str(arg) else arg
                 for arg in record.args
             )
+        elif isinstance(record.args, dict):
+            record.args = {key: _hide(item, label) for key, item in record.args.items()}
         return True
 
 

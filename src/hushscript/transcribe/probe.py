@@ -44,12 +44,6 @@ _SYNC_BYTE: Final = 0xFF
 _SYNC_BITS: Final = 0xE0
 _FIELD_MASK: Final = 3
 _RESERVED_RATE: Final = 3
-_EBML_HEAD_BYTES: Final = 1 << 20
-_EBML_SEGMENT: Final = 0x18538067
-_EBML_INFO: Final = 0x1549A966
-_EBML_TIMECODE_SCALE: Final = 0x2AD7B1
-_EBML_DURATION: Final = 0x4489
-_DEFAULT_TIMECODE_SCALE: Final = 1_000_000
 
 
 def _unreadable(reason: str) -> UnsupportedMediaError:
@@ -157,53 +151,6 @@ def _ogg(handle: BinaryIO) -> float:
     return float(_info(OggOpus, handle).length) + float(pre_skip) / _OPUS_RATE
 
 
-def _vint(data: bytes, at: int) -> tuple[int, int, bool]:
-    """(value without its length marker, byte length, all value bits set) of a vint at `at`."""
-    first = data[at]
-    length = 1
-    mask = 0x80
-    while length <= 8 and not first & mask:  # noqa: PLR2004
-        length += 1
-        mask >>= 1
-    if length > 8:  # noqa: PLR2004
-        raise _unreadable("bad EBML length")
-    value = first & (mask - 1)
-    for byte in data[at + 1 : at + length]:
-        value = (value << 8) | byte
-    unknown = value == (1 << (7 * length)) - 1
-    return value, length, unknown
-
-
-def _ebml_children(data: bytes, start: int, end: int) -> list[tuple[int, int, int]]:
-    """(id, payload start, payload end) of the elements between `start` and `end`."""
-    found: list[tuple[int, int, int]] = []
-    at = start
-    while at < end:
-        _, id_length, _ = _vint(data, at)
-        element = int.from_bytes(data[at : at + id_length], "big")
-        size, size_length, unknown = _vint(data, at + id_length)
-        payload = at + id_length + size_length
-        stop = end if unknown else min(payload + size, end)
-        found.append((element, payload, stop))
-        at = stop
-    return found
-
-
-def _matroska(handle: BinaryIO) -> float:
-    handle.seek(0)
-    data = handle.read(_EBML_HEAD_BYTES)
-    try:
-        segment = next(c for c in _ebml_children(data, 0, len(data)) if c[0] == _EBML_SEGMENT)
-        info = next(c for c in _ebml_children(data, segment[1], segment[2]) if c[0] == _EBML_INFO)
-        fields = {c[0]: data[c[1] : c[2]] for c in _ebml_children(data, info[1], info[2])}
-        raw = fields[_EBML_DURATION]
-        ticks = struct.unpack(">f" if len(raw) == 4 else ">d", raw)[0]  # noqa: PLR2004
-        scale = int.from_bytes(fields.get(_EBML_TIMECODE_SCALE, b""), "big")
-    except (StopIteration, KeyError, IndexError, struct.error) as failure:
-        raise _unreadable("no Matroska duration") from failure
-    return float(ticks) * (scale or _DEFAULT_TIMECODE_SCALE) / 1e9
-
-
 def _read(kind: MediaFormat | None, handle: BinaryIO) -> float:
     handle.seek(0)
     if kind == "mp3":
@@ -216,7 +163,7 @@ def _read(kind: MediaFormat | None, handle: BinaryIO) -> float:
         return float(_info(FLAC, handle).length)
     if kind == "ogg":
         return _ogg(handle)
-    return _matroska(handle)
+    raise _unreadable("not a container the SDK reads")
 
 
 def probe_duration(source: Source) -> float:

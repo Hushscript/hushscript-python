@@ -10,12 +10,14 @@ from ._config import PART_TIMEOUT, Config, resolve_config
 from ._errors import ConfigurationError
 from ._http import AsyncRetryingTransport, RetryingTransport, TransportSettings
 from ._log import RequestLog
-from ._models import Balance, Job, Progress, Transcript
 from ._pacing import TokenBucket
 from ._redact import REDACTED
 from ._response import parsed
 from ._version import __version__
 from .generated.client import AuthenticatedClient
+from .resources.account import Account, Balance
+from .resources.jobs import AsyncJobs, Jobs
+from .resources.transcripts import AsyncTranscripts, Transcripts
 from .transcribe import apipeline, pipeline
 from .transcribe.pipeline import Callbacks
 from .transcribe.preflight import Options
@@ -26,6 +28,9 @@ if TYPE_CHECKING:
     import os
     from collections.abc import Callable, Sequence
     from types import TracebackType
+
+    from ._models import Progress
+    from .transcript import Transcript
 
 
 def user_agent() -> str:
@@ -217,40 +222,6 @@ def _options(  # noqa: PLR0913  the keyword surface of `transcribe()`, validated
     )
 
 
-class Jobs:
-    def __init__(self, session: SyncSession) -> None:
-        self._session = session
-
-    def wait(
-        self,
-        job_id: str,
-        *,
-        wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
-        on_progress: Callable[[Progress], None] | None = None,
-    ) -> Job:
-        """Polls until the job is `done` or `failed` (spec 8.6); WaitTimeoutError after
-        `wait_timeout` seconds. A failed job is returned, not raised."""
-        return pipeline.wait_job(
-            self._session, job_id, wait_timeout, Callbacks(on_progress=on_progress), None
-        )
-
-
-class AsyncJobs:
-    def __init__(self, session: AsyncSession) -> None:
-        self._session = session
-
-    async def wait(
-        self,
-        job_id: str,
-        *,
-        wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
-        on_progress: Callable[[Progress], None] | None = None,
-    ) -> Job:
-        return await apipeline.wait_job(
-            self._session, job_id, wait_timeout, Callbacks(on_progress=on_progress), None
-        )
-
-
 class Hushscript:
     """The synchronous Hushscript client. `api` is the generated low-level client on the same
     retrying transport."""
@@ -297,10 +268,18 @@ class Hushscript:
             r2=self._r2,
         )
         self.jobs = Jobs(self._session)
+        self.transcripts = Transcripts(self._session)
 
     def balance(self) -> Balance:
+        """What the account can spend. Net of holds: `held_seconds` says how much of it is already
+        committed, and is not to be subtracted again."""
         response = self._http.get("/v1/account")
         return parsed(response, self._config.credentials, Balance.from_account)
+
+    def account(self) -> Account:
+        """The account: balance, limits, card on file and data region."""
+        response = self._http.get("/v1/account")
+        return parsed(response, self._config.credentials, Account.from_body)
 
     def transcribe(  # noqa: PLR0913  the keyword surface of spec 6.1
         self,
@@ -429,10 +408,15 @@ class AsyncHushscript:
             r2=self._r2,
         )
         self.jobs = AsyncJobs(self._session)
+        self.transcripts = AsyncTranscripts(self._session)
 
     async def balance(self) -> Balance:
         response = await self._http.get("/v1/account")
         return parsed(response, self._config.credentials, Balance.from_account)
+
+    async def account(self) -> Account:
+        response = await self._http.get("/v1/account")
+        return parsed(response, self._config.credentials, Account.from_body)
 
     async def transcribe(  # noqa: PLR0913  the keyword surface of spec 6.1
         self,

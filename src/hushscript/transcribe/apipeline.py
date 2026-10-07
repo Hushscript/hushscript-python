@@ -27,7 +27,7 @@ from .wait import await_job, finish, job_from, transcript_of
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
 
-    from hushscript._models import Transcript
+    from hushscript.transcript import Transcript
 
     from .session import AsyncSession
     from .upload import Created

@@ -191,3 +191,80 @@ class SlowBody(httpx.SyncByteStream, httpx.AsyncByteStream):
         for _ in range(self.count):
             self.clock.time += self.seconds
             yield b"x"
+
+
+OPTIONS: dict[str, object] = {
+    "language_code": None,
+    "speaker_detection": True,
+    "medical_mode": False,
+    "multichannel": False,
+    "translation_targets": [],
+    "keyterms": False,
+    "prompt": False,
+    "auto_generate_insights": None,
+}
+
+
+def job_body(job_id: str, state: str, **fields: object) -> dict[str, object]:
+    """A job as `GET /v1/jobs/{id}` returns it, every field present."""
+    return {
+        "id": job_id,
+        "state": state,
+        "mode": "standard",
+        "declared_seconds": 24,
+        "verified_seconds": None,
+        "actual_seconds": None,
+        "billable_seconds": 0,
+        "error": None,
+        "failure_kind": None,
+        "retry_of": None,
+        "created_at": 1_700_000_000,
+        "transcript_id": None,
+        "private_result_expires_at": None,
+        "private_result_available": False,
+        "options": OPTIONS,
+        **fields,
+    }
+
+
+def transcript_body(transcript_id: str = "tr_1", **fields: object) -> dict[str, object]:
+    """A transcript as `GET /v1/transcripts/{id}` returns it, every field present."""
+    return {
+        "id": transcript_id,
+        "title": "Weekly sync",
+        "language_detected": "en",
+        "duration_seconds": 24,
+        "speaker_names": {},
+        "tags": [],
+        "created_at": 1_700_000_000,
+        "updated_at": 1_700_000_100,
+        "auto_delete_at": None,
+        "edited": False,
+        "matter_code": None,
+        "client_code": None,
+        "body": {
+            "version": 1,
+            "original": {
+                "utterances": [{"speaker": "A", "start_ms": 0, "end_ms": 900, "text": "Hi."}]
+            },
+            "translations": {},
+        },
+        **fields,
+    }
+
+
+def account_body(**fields: object) -> dict[str, object]:
+    return {
+        "balance_seconds": 36000,
+        "held_seconds": 0,
+        "credits_expire_at": None,
+        "card_on_file": True,
+        "data_region": "eu",
+        "limits": {
+            "max_daily_seconds": 36000,
+            "max_active_jobs": 50,
+            "active_jobs": 0,
+            "used_today_seconds": 0,
+        },
+        **fields,
+    }

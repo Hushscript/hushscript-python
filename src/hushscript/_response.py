@@ -30,7 +30,10 @@ def json_body(response: httpx.Response, credentials: Credentials) -> object:
     raise_for_response(response, credentials=credentials)
     try:
         return response.json()
-    except ValueError as failure:
+    except (
+        ValueError,
+        RecursionError,
+    ) as failure:  # a deeply nested body is not JSON the SDK reads
         raise bad_response(response, "response (not JSON)") from failure
 
 

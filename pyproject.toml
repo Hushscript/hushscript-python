@@ -149,13 +149,14 @@ typeCheckingMode = "strict"
 include = ["src", "tests", "scripts", "conformance", "smoke"]
 exclude = ["src/hushscript/generated"]
 reportMissingTypeStubs = false
+extraPaths = ["conformance"]
 
 [tool.pytest.ini_options]
 minversion = "9.0"
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config", "-p", "no:cacheprovider"]
 filterwarnings = ["error"]
-pythonpath = ["src"]
+pythonpath = ["src", "conformance"]
 
 [tool.coverage.run]
 source = ["hushscript"]
@@ -169,7 +170,7 @@ exclude_also = ["if TYPE_CHECKING:", "@overload", "\\.\\.\\."]
 
 [tool.deptry]
 extend_exclude = ["build"]
-known_first_party = ["hushscript"]
+known_first_party = ["hushscript", "golden_table"]
 
 [tool.mutmut]
 source_paths = ["src/hushscript/_retry.py", "src/hushscript/_pacing.py", "src/hushscript/_http.py"]
