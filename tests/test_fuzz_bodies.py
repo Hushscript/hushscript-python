@@ -24,7 +24,8 @@ from hushscript._response import parsed
 from hushscript.resources.account import Account, Balance
 from hushscript.resources.jobs import job_page
 from hushscript.resources.transcripts import deleted_page, summary_page
-from hushscript.transcribe.upload import parse_created
+from hushscript.transcribe.preflight import Media, Options, check_account
+from hushscript.transcribe.upload import parse_created, parse_plan
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -49,7 +50,7 @@ DELETED = {
     "cause": "manual",
     "receipt": {"k": "v"},
 }
-CREATED = {
+CREATED: dict[str, Any] = {
     "job_id": "job_1",
     "state": "uploading",
     "upload": {
@@ -77,6 +78,13 @@ TRANSLATED = transcript_body(
     },
 )
 
+
+def check_account_of(body: object) -> object:
+    """The preflight read of `GET /v1/account`: it returns, or raises a HushscriptError."""
+    check_account(body, Media(size=1000, duration_seconds=60), Options())
+    return True
+
+
 CASES: dict[str, tuple[Callable[[object], object], object]] = {
     "balance": (Balance.from_account, account_body(purchases_remaining_in_window=2)),
     "account": (Account.from_body, account_body(credits_expire_at=1_800_000_000)),
@@ -86,6 +94,8 @@ CASES: dict[str, tuple[Callable[[object], object], object]] = {
     "deleted": (deleted_page, {"deleted": [DELETED], "next_cursor": None}),
     "jobs": (job_page, {"jobs": [job_body("job_1", "queued")], "next_cursor": "c"}),
     "created": (parse_created, CREATED),
+    "part_urls": (parse_plan, CREATED["upload"]),
+    "account_check": (check_account_of, account_body()),
 }
 
 SCALARS = st.one_of(
@@ -146,6 +156,8 @@ def through_the_boundary(parse: Callable[[object], object], body: object) -> obj
         return parsed(response, Credentials(TOKEN), parse)
     except HushscriptError as error:
         failure = error
+    if failure.code == "bad_part_plan":  # a plan whose numbers cannot describe a file (spec 8.3)
+        return None
     assert (failure.code, failure.status, failure.numeric_code) == ("bad_response", 200, None)
     return None
 
@@ -206,6 +218,23 @@ def test_job_list_only_ever_answers_with_a_value_or_a_hushscript_error(body: obj
 @given(mutated(CASES["created"][1]))
 def test_upload_create_only_ever_answers_with_a_value_or_a_hushscript_error(body: object) -> None:
     run("created", body)
+
+
+@given(mutated(CASES["part_urls"][1]))
+def test_part_urls_only_ever_answer_with_a_value_or_a_hushscript_error(body: object) -> None:
+    run("part_urls", body)
+
+
+@given(mutated(CASES["account_check"][1]))
+def test_the_preflight_account_read_only_ever_answers_with_a_value_or_an_error(
+    body: object,
+) -> None:
+    parse, _ = CASES["account_check"]
+    text = json.dumps(body, allow_nan=True)
+    try:
+        parse(json.loads(text))
+    except HushscriptError:
+        return
 
 
 def test_every_unmutated_body_parses() -> None:
