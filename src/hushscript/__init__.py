@@ -29,8 +29,11 @@ from ._version import __version__
 from .generated.catalog import ERROR_CATALOG, ErrorCatalogEntry
 from .generated.hints import HINTS
 from .generated.scopes import OPERATION_SCOPES
+from .money import Money
 from .paginate import Page
 from .resources.account import Account, Balance, UploadLimits
+from .resources.agent import AgentAccount, AgentInfo, AgentSignup, RotatedToken
+from .resources.billing import Card, Cards, Hold, LedgerEntry, Pack, Purchase, Transaction
 from .resources.transcripts import DeletedTranscript, TranscriptSummary
 from .transcript import Transcript, Utterance
 
@@ -40,10 +43,15 @@ __all__ = [
     "OPERATION_SCOPES",
     "AbortError",
     "Account",
+    "AgentAccount",
+    "AgentInfo",
+    "AgentSignup",
     "ApiError",
     "AsyncHushscript",
     "AuthenticationError",
     "Balance",
+    "Card",
+    "Cards",
     "Clock",
     "ConfigurationError",
     "ConflictError",
@@ -51,24 +59,31 @@ __all__ = [
     "DeletedTranscript",
     "ErrorCatalogEntry",
     "FileLimitError",
+    "Hold",
     "Hushscript",
     "HushscriptError",
     "InsufficientBalanceError",
     "Job",
     "JobFailedError",
     "JobOptions",
+    "LedgerEntry",
+    "Money",
     "NetworkError",
     "NotFoundError",
     "OutcomeUnknownError",
+    "Pack",
     "Page",
     "PaymentMethodRequiredError",
     "PermissionDeniedError",
     "PreflightError",
     "ProcessingProgress",
     "Progress",
+    "Purchase",
     "RateLimitError",
     "ResumeMismatchError",
+    "RotatedToken",
     "SystemClock",
+    "Transaction",
     "Transcript",
     "TranscriptSummary",
     "UnsupportedMediaError",

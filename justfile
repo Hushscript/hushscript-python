@@ -11,6 +11,11 @@ zizmor_image := "ghcr.io/zizmorcore/zizmor:1.16.0@sha256:a6460f1b6fe3dc08e588d31
 shellcheck_image := "koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d"
 gitleaks_image := "ghcr.io/gitleaks/gitleaks:v8.28.0@sha256:cdbb7c955abce02001a9f6c9f602fb195b7fadc1e812065883f695d1eeaba854"
 sandbox := "--rm --init --label sdk.test=1 --cap-drop ALL --read-only --security-opt no-new-privileges --pids-limit 512 --memory 4g --tmpfs /tmp"
+# The conformance suite is read at the ref in conformance-ref, the one place it is pinned.
+conformance_ref := `tr -d '[:space:]' < conformance-ref`
+export CONFORMANCE_CONTEXT := env("CONFORMANCE_CONTEXT", "https://github.com/Hushscript/hushscript-sdk-conformance.git#" + conformance_ref)
+# No scenario may be skipped: an unmapped op fails the conformance run.
+export CONFORMANCE_STRICT := env("CONFORMANCE_STRICT", "1")
 floor := "3.11"
 latest := "3.14"
 
@@ -135,7 +140,7 @@ regen spec="":
     docker compose build regen
     docker compose run --rm ${extra[@]+"${extra[@]}"} regen timeout 600 python scripts/generate.py ${spec:+"$spec"}
 
-# lint, then test and conformance, then examples and build; no argument runs Python 3.11 and 3.14
+# lint, then test and conformance, then examples, then build on each version; no argument runs Python 3.11 and 3.14
 ci version="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -147,7 +152,9 @@ ci version="":
       just conformance "$v"
     done
     just examples "$first"
-    just build "$first"
+    for v in $versions; do
+      just build "$v"
+    done
 
 # nightly smoke against production; needs SMOKE_TOKEN (outbound network)
 smoke:

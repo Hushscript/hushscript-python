@@ -46,6 +46,11 @@ def _is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def check_wait_timeout(wait_timeout: object) -> None:
+    if not _is_number(wait_timeout) or cast("float", wait_timeout) <= 0:
+        raise invalid_option("wait_timeout must be a positive number of seconds.")
+
+
 @dataclass(frozen=True, slots=True)
 class Options:
     """The options of `transcribe()` (spec 6.1), checked before any request."""
@@ -73,8 +78,7 @@ class Options:
             or not 1 <= concurrency <= MAX_CONCURRENCY
         ):
             raise invalid_option(f"concurrency must be a whole number from 1 to {MAX_CONCURRENCY}.")
-        if not _is_number(self.wait_timeout) or self.wait_timeout <= 0:
-            raise invalid_option("wait_timeout must be a positive number of seconds.")
+        check_wait_timeout(self.wait_timeout)
         if self.duration_seconds is not None and (
             not _is_number(self.duration_seconds) or self.duration_seconds <= 0
         ):

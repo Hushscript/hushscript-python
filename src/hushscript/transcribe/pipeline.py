@@ -178,8 +178,6 @@ def _after_create(  # the upload, wait and fetch that follow a create, for a new
     if callbacks.on_resume_token is not None:
         callbacks.on_resume_token(token)
     if created.state == UPLOADING:
-        if created.plan_error is not None:
-            raise created.plan_error
         if source is None:
             raise file_required()
         _upload(session, created, source, options.concurrency, callbacks)

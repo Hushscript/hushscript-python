@@ -62,6 +62,38 @@ def _is_non_negative_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def acceptable_token(token: str) -> bool:
+    """The check every token passes, at construction and after a claim or a rotation: printable
+    ASCII only, and the `hsr` prefix."""
+    return token.startswith(TOKEN_PREFIX) and all(
+        PRINTABLE_FIRST <= ord(char) <= PRINTABLE_LAST for char in token
+    )
+
+
+def resolve_tokenless_config(  # mirrors the keyword surface of the static agent calls
+    *,
+    base_url: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    log_level: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Config:
+    """The config of a call that needs no token: HUSHSCRIPT_TOKEN is neither read nor sent."""
+    environment = os.environ if env is None else env
+    resolved_url = _validate_base_url(base_url or environment.get(BASE_URL_ENV) or DEFAULT_BASE_URL)
+    if not _is_positive_number(timeout):
+        raise ConfigurationError("timeout must be a positive number of seconds.")
+    level = log_level if log_level is not None else environment.get(LOG_ENV) or "off"
+    if level not in LOG_LEVELS:
+        raise ConfigurationError(f"log_level must be one of {', '.join(LOG_LEVELS)}.")
+    return Config(
+        credentials=Credentials(),
+        base_url=resolved_url,
+        timeout=float(timeout),
+        max_retries=0,
+        log_level=level,
+    )
+
+
 def resolve_config(  # mirrors the public constructor
     token: str | None = None,
     *,

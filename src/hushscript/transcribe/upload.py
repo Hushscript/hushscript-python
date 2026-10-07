@@ -14,6 +14,7 @@ from hushscript._errors import NetworkError, UploadError, raise_for_response
 from hushscript._http import CLASS_EXTENSION, LABEL_EXTENSION, STREAM_EXTENSION
 from hushscript._json import as_dict, as_list
 from hushscript._log import hiding_signed_url
+from hushscript._redact import Secret
 from hushscript._response import BadBodyError, parsed
 from hushscript._retry import RetryClass
 
@@ -39,7 +40,8 @@ class Plan:
 
     part_size: int
     total_parts: int
-    urls: dict[int, str]
+    urls: dict[int, Secret]
+    """Signed URLs, held where no repr, copy or pickle shows them."""
     next_part: int | None
 
 
@@ -50,8 +52,6 @@ class Created:
     plan: Plan | None
     """None in proxied mode (`upload: null`), which a job that has left `uploading` also shows;
     `state` tells them apart."""
-    plan_error: UploadError | None = None
-    """Set when the plan's numbers cannot describe a file; raised once the resume token exists."""
 
 
 def _whole(value: object) -> int | None:
@@ -62,15 +62,15 @@ def _unexpected(what: str) -> BadBodyError:
     return BadBodyError(what)
 
 
-def _urls(raw: object) -> dict[int, str]:
-    urls: dict[int, str] = {}
+def _urls(raw: object) -> dict[int, Secret]:
+    urls: dict[int, Secret] = {}
     for item in as_list(raw) or []:
         entry = as_dict(item) or {}
         n = _whole(entry.get("n"))
         url = entry.get("url")
         if n is None or n < 1 or not isinstance(url, str):
             raise _unexpected("part URL list")
-        urls[n] = url
+        urls[n] = Secret(url)
     return urls
 
 
@@ -81,10 +81,14 @@ def parse_plan(raw: object) -> Plan:
     part_size = _whole(fields.get("part_size_bytes"))
     total = _whole(fields.get("total_parts"))
     next_part = _whole(fields.get("next_part_number"))
-    if part_size is None or total is None or (next_part is not None and next_part < 1):
+    if (
+        part_size is None
+        or total is None
+        or part_size < 1
+        or total < 1
+        or (next_part is not None and next_part < 1)
+    ):
         raise _unexpected("upload plan")
-    if part_size < 1 or total < 1:
-        raise bad_part_plan()
     return Plan(
         part_size=part_size,
         total_parts=total,
@@ -106,17 +110,10 @@ def parse_created(body: object) -> Created:
         raise _unexpected("create response")
     upload = fields.get("upload")
     state = fields.get("state")
-    plan, plan_error = None, None
-    if upload is not None:
-        try:
-            plan = parse_plan(upload)
-        except UploadError as unusable:
-            plan_error = unusable
     return Created(
         job_id=job_id,
         state=state if isinstance(state, str) else "uploading",
-        plan=plan,
-        plan_error=plan_error,
+        plan=None if upload is None else parse_plan(upload),
     )
 
 
@@ -143,10 +140,10 @@ class UrlBook:
 
     def __init__(self, clock: Clock) -> None:
         self._clock = clock
-        self._urls: dict[int, tuple[str, float]] = {}
+        self._urls: dict[int, tuple[Secret, float]] = {}
         self.next_start: int | None = None
 
-    def store(self, urls: dict[int, str], next_part: int | None) -> None:
+    def store(self, urls: dict[int, Secret], next_part: int | None) -> None:
         now = self._clock.now()
         for n, url in urls.items():
             self._urls[n] = (url, now)
@@ -154,13 +151,13 @@ class UrlBook:
 
     def current(self, n: int) -> str | None:
         entry = self._urls.get(n)
-        return None if entry is None else entry[0]
+        return None if entry is None else entry[0].reveal()
 
     def get(self, n: int) -> str | None:
         entry = self._urls.get(n)
         if entry is None or self._clock.now() - entry[1] > URL_MAX_AGE:
             return None
-        return entry[0]
+        return entry[0].reveal()
 
 
 class Action(enum.Enum):

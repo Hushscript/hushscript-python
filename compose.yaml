@@ -45,7 +45,7 @@ services:
   mock:
     <<: *hardening
     build:
-      context: ${CONFORMANCE_CONTEXT:-https://github.com/Hushscript/hushscript-sdk-conformance.git#v0.1.0}
+      context: ${CONFORMANCE_CONTEXT:?set by the justfile}
       dockerfile: Dockerfile
     image: hushscript-sdk-conformance-mock:pinned
     mem_limit: 512m
@@ -90,20 +90,14 @@ services:
 
   conformance:
     <<: *sandboxed
+    environment:
+      # A scenario the runner cannot map is a failure, not a skip.
+      CONFORMANCE_STRICT: ${CONFORMANCE_STRICT:-1}
     command: ["timeout", "1800", "python", "conformance/runner.py"]
 
   examples:
     <<: *sandboxed
-    command:
-      - sh
-      - -c
-      - >-
-        found=0;
-        for f in examples/*.py; do
-        [ -e "$$f" ] || continue; found=1;
-        timeout 600 python "$$f" || exit 1;
-        done;
-        [ "$$found" = 1 ] || echo "no examples yet"
+    command: ["timeout", "900", "python", "scripts/run_examples.py"]
 
   # Outbound network: fetches the spec and hints.json, writes openapi.json and src/hushscript/generated.
   regen:

@@ -146,3 +146,103 @@ DELETED_LIST: Final[Shape] = object_of(
         "next_cursor": nullable(string),
     }
 )
+
+PACKS: Final[Shape] = object_of(
+    {
+        "packs": array_of(
+            object_of(
+                {
+                    "id": string,
+                    "amount": integer,
+                    "currency": string,
+                    "seconds": count,
+                    "referral_bonus_seconds": count,
+                },
+                {"available": nullable(boolean)},
+            )
+        )
+    }
+)
+
+CARDS: Final[Shape] = object_of(
+    {
+        "default_id": nullable(string),
+        "methods": array_of(
+            object_of(
+                {
+                    "id": string,
+                    "type": string,
+                    "brand": string,
+                    "last4": string,
+                    "exp_month": count,
+                    "exp_year": count,
+                    "is_default": boolean,
+                    "fast_checkout_eligible": boolean,
+                },
+                {"email": nullable(string)},
+            )
+        ),
+    }
+)
+
+SETUP_SESSION: Final[Shape] = object_of({"checkout_url": string})
+
+PURCHASE: Final[Shape] = object_of({"status": string, "balance_seconds": integer})
+
+TRANSACTIONS: Final[Shape] = object_of(
+    {
+        "transactions": array_of(
+            object_of(
+                {
+                    "id": integer,
+                    "seconds": integer,
+                    "amount_cents": integer,
+                    "amount_refunded_cents": integer,
+                    "currency": string,
+                    "status": string,
+                    "created_at": timestamp,
+                },
+                {
+                    "payment_method_type": nullable(string),
+                    "payment_method_brand": nullable(string),
+                    "payment_method_last4": nullable(string),
+                    "receipt_number": nullable(string),
+                    "initiated_via": nullable(string),
+                },
+            )
+        ),
+        "next_cursor": nullable(string),
+    }
+)
+
+LEDGER: Final[Shape] = object_of(
+    {
+        "entries": array_of(
+            object_of(
+                {"id": integer, "delta_seconds": integer, "kind": string, "created_at": timestamp},
+                {"job_id": nullable(string), "note": nullable(string)},
+            )
+        ),
+        "next_cursor": nullable(string),
+    }
+)
+
+HOLDS: Final[Shape] = object_of(
+    {
+        "holds": array_of(
+            object_of({"id": string, "kind": string, "seconds": count, "created_at": timestamp})
+        ),
+        "next_cursor": nullable(string),
+    }
+)
+
+AGENT_SIGNUP: Final[Shape] = object_of(
+    {
+        "signup_id": string,
+        "claim_secret": string,
+        "checkout_url": string,
+        "amount": integer,
+        "currency": string,
+        "expires_at": timestamp,
+    }
+)

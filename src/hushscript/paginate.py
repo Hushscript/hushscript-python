@@ -18,6 +18,8 @@ class Page(Generic[T]):
     items: list[T]
     next_cursor: str | None
 
+    __hash__ = None  # type: ignore[assignment]  # holds a list, so it is unhashable by design
+
 
 def pagination_loop() -> HushscriptError:
     return HushscriptError(

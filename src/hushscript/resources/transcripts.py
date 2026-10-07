@@ -36,6 +36,8 @@ class TranscriptSummary:
     auto_delete_at: datetime | None
     tags: list[str]
 
+    __hash__ = None  # type: ignore[assignment]  # holds a list, so it is unhashable by design
+
 
 @dataclass(frozen=True, slots=True)
 class DeletedTranscript:
@@ -53,6 +55,8 @@ class DeletedTranscript:
     receipt: dict[str, object] | None
     """The stored deletion receipt, opaque and as the API sends it (snake_case keys, string
     timestamps); None when it could not be read back."""
+
+    __hash__ = None  # type: ignore[assignment]  # holds a dict, so it is unhashable by design
 
 
 def summary_page(body: object) -> Page[TranscriptSummary]:

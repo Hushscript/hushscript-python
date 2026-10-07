@@ -3,8 +3,14 @@ from __future__ import annotations
 
 import pytest
 
-from helpers import FakeClock, job_body
-from hushscript import JobFailedError, ProcessingProgress, UploadError, WaitTimeoutError
+from helpers import FakeClock, job_body, reply
+from hushscript import (
+    JobFailedError,
+    PreflightError,
+    ProcessingProgress,
+    UploadError,
+    WaitTimeoutError,
+)
 from hushscript._models import Job, Progress
 from hushscript._response import BadBodyError
 from hushscript.transcribe.wait import (
@@ -13,6 +19,7 @@ from hushscript.transcribe.wait import (
     next_delay,
     wait_for_job,
 )
+from routes import async_hs_on, hs_on
 
 
 def _job(state: str, **fields: object) -> Job:
@@ -129,3 +136,23 @@ async def test_the_async_wait_times_out_with_the_token() -> None:
         await await_job(get, clock, 20, token="tok")
     assert raised.value.resume_token == "tok"
     assert sum(clock.sleeps) == 20
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), True, "5", None])
+def test_jobs_wait_refuses_a_wait_timeout_that_is_not_a_positive_finite_number(
+    monkeypatch: pytest.MonkeyPatch, bad: object
+) -> None:
+    hs, routes = hs_on(monkeypatch, lambda _request: reply(200, job_body("job_1", "done")))
+    with pytest.raises(PreflightError) as raised:
+        hs.jobs.wait("job_1", wait_timeout=bad)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+    assert raised.value.code == "invalid_option"
+    assert routes.requests == []
+
+
+@pytest.mark.anyio
+async def test_the_async_jobs_wait_refuses_it_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    hs, routes = async_hs_on(monkeypatch, lambda _request: reply(200, job_body("job_1", "done")))
+    with pytest.raises(PreflightError) as raised:
+        await hs.jobs.wait("job_1", wait_timeout=float("nan"))
+    assert raised.value.code == "invalid_option"
+    assert routes.requests == []

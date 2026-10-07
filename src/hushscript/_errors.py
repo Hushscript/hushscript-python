@@ -6,7 +6,7 @@ import re
 from typing import TYPE_CHECKING, Any, ClassVar, Final
 
 from ._json import as_dict, as_list
-from ._redact import Credentials, redact
+from ._redact import Credentials, Secret, redact
 from .generated.catalog import ERROR_CATALOG
 from .generated.hints import HINTS
 from .generated.scopes import OPERATION_SCOPES
@@ -271,6 +271,23 @@ class NetworkError(HushscriptError):
 class OutcomeUnknownError(HushscriptError):
     default_code = "outcome_unknown"
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        received_token: str | None = None,
+        **kwargs: Any,  # noqa: ANN401  # forwarded to HushscriptError, which types them
+    ) -> None:
+        super().__init__(message, **kwargs)
+        self._received = Secret(received_token if received_token and received_token.strip() else "")
+
+    @property
+    def received_token(self) -> str | None:
+        """The token a claim or rotation answer carried when the rest of it could not be used, so
+        the credential the server shows once is not lost; None when there is none. It is never part
+        of the message, the repr, a pickle or a log line; treat it like any token."""
+        return self._received.reveal() or None
+
 
 _CLASS_BY_SLUG: Final[dict[str, type[HushscriptError]]] = {
     "upload_incomplete": UploadError,
@@ -356,9 +373,16 @@ def _operation_of(response: httpx.Response) -> str | None:
 def _parse_body(response: httpx.Response) -> dict[str, object]:
     try:
         parsed: object = json.loads(response.content)
-    except ValueError:
+    except (ValueError, RecursionError):  # not JSON, or nested past what the parser reads
         return {}
     return as_dict(parsed) or {}
+
+
+def _details_of(body: Mapping[str, object], credentials: Credentials) -> dict[str, object]:
+    try:
+        return as_dict(_snake_keys(credentials.scrub_value(_extra_details(body)))) or {}
+    except RecursionError:  # a body nested past what the walkers read carries no details
+        return {}
 
 
 def error_from_response(
@@ -382,7 +406,7 @@ def error_from_response(
     if operation is None:
         operation = _operation_of(response)
     retry_after = parse_retry_after(response.headers.get("retry-after"))
-    details = as_dict(_snake_keys(credentials.scrub_value(_extra_details(body)))) or {}
+    details = _details_of(body, credentials)
     error_class = _CLASS_BY_SLUG.get(code) or _CLASS_BY_STATUS.get(status) or ApiError
     error = error_class(
         credentials.scrub(message),

@@ -18,8 +18,9 @@ LOG_LEVELS: Final = ("off", "debug")
 _LOGGER: Final = logging.getLogger("hushscript")
 
 # The label of the signed R2 request this thread or task is sending, or None. httpx logs every
-# request's full URL at INFO on its own logger ("HTTP Request: PUT <url>"), and a signed part URL
-# carries the signature in its query (spec 10: R2 URLs only ever appear as `r2:part/{n}`).
+# request's full URL at INFO on its own logger ("HTTP Request: PUT <url>"), httpcore traces its
+# connection and request events at DEBUG on its own, and a signed part URL carries the signature in
+# its query (spec 10: R2 URLs only ever appear as `r2:part/{n}`).
 _SIGNED_REQUEST: ContextVar[str | None] = ContextVar("hushscript_signed_request", default=None)
 
 
@@ -35,13 +36,34 @@ def _looks_signed(url: str) -> bool:
     return _SIGNED_QUERY.search(url) is not None
 
 
+def _hide_text(text: str, label: str) -> str:
+    return _URL_TEXT.sub(lambda m: label if _looks_signed(m.group(0)) else m.group(0), text)
+
+
 def _hide(value: object, label: str) -> object:
-    """`value` with every signed-looking URL in it swapped for `label`."""
-    if isinstance(value, httpx.URL):
-        return label if _looks_signed(str(value)) else value
+    """`value` with every signed-looking URL in it swapped for `label`. An object that is neither
+    text nor a number (an httpx.Request, a URL object of either library) is swapped for its hidden
+    text when its own text shows a signed URL."""
     if isinstance(value, str):
-        return _URL_TEXT.sub(lambda m: label if _looks_signed(m.group(0)) else m.group(0), value)
+        return _hide_text(value, label)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, bytes):
+        return _hide_text(value.decode("latin-1"), label).encode("latin-1")
+    try:
+        shown = f"{value}"
+        shown_repr = repr(value)
+    except Exception:  # noqa: BLE001  # a log call must not fail on a hostile __str__
+        return value
+    if _looks_signed(shown) or _looks_signed(shown_repr):
+        return _hide_text(shown_repr if _looks_signed(shown_repr) else shown, label)
     return value
+
+
+def _hide_arg(arg: object, label: str) -> object:
+    if isinstance(arg, (str, httpx.URL)) and "://" in str(arg):
+        return label
+    return _hide(arg, label)
 
 
 class _SignedUrlFilter(logging.Filter):
@@ -59,16 +81,22 @@ class _SignedUrlFilter(logging.Filter):
         if isinstance(record.msg, str):
             record.msg = _hide(record.msg, label)
         if isinstance(record.args, tuple):
-            record.args = tuple(
-                label if isinstance(arg, (str, httpx.URL)) and "://" in str(arg) else arg
-                for arg in record.args
-            )
+            record.args = tuple(_hide_arg(arg, label) for arg in record.args)
         elif isinstance(record.args, dict):
             record.args = {key: _hide(item, label) for key, item in record.args.items()}
         return True
 
 
 _SIGNED_URL_FILTER: Final = _SignedUrlFilter()
+_THIRD_PARTY_LOGGERS: Final = (
+    "httpx",
+    "httpcore",
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+)
 
 
 @contextmanager
@@ -89,9 +117,11 @@ class RequestLog:
     """
 
     def __init__(self, level: str = "off") -> None:
-        # httpx logs on its own, whatever our level; the filter is a no-op until a
-        # signed request is out. Adding it twice is harmless.
-        logging.getLogger("httpx").addFilter(_SIGNED_URL_FILTER)
+        # httpx and httpcore log on their own, whatever our level; the filter is a no-op until a
+        # signed request is out. Adding it twice is harmless. A logger's filters see only the
+        # records it creates, so each httpcore logger carries it.
+        for name in _THIRD_PARTY_LOGGERS:
+            logging.getLogger(name).addFilter(_SIGNED_URL_FILTER)
         self.enabled = level == "debug"
         if self.enabled:
             _LOGGER.setLevel(logging.DEBUG)

@@ -45,7 +45,7 @@ _PHASES: Final = ("connect", "read", "write", "pool")
 _STREAMABLE: Final = frozenset({RetryClass.SAFE, RetryClass.PART})
 
 # Spec 7.4. A lost signup has no hint in v0.1.
-_UNKNOWN_HINTS: Final = {
+UNKNOWN_HINTS: Final = {
     CLAIM: (
         "The claim may have succeeded. Retrying will fail with agent_claim_invalid. "
         "If you have no token, contact support with the signup id."
@@ -88,7 +88,7 @@ def _label(request: httpx.Request) -> str:
 def _has_idempotency_key(request: httpx.Request) -> bool:
     try:
         parsed: object = json.loads(request.content)
-    except (ValueError, httpx.RequestNotRead):
+    except (ValueError, RecursionError, httpx.RequestNotRead):
         return False
     key = (as_dict(parsed) or {}).get(IDEMPOTENCY_FIELD)
     return isinstance(key, str) and bool(key)
@@ -97,7 +97,7 @@ def _has_idempotency_key(request: httpx.Request) -> bool:
 def _slug_of(body: bytes) -> str | None:
     try:
         parsed: object = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     slug = (as_dict(parsed) or {}).get("error")
     return slug if isinstance(slug, str) else None
@@ -309,7 +309,7 @@ class _Attempt:
             return OutcomeUnknownError(
                 f"No response arrived for {where} ({reason}).",
                 code="outcome_unknown",
-                hint=_UNKNOWN_HINTS.get(self.route or ""),
+                hint=UNKNOWN_HINTS.get(self.route or ""),
             )
         return NetworkError(f"Could not reach the Hushscript API: {where} ({reason}).")
 
@@ -319,7 +319,7 @@ class _Attempt:
         depend on it), so the outcome rides along as a note."""
         if not self.sent():
             return
-        hint = _UNKNOWN_HINTS.get(self.route or "")
+        hint = UNKNOWN_HINTS.get(self.route or "")
         text = (
             f"Cancelled after {self.request.method} {self.label} was sent: its outcome is unknown."
         )
