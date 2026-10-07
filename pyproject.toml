@@ -109,6 +109,13 @@ ignore = [
   "S603",
   "S607",
 ]
+"examples/**" = [
+  "INP001",
+  # Argument counts and status sets are the point of a short example.
+  "PLR2004",
+  # The examples report on stdout and stderr.
+  "T201",
+]
 "smoke/**" = [
   "INP001",
   # The smoke script reports on stdout.
@@ -131,7 +138,7 @@ max-args = 8
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src", "tests", "scripts", "conformance", "smoke"]
+files = ["src", "tests", "scripts", "conformance", "smoke", "examples"]
 cache_dir = "/tmp/mypy-cache"
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
@@ -146,7 +153,7 @@ warn_unreachable = false
 [tool.basedpyright]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
-include = ["src", "tests", "scripts", "conformance", "smoke"]
+include = ["src", "tests", "scripts", "conformance", "smoke", "examples"]
 exclude = ["src/hushscript/generated"]
 reportMissingTypeStubs = false
 extraPaths = ["conformance"]

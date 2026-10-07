@@ -460,7 +460,7 @@ async def test_the_async_billing_calls_and_histories(monkeypatch: pytest.MonkeyP
         "referral_bonus_seconds": 0,
     }
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: PLR0911  one answer per route
         path = request.url.path
         if path == "/v1/billing/packs":
             return reply(200, {"packs": [pack]})
