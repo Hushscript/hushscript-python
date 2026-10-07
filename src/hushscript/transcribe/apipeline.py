@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Final, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from hushscript._errors import NotFoundError, raise_for_response
 from hushscript._models import Job, UploadingProgress
@@ -33,8 +33,6 @@ if TYPE_CHECKING:
     from .upload import Created
 
 T = TypeVar("T")
-
-RESUME_NOTE: Final = "The job exists on the server. Resume it with this token: "
 
 
 async def create(session: AsyncSession, body: Mapping[str, object]) -> Created:
@@ -122,7 +120,7 @@ async def _upload(
         )
         raise_for_response(response, credentials=session.credentials)
 
-    await _supervised(Heartbeat(session.clock), ping, parts_and_complete())
+    await _supervised(Heartbeat(session.clock, session.log), ping, parts_and_complete())
 
 
 async def _after_create(  # the upload, wait and fetch that follow a create
@@ -138,22 +136,16 @@ async def _after_create(  # the upload, wait and fetch that follow a create
         ResumeState(created.job_id, state.idempotency_key, state.size, state.duration_seconds)
     )
     tracker.token = token
-    try:
-        if callbacks.on_resume_token is not None:
-            callbacks.on_resume_token(token)
-        if created.state == UPLOADING:
-            if created.plan_error is not None:
-                raise created.plan_error
-            if source is None:
-                raise file_required()
-            await _upload(session, created, source, options.concurrency, callbacks)
-        job = await wait_job(session, created.job_id, options.wait_timeout, callbacks, token)
-        return await fetch_transcript(session, job)
-    except asyncio.CancelledError as cancelled:
-        # Spec 7.4: a cancellation is never converted (asyncio.timeout and task groups depend on
-        # it); the way back to the job rides along as a note.
-        cancelled.add_note(f"{RESUME_NOTE}{token}")
-        raise
+    if callbacks.on_resume_token is not None:
+        callbacks.on_resume_token(token)
+    if created.state == UPLOADING:
+        if created.plan_error is not None:
+            raise created.plan_error
+        if source is None:
+            raise file_required()
+        await _upload(session, created, source, options.concurrency, callbacks)
+    job = await wait_job(session, created.job_id, options.wait_timeout, callbacks, token)
+    return await fetch_transcript(session, job)
 
 
 async def run_transcribe(
@@ -174,6 +166,7 @@ async def run_transcribe(
     tracker = Tracker(key)
     with annotated(tracker):
         callbacks.progress(UploadingProgress(0, 0, state.size))
+        tracker.sent = True
         created = await create(session, body)
         return await _after_create(session, created, tracker, state, source, options, callbacks)
 
@@ -195,7 +188,7 @@ async def run_resume(
     options.validate()
     state = decode_token(token)
     source = early_source(state, file)
-    tracker = Tracker(state.idempotency_key, token)
+    tracker = Tracker(state.idempotency_key, token, sent=True)
     with annotated(tracker):
         job = await read_job_to_resume(session, state.job_id)
         if job.state != UPLOADING:

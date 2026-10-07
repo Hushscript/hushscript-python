@@ -1,10 +1,12 @@
 # pyright: reportPrivateUsage=false
 from __future__ import annotations
 
+import logging
 import threading
 
 import pytest
 
+from conftest import TOKEN
 from helpers import FakeClock
 from hushscript import (
     AuthenticationError,
@@ -12,6 +14,7 @@ from hushscript import (
     NetworkError,
     RateLimitError,
 )
+from hushscript._log import RequestLog
 from hushscript.transcribe.heartbeat import HEARTBEAT_INTERVAL, Heartbeat
 
 
@@ -112,3 +115,37 @@ async def test_the_async_loop_keeps_unauthorized() -> None:
     await heartbeat.arun(ping)
     with pytest.raises(AuthenticationError):
         heartbeat.raise_if_failed()
+
+
+def test_a_ping_that_breaks_outside_our_errors_does_not_end_the_beat(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock()
+    heartbeat = Heartbeat(clock, RequestLog("debug"))
+    failures: list[Exception] = [RuntimeError(f"boom {TOKEN}"), ValueError("odd"), _wrong_state()]
+    calls: list[int] = []
+
+    def ping() -> None:
+        calls.append(1)
+        raise failures.pop(0)
+
+    with caplog.at_level(logging.DEBUG):
+        heartbeat.run(ping)
+    assert len(calls) == 3
+    assert clock.sleeps == [120, 120, 120]
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "RuntimeError" in text
+    assert TOKEN not in text
+
+
+@pytest.mark.anyio
+async def test_the_async_loop_keeps_beating_through_a_foreign_error() -> None:
+    clock = FakeClock()
+    heartbeat = Heartbeat(clock)
+    failures: list[Exception] = [RuntimeError("boom"), _wrong_state()]
+
+    async def ping() -> None:
+        raise failures.pop(0)
+
+    await heartbeat.arun(ping)
+    assert clock.sleeps == [120, 120]

@@ -292,6 +292,7 @@ class Hushscript:
         self._session = SyncSession(
             clock=self._clock,
             credentials=self._config.credentials,
+            log=RequestLog(self._config.log_level),
             http=self._http,
             r2=self._r2,
         )
@@ -423,6 +424,7 @@ class AsyncHushscript:
         self._session = AsyncSession(
             clock=self._clock,
             credentials=self._config.credentials,
+            log=RequestLog(self._config.log_level),
             http=self._http,
             r2=self._r2,
         )

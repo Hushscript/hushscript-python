@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 from typing import TYPE_CHECKING
 
 import httpx
 import pytest
 
+from conftest import TOKEN
 from fakeapi import FakeApi, Job, error_reply
 from hushscript import (
     AuthenticationError,
@@ -265,3 +267,91 @@ async def test_a_timeout_around_the_call_still_works(monkeypatch: pytest.MonkeyP
     with pytest.raises(TimeoutError):
         async with asyncio.timeout(0.05):
             await hs.transcribe(media(), duration_seconds=100, wait_timeout=10**9)
+
+
+async def test_no_signed_url_or_token_reaches_any_logger(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    api = FakeApi(parts=3)
+    hs = async_hs_for(monkeypatch, api, log_level="debug")
+    with caplog.at_level(logging.DEBUG):
+        await hs.transcribe(media(), duration_seconds=100)
+    text = "\n".join(f"{r.name}: {r.getMessage()}" for r in caplog.records)
+    assert api.count("PUT", R2) == 3
+    assert "sig=" not in text
+    assert "__r2" not in text
+    assert TOKEN not in text
+    assert "hushscript PUT r2:part/1 200" in text
+    assert "httpx: HTTP Request: PUT r2:part/1" in text
+    await hs.aclose()
+
+
+async def test_a_cancel_while_the_create_response_is_held_names_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(create_delay=30)
+    hs = async_hs_for(monkeypatch, api)
+    task = asyncio.ensure_future(
+        hs.transcribe(media(), duration_seconds=100, idempotency_key="k" * 24)
+    )
+    while not api.jobs:  # noqa: ASYNC110
+        await asyncio.sleep(0.001)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+    notes = "\n".join(raised.value.__notes__)
+    assert "k" * 24 in notes
+    assert len(api.jobs) == 1
+
+
+async def test_a_cancel_during_the_parts_names_the_key_and_the_resume_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(r2_delay=30)
+    hs = async_hs_for(monkeypatch, api)
+    tokens: list[str] = []
+    task = asyncio.ensure_future(
+        hs.transcribe(
+            media(),
+            duration_seconds=100,
+            idempotency_key="k" * 24,
+            on_resume_token=tokens.append,
+        )
+    )
+    while not api.r2_calls:  # noqa: ASYNC110
+        await asyncio.sleep(0.001)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+    notes = "\n".join(raised.value.__notes__)
+    assert "k" * 24 in notes
+    assert tokens[0] in notes
+
+
+async def test_resume_takes_a_stream_that_cannot_seek_with_the_size_from_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broken = {"on": True}
+
+    def r2(n: int, _attempt: int) -> httpx.Response | None:
+        return httpx.Response(503) if broken["on"] and n == 3 else None
+
+    api = FakeApi(r2_hook=r2)
+    hs = async_hs_for(monkeypatch, api)
+    tokens: list[str] = []
+    with pytest.raises(UploadError):
+        await hs.transcribe(
+            media(), duration_seconds=100, concurrency=1, on_resume_token=tokens.append
+        )
+    broken["on"] = False
+
+    class OneWay(io.BytesIO):
+        def seekable(self) -> bool:
+            return False
+
+    with pytest.raises(UploadError) as raised:
+        await hs.resume(tokens[0], OneWay(media(8999)))
+    assert raised.value.code == "stream_size_mismatch"
+    assert (await hs.resume(tokens[0], OneWay(media()))).id
+    assert len(api.jobs) == 1
+    await hs.aclose()

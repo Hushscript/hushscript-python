@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -15,6 +15,7 @@ from hushscript.transcribe.source import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+    from typing import BinaryIO
 
 DATA = bytes(range(256)) * 100
 
@@ -97,3 +98,43 @@ def test_a_stream_cannot_be_read_out_of_order() -> None:
     source.read_range(0, 10)
     with pytest.raises(PreflightError):
         source.read_range(5000, 10)
+
+
+class Trickle:
+    """A stream whose reads come up short without the stream being at its end, as a raw unbuffered
+    stream (a pipe, `io.FileIO`) may: every read returns at most `chunk` bytes."""
+
+    def __init__(self, data: bytes, chunk: int, *, seekable: bool) -> None:
+        self._data = io.BytesIO(data)
+        self._chunk = chunk
+        self._seekable = seekable
+
+    def read(self, size: int = -1) -> bytes:
+        return self._data.read(self._chunk if size < 0 else min(size, self._chunk))
+
+    def seekable(self) -> bool:
+        return self._seekable
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._data.seek(offset, whence)
+
+
+def _trickle(chunk: int, *, seekable: bool) -> BinaryIO:
+    return cast("BinaryIO", Trickle(DATA, chunk, seekable=seekable))
+
+
+def test_a_stream_that_returns_short_reads_is_not_taken_for_ended() -> None:
+    source = make_source(_trickle(7, seekable=False), len(DATA))
+    assert isinstance(source, SequentialSource)
+    assert source.head() == DATA[:4096]
+    assert source.read_range(0, 5000) == DATA[:5000]
+    assert source.read_range(5000, 5000) == DATA[5000:10000]
+    assert source.read_range(10000, len(DATA)) == DATA[10000:]
+    assert source.at_end()
+
+
+def test_a_seekable_stream_with_short_reads_is_read_to_the_end_of_each_range() -> None:
+    source = make_source(_trickle(11, seekable=True))
+    assert source.size == len(DATA)
+    assert source.read_range(100, 3000) == DATA[100:3100]
+    assert source.read_range(len(DATA) - 5, 50) == DATA[-5:]

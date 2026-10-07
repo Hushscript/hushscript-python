@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from hushscript._errors import NetworkError, raise_for_response
 from hushscript._http import STREAM_EXTENSION
+from hushscript._log import hiding_signed_url
 from hushscript._response import parsed
 
 from .upload import (
@@ -101,7 +102,8 @@ class AsyncUploader:
             "PUT", url, content=data, timeout=PART_TIMEOUTS, extensions=r2_extensions(n)
         )
         try:
-            response = await client.send(request, stream=True)
+            with hiding_signed_url(f"r2:part/{n}"):
+                response = await client.send(request, stream=True)
             try:
                 etag = etag_of(response)
                 if response.is_success and etag is None:

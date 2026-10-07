@@ -7,6 +7,7 @@ if TYPE_CHECKING:
     import httpx
 
     from hushscript._clock import Clock
+    from hushscript._log import RequestLog
     from hushscript._redact import Credentials
 
 
@@ -18,6 +19,7 @@ class Session:
 
     clock: Clock
     credentials: Credentials
+    log: RequestLog
 
 
 @dataclass(frozen=True, slots=True)
