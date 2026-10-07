@@ -32,6 +32,8 @@ from .upload import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from hushscript._redact import Secret
+
     from .session import AsyncSession
     from .source import Source
 
@@ -99,10 +101,10 @@ class AsyncUploader:
             if action is Action.REFRESH:
                 await self._refresh(n, url)
 
-    async def _put_direct(self, n: int, url: str, data: bytes) -> tuple[int | None, str | None]:
+    async def _put_direct(self, n: int, url: Secret, data: bytes) -> tuple[int | None, str | None]:
         client = self._session.r2
         request = client.build_request(
-            "PUT", url, content=data, timeout=PART_TIMEOUTS, extensions=r2_extensions(n)
+            "PUT", url.reveal(), content=data, timeout=PART_TIMEOUTS, extensions=r2_extensions(n)
         )
         try:
             with hiding_signed_url(f"r2:part/{n}"):
@@ -140,7 +142,7 @@ class AsyncUploader:
         finally:
             release(request)
 
-    async def _url_for(self, n: int) -> str | None:
+    async def _url_for(self, n: int) -> Secret | None:
         async with self._pages:
             url = self._book.get(n)
             if url is None:
@@ -164,9 +166,9 @@ class AsyncUploader:
         ):
             await self._fetch(self._book.next_start, advance=True)
 
-    async def _refresh(self, n: int, failed_url: str) -> None:
+    async def _refresh(self, n: int, failed_url: Secret) -> None:
         async with self._pages:
-            if self._book.current(n) == failed_url:
+            if self._book.is_current(n, failed_url):
                 await self._fetch(n, advance=False)
 
     async def _fetch(self, start: int, *, advance: bool) -> None:

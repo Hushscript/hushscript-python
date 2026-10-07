@@ -156,15 +156,16 @@ class UrlBook:
             self._urls[n] = (url, now)
         self.next_start = next_part
 
-    def current(self, n: int) -> str | None:
+    def is_current(self, n: int, url: Secret) -> bool:
+        """Whether `url` is still the one stored for part `n`."""
         entry = self._urls.get(n)
-        return None if entry is None else entry[0].reveal()
+        return entry is not None and entry[0].reveal() == url.reveal()
 
-    def get(self, n: int) -> str | None:
+    def get(self, n: int) -> Secret | None:
         entry = self._urls.get(n)
         if entry is None or self._clock.now() - entry[1] > URL_MAX_AGE:
             return None
-        return entry[0].reveal()
+        return entry[0]
 
 
 class Action(enum.Enum):
@@ -395,10 +396,10 @@ class SyncUploader:
             if action is Action.REFRESH:
                 self._refresh(n, url)
 
-    def _put_direct(self, n: int, url: str, data: bytes) -> tuple[int | None, str | None]:
+    def _put_direct(self, n: int, url: Secret, data: bytes) -> tuple[int | None, str | None]:
         client = self._session.r2
         request = client.build_request(
-            "PUT", url, content=data, timeout=PART_TIMEOUTS, extensions=r2_extensions(n)
+            "PUT", url.reveal(), content=data, timeout=PART_TIMEOUTS, extensions=r2_extensions(n)
         )
         try:
             with hiding_signed_url(f"r2:part/{n}"):
@@ -436,7 +437,7 @@ class SyncUploader:
         finally:
             release(request)
 
-    def _url_for(self, n: int) -> str | None:
+    def _url_for(self, n: int) -> Secret | None:
         """The URL of part `n`; None when a page said the rest goes through the API."""
         with self._pages:
             url = self._book.get(n)
@@ -461,9 +462,9 @@ class SyncUploader:
         ):
             self._fetch(self._book.next_start, advance=True)
 
-    def _refresh(self, n: int, failed_url: str) -> None:
+    def _refresh(self, n: int, failed_url: Secret) -> None:
         with self._pages:
-            if self._book.current(n) == failed_url:
+            if self._book.is_current(n, failed_url):
                 self._fetch(n, advance=False)
 
     def _fetch(self, start: int, *, advance: bool) -> None:

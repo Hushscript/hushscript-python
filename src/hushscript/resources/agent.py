@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import fields as fields_of
 from typing import TYPE_CHECKING, Final, TypeVar
 
 from hushscript._config import acceptable_token
@@ -13,6 +14,7 @@ from hushscript._errors import (
 )
 from hushscript._http import UNKNOWN_HINTS
 from hushscript._json import as_dict, as_list, loads
+from hushscript._redact import REDACTED, Secret
 from hushscript._response import bad_response, parsed
 from hushscript._retry import CLAIM, ROTATE
 from hushscript._shape import INT_LIMIT, as_text, as_whole, check_shape, to_datetime
@@ -26,6 +28,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     import httpx
+    from _typeshed import DataclassInstance
 
     from hushscript._redact import Credentials
     from hushscript.transcribe.session import AsyncSession, SyncSession
@@ -34,6 +37,18 @@ CLAIM_ROUTE: Final = "POST /v1/agent/accounts/{signup_id}/claim"
 ROTATE_ROUTE: Final = "POST /v1/agent/credentials/rotate"
 
 T = TypeVar("T")
+
+
+def _repr_without(value: DataclassInstance, secret: str) -> str:
+    """A dataclass repr that names `secret` and shows the marker in place of its value (R79). The
+    field stays a plain readable attribute; `asdict`, `json` and `pickle` carry it."""
+    shown = [
+        f"{field.name}={REDACTED}"
+        if field.name == secret
+        else f"{field.name}={getattr(value, field.name)!r}"
+        for field in fields_of(value)
+    ]
+    return f"{type(value).__name__}({', '.join(shown)})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,9 +60,9 @@ class AgentInfo:
     contact_url: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class AgentSignup:
-    """What `agent_signup` returns."""
+    """What `agent_signup` returns. `repr` and `str` show `claim_secret` as a marker."""
 
     signup_id: str
     """Passed back to `agent_claim` verbatim."""
@@ -58,10 +73,13 @@ class AgentSignup:
     price: Money
     expires_at: datetime
 
+    def __repr__(self) -> str:
+        return _repr_without(self, "claim_secret")
 
-@dataclass(frozen=True, slots=True)
+
+@dataclass(frozen=True, slots=True, repr=False)
 class AgentAccount:
-    """What `agent_claim` returns."""
+    """What `agent_claim` returns. `repr` and `str` show `token` as a marker."""
 
     token: str
     """The account's token, shown once: write it down before anything else can fail."""
@@ -72,10 +90,13 @@ class AgentAccount:
 
     __hash__ = None  # type: ignore[assignment]  # holds a list, so it is unhashable by design
 
+    def __repr__(self) -> str:
+        return _repr_without(self, "token")
 
-@dataclass(frozen=True, slots=True)
+
+@dataclass(frozen=True, slots=True, repr=False)
 class RotatedToken:
-    """What `rotate_token` returns."""
+    """What `rotate_token` returns. `repr` and `str` show `token` as a marker."""
 
     token: str
     """The successor token, shown once; the client already sends it."""
@@ -85,6 +106,9 @@ class RotatedToken:
     """None when the token never expires."""
 
     __hash__ = None  # type: ignore[assignment]  # holds a list, so it is unhashable by design
+
+    def __repr__(self) -> str:
+        return _repr_without(self, "token")
 
 
 def accept_terms_required() -> ValidationError:
@@ -127,11 +151,18 @@ def signup_body(  # mirrors the keyword surface of `agent_signup`
 
 
 def signup_of(body: object) -> AgentSignup:
-    check_shape(body, AGENT_SIGNUP, "signup response")
     fields = as_dict(body) or {}
+    # R81: the secret is held in a Secret until the result is built, and the body other frames
+    # share carries the marker, which is still a string to the shape check
+    text = fields.get("claim_secret")
+    claim_secret = Secret(text if isinstance(text, str) else "")
+    if isinstance(text, str):
+        fields["claim_secret"] = REDACTED
+    del text
+    check_shape(body, AGENT_SIGNUP, "signup response")
     return AgentSignup(
         signup_id=as_text(fields["signup_id"]),
-        claim_secret=as_text(fields["claim_secret"]),
+        claim_secret=claim_secret.reveal(),
         checkout_url=as_text(fields["checkout_url"]),
         price=to_money(as_whole(fields["amount"]), as_text(fields["currency"])),
         expires_at=to_datetime(fields["expires_at"]),
@@ -187,7 +218,7 @@ def _decode(response: httpx.Response) -> dict[str, object]:
 
 
 def _unknown(
-    route: str, hint_key: str, seen: str | None, credentials: Credentials
+    route: str, hint_key: str, seen: Secret | None, credentials: Credentials
 ) -> OutcomeUnknownError:
     return OutcomeUnknownError(
         credentials.scrub(f"The answer to {route} could not be used, so the token may be lost."),
@@ -197,7 +228,11 @@ def _unknown(
 
 
 def lost_credential(  # one place that builds the spec 7.4 error
-    response: httpx.Response, route: str, hint_key: str, seen: str | None, credentials: Credentials
+    response: httpx.Response,
+    route: str,
+    hint_key: str,
+    seen: Secret | None,
+    credentials: Credentials,
 ) -> OutcomeUnknownError:
     """A claim or rotation answered 2xx without a usable credential: it was minted and may be
     lost, exactly as if the answer never arrived (spec 7.4). `seen` is whatever the answer carried
@@ -208,7 +243,7 @@ def lost_credential(  # one place that builds the spec 7.4 error
 
 
 def _stray_credential(
-    failure: Exception, route: str, hint_key: str, seen: str | None, credentials: Credentials
+    failure: Exception, route: str, hint_key: str, seen: Secret | None, credentials: Credentials
 ) -> OutcomeUnknownError:
     """The same loss when the SDK itself failed on the answer (R61): the original rides along as
     a redacted cause, and `seen` is kept on the error."""
@@ -217,16 +252,18 @@ def _stray_credential(
     return lost
 
 
-def _pat_of(fields: dict[str, object]) -> str | None:
-    pat = fields.get("pat")
-    return pat if isinstance(pat, str) else None
+def _take_pat(fields: dict[str, object]) -> Secret | None:
+    """The `pat` the answer carried, moved out of the decoded body into a Secret so no frame that
+    shares the body holds it as text (R81)."""
+    pat = fields.pop("pat", None)
+    return Secret(pat) if isinstance(pat, str) else None
 
 
-def _register(seen: str | None, credentials: Credentials) -> None:
+def _register(seen: Secret | None, credentials: Credentials) -> None:
     """Scrubs a token the answer carried from every text from now on, trimmed, once it passes the
     token check; anything else the server put in `pat` is never registered."""
-    if seen is not None and acceptable_token(seen.strip()):
-        credentials.remember(seen.strip())
+    if seen is not None and acceptable_token(seen.reveal().strip()):
+        credentials.remember(seen.reveal().strip())
 
 
 def settle(
@@ -234,18 +271,18 @@ def settle(
     credentials: Credentials,
     route: str,
     hint_key: str,
-    use: Callable[[dict[str, object], str | None], T],
+    use: Callable[[dict[str, object], Secret | None], T],
 ) -> T:
     """`use` of a claim or rotation answer. A failure of the SDK's own while reading it, after the
     answer came, is as lost as an answer that never arrived (spec 7.4 and R61): an
     `OutcomeUnknownError` that keeps the `pat` the answer carried. It is raised once the handler
     has ended, so the unredacted original is not left on its `__context__`."""
     raise_for_response(response, credentials=credentials)
-    seen: str | None = None
+    seen: Secret | None = None
     lost: OutcomeUnknownError
     try:
         fields = _decode(response)
-        seen = _pat_of(fields)
+        seen = _take_pat(fields)
         _register(seen, credentials)
         return use(fields, seen)
     except HushscriptError:
@@ -255,10 +292,10 @@ def settle(
     raise lost
 
 
-def account_of(token: str, fields: dict[str, object]) -> AgentAccount:
+def account_of(token: Secret, fields: dict[str, object]) -> AgentAccount:
     seconds = as_whole(fields["balance_seconds"])
     return AgentAccount(
-        token=token,
+        token=token.reveal(),
         user_id=as_text(fields["user_id"]),
         scopes=_strings(fields["scopes"]) or [],
         balance=Balance(
@@ -271,10 +308,10 @@ def account_of(token: str, fields: dict[str, object]) -> AgentAccount:
     )
 
 
-def rotated_of(token: str, fields: dict[str, object]) -> RotatedToken:
+def rotated_of(token: Secret, fields: dict[str, object]) -> RotatedToken:
     expires = fields.get("expires_at")
     return RotatedToken(
-        token=token,
+        token=token.reveal(),
         token_id=as_text(fields["pat_id"]),
         scopes=_strings(fields["scopes"]) or [],
         expires_at=None if expires is None else to_datetime(expires),
@@ -285,8 +322,8 @@ def claim_path(signup_id: object) -> str:
     return f"/v1/agent/accounts/{path_id(signup_id)}/claim"
 
 
-def claim_body(claim_secret: str) -> dict[str, object]:
-    return {"claim_secret": claim_secret}
+def claim_body(claim_secret: Secret) -> dict[str, object]:
+    return {"claim_secret": claim_secret.reveal()}
 
 
 def signed_up(response: httpx.Response, credentials: Credentials) -> AgentSignup:
@@ -294,8 +331,8 @@ def signed_up(response: httpx.Response, credentials: Credentials) -> AgentSignup
 
 
 def claimed(response: httpx.Response, credentials: Credentials) -> AgentAccount:
-    def use(fields: dict[str, object], seen: str | None) -> AgentAccount:
-        if seen is None or not acceptable_token(seen) or not _claim_usable(fields):
+    def use(fields: dict[str, object], seen: Secret | None) -> AgentAccount:
+        if seen is None or not acceptable_token(seen.reveal()) or not _claim_usable(fields):
             raise lost_credential(response, CLAIM_ROUTE, CLAIM, seen, credentials)
         return account_of(seen, fields)
 
@@ -310,10 +347,10 @@ def rotated(response: httpx.Response, credentials: Credentials) -> RotatedToken:
     an expiry that cannot be read, as in the TypeScript SDK: the answer is then not trusted at all,
     the old token stays in use and the new one is only kept on the error."""
 
-    def use(fields: dict[str, object], seen: str | None) -> RotatedToken:
-        token_usable = seen is not None and acceptable_token(seen)
+    def use(fields: dict[str, object], seen: Secret | None) -> RotatedToken:
+        token_usable = seen is not None and acceptable_token(seen.reveal())
         if seen is not None and token_usable and _expiry_usable(fields):
-            credentials.replace(seen)
+            credentials.replace(seen.reveal())
         if seen is None or not token_usable or not _rotate_usable(fields):
             raise lost_credential(response, ROTATE_ROUTE, ROTATE, seen, credentials)
         return rotated_of(seen, fields)

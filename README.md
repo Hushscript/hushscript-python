@@ -251,7 +251,12 @@ carry on without a second charge.
 - **Waits and fetches.** It polls the job until it is done, raises `JobFailedError` if it fails,
   and gives you a `resume_token` if the wait times out. The job keeps running.
 - **Redacts secrets.** The token, a received token and every signed upload URL stay out of every
-  error, log line, `repr`, pickle and copy.
+  error, log line, `repr`, pickle and copy. The results that hand you a secret
+  (`AgentSignup.claim_secret`, `AgentAccount.token`, `RotatedToken.token`) keep it readable as a
+  field, but `repr`, `str` and `pprint` show `[redacted]` in its place; `dataclasses.asdict`, `json`
+  and `pickle` are your own export and carry the value. The SDK keeps secrets out of the local
+  variables of its own frames, but an error reporter that captures local variables (for example
+  Sentry with `include_local_variables`) can still see them inside the HTTP library's frames.
 
 ## Supported formats
 
@@ -280,6 +285,10 @@ from hushscript.generated.api.default import get_account
 
 response = get_account.sync_detailed(client=hs.api)
 ```
+
+An answer the generated code cannot read (a body that is not JSON, or lacks a field) raises
+`HushscriptError` with code `bad_response`, or the error for its status, never a bare
+`JSONDecodeError` or `KeyError`. A failure after a purchase went out carries its `idempotency_key`.
 
 ## Server only
 
