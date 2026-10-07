@@ -228,7 +228,7 @@ def test_render_hint_drops_sentences_with_unfilled_placeholders() -> None:
     assert render_hint("no_such_slug") is None
     assert render_hint("insufficient_balance") == 'Buy a pack with hs.buy("300min") or in the app.'
     assert render_hint("rate_limited") == "Too many requests."
-    assert render_hint("config_invalid") == "(message carries the specific reason)"
+    assert render_hint("config_invalid") is None
     assert render_hint("daily_limit") is None
     daily = {"used_today_seconds": 3599, "max_daily_seconds": 36000}
     assert render_hint("daily_limit", daily) == (
@@ -279,8 +279,9 @@ CAPPED = "This account has used its 3 purchase attempts for the last 24 hours."
             {},
             None,
             (
-                "Create a token that includes it. For billing, also turn on"
-                ' "Let connected apps buy minutes" in the app under Account \u2192 Connected apps.'
+                "Create a token that includes it. For billing, the token also needs"
+                ' "Let this token buy minutes" turned on when you create it, and'
+                ' "Let connected apps buy minutes" must be on in the app under Account \u2192 MCP.'
             ),
         ),
         ("agent_pack_locked", {}, None, None),

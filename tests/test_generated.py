@@ -67,7 +67,9 @@ def test_every_hint_slug_of_spec_9_3_is_present() -> None:
         "wrong_state",
         "resume_file_mismatch",
         "resume_file_required",
-        "config_invalid",
+        "resume_job_missing",
+        "stream_size_mismatch",
+        "default_card_required",
     }
     assert set(HINTS) == slugs
     assert "not the file the upload started with" in HINTS["resume_file_mismatch"]

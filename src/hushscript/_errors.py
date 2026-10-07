@@ -132,6 +132,10 @@ class HushscriptError(Exception):
         self.status: int | None = status
         self.details: dict[str, object] = dict(details or {})
         self.retry_after: float | None = retry_after
+        self.idempotency_key: str | None = None
+        """Set on every error `transcribe()` raises once its create was sent (spec 7.3): passing it
+        back to `transcribe()` replays the same job."""
+        self.resume_token: str | None = None
         if hint is None and self.auto_hint:
             hint = render_hint(self.code, self.details, retry_after, scope)
         self.hint: str | None = redact(hint) if hint is not None else None

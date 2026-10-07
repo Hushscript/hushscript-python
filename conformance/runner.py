@@ -7,17 +7,25 @@ runner contract asks for once the friendly layer is complete.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import sys
+import tempfile
+import threading
+import time
 import traceback
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
 import hushscript
+import hushscript._client as client_module
 from hushscript import Hushscript, HushscriptError
 from hushscript._json import as_dict, as_list
+from hushscript.transcribe.probe import probe_duration
+from hushscript.transcribe.source import make_source
 
 BASE_URL = "http://127.0.0.1:4010"
 TEST_TOKEN = "hsr1:eu:pat." + "0123456789abcdef" * 2 + "." + "fedcba9876543210" * 4
@@ -32,26 +40,193 @@ Json = Any
 CLASS_ALIASES = {"PermissionError": "PermissionDeniedError"}
 
 
-class VirtualClock:
-    """Time that moves only when the SDK sleeps; the mock's clock is moved by the same amount."""
+class Timer:
+    def __init__(self, due: float) -> None:
+        self.due = due
+        self.fired = threading.Event()
 
-    def __init__(self, control: httpx.Client) -> None:
-        self._control = control
+
+class VirtualClock:
+    """Time that moves only when the driver says so (runner contract section 5).
+
+    `sleep` registers a timer and blocks until the driver fires it, so the SDK's waits are visible
+    to the driver and a wait that nobody ends is a stall, not a hang.
+    """
+
+    def __init__(self) -> None:
         self.time = 0.0
+        self.registered = 0
+        self._timers: list[Timer] = []
+        self._lock = threading.Lock()
 
     def now(self) -> float:
         return self.time
 
+    def _register(self, seconds: float) -> Timer:
+        with self._lock:
+            timer = Timer(self.time + seconds)
+            self._timers.append(timer)
+            self.registered += 1
+            return timer
+
+    def _drop(self, timer: Timer) -> None:
+        with self._lock:
+            if timer in self._timers:
+                self._timers.remove(timer)
+
     def sleep(self, seconds: float) -> None:
         if seconds > 0:
-            self._control.post("/__clock", json={"advance": seconds}).raise_for_status()
-            self.time += seconds
+            self._register(seconds).fired.wait()
+
+    def wait(self, stop: threading.Event, seconds: float) -> bool:
+        if stop.is_set():
+            return True
+        timer = self._register(seconds)
+        while not timer.fired.wait(0.005):
+            if stop.is_set():
+                self._drop(timer)
+                return True
+        return stop.is_set()
 
     async def asleep(self, seconds: float) -> None:
-        self.sleep(seconds)
+        await asyncio.to_thread(self.sleep, seconds)
+
+    def earliest(self) -> float | None:
+        with self._lock:
+            return min((timer.due for timer in self._timers), default=None)
+
+    def advance_to(self, target: float) -> None:
+        self.time = max(self.time, target)
+
+    def fire_due(self) -> None:
+        with self._lock:
+            due = [timer for timer in self._timers if timer.due <= self.time]
+            self._timers = [timer for timer in self._timers if timer.due > self.time]
+        for timer in due:
+            timer.fired.set()
 
 
-def _balance(hs: Hushscript, _args: Json) -> Json:
+class InFlight:
+    """Requests the SDK has sent and not yet had an answer to, counted under its transport."""
+
+    def __init__(self) -> None:
+        self.value = 0
+        self.total = 0
+        self._lock = threading.Lock()
+
+    def enter(self) -> None:
+        with self._lock:
+            self.value += 1
+            self.total += 1
+
+    def leave(self) -> None:
+        with self._lock:
+            self.value -= 1
+
+
+class CountingTransport(httpx.BaseTransport):
+    def __init__(self, inner: httpx.BaseTransport, counter: InFlight) -> None:
+        self._inner = inner
+        self._counter = counter
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self._counter.enter()
+        try:
+            return self._inner.handle_request(request)
+        finally:
+            self._counter.leave()
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+SETTLE_SECONDS = 0.02
+STALL_SECONDS = 0.5
+
+
+class SDKStalledError(Exception):
+    """The call is pending and nothing it could be waiting for exists."""
+
+
+class Driver:
+    """Moves the virtual clock and the mock's while the SDK's call runs (runner contract 5)."""
+
+    def __init__(self, control: httpx.Client, clock: VirtualClock, counter: InFlight) -> None:
+        self.control = control
+        self.clock = clock
+        self.counter = counter
+
+    def _state(self) -> Json:
+        return self.control.get("/__state").raise_for_status().json()
+
+    def _settle(self, done: threading.Event) -> bool:
+        """True once the SDK has been quiet for the settle period; False if the call finished."""
+        started = time.monotonic()
+        seen = self.clock.registered
+        while time.monotonic() - started < SETTLE_SECONDS:
+            if done.is_set():
+                return False
+            held = self._state()["pendingHolds"]
+            if self.counter.value - held != 0 or self.clock.registered != seen:
+                started = time.monotonic()
+                seen = self.clock.registered
+            time.sleep(0.002)
+        return True
+
+    def drive(self, done: threading.Event) -> None:
+        idle_since: float | None = None
+        activity = (self.clock.registered, self.counter.total)
+        while not done.is_set():
+            if not self._settle(done):
+                return
+            state = self._state()
+            targets = [
+                target
+                for target in (self.clock.earliest(), state["nextHoldAt"])
+                if target is not None
+            ]
+            now_activity = (self.clock.registered, self.counter.total)
+            if not targets:
+                if idle_since is None or now_activity != activity:
+                    idle_since = time.monotonic()
+                    activity = now_activity
+                elif time.monotonic() - idle_since >= STALL_SECONDS and self.counter.value == 0:
+                    raise SDKStalledError
+                continue
+            idle_since = None
+            target = min(targets)
+            if target > self.clock.time:
+                advance = target - self.clock.time
+                self.control.post("/__clock", json={"advance": advance}).raise_for_status()
+                self.clock.advance_to(target)
+                # Held responses first: let the SDK take them in before timers at the same instant.
+                if not self._settle(done):
+                    return
+            self.clock.fire_due()
+
+    def run(self, call: Callable[[], Json]) -> Json:
+        done = threading.Event()
+        outcome: list[Json] = []
+        failure: list[BaseException] = []
+
+        def target() -> None:
+            try:
+                outcome.append(call())
+            except BaseException as error:  # noqa: BLE001  # handed to the caller below
+                failure.append(error)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=target, daemon=True)
+        worker.start()
+        self.drive(done)
+        worker.join()
+        if failure:
+            raise failure[0]
+        return outcome[0]
+
+
+def _balance(hs: Hushscript, _args: Json, _files: Files) -> Json:
     balance = hs.balance()
     return {
         "seconds": balance.seconds,
@@ -61,7 +236,75 @@ def _balance(hs: Hushscript, _args: Json) -> Json:
     }
 
 
-OPS: dict[str, Callable[[Hushscript, Json], Json]] = {"balance": _balance}
+def _transcript_result(raw: Json) -> Json:
+    utterances = raw.get("body", {}).get("original", {}).get("utterances", [])
+    return {
+        "id": raw.get("id"),
+        "title": raw.get("title"),
+        "language": raw.get("language_detected"),
+        "durationSeconds": raw.get("duration_seconds"),
+        "utteranceCount": len(utterances),
+        "raw": raw,
+    }
+
+
+def _options(args: Json) -> Json:
+    return {_snake(key): value for key, value in args.get("options", {}).items()}
+
+
+def _transcribe(hs: Hushscript, args: Json, files: Files) -> Json:
+    transcript = hs.transcribe(str(files[args["file"]]), **_options(args))
+    return _transcript_result(dict(transcript.raw))
+
+
+def _probe(_hs: Hushscript, args: Json, files: Files) -> Json:
+    tolerance = args["toleranceSeconds"]
+    failures: list[Json] = []
+    for name, expected in files.durations.items():
+        try:
+            got: float | None = probe_duration(make_source(files[name]))
+        except HushscriptError:
+            got = None
+        if got is None or abs(got - expected) > tolerance:
+            failures.append({"file": name, "expected": expected, "got": got})
+    return {"checked": len(files.durations), "failures": failures}
+
+
+OPS: dict[str, Callable[[Hushscript, Json, Files], Json]] = {
+    "balance": _balance,
+    "transcribe": _transcribe,
+    "probe": _probe,
+}
+
+
+class Files:
+    """The media a scenario names, downloaded from the mock into a scratch directory."""
+
+    def __init__(self, control: httpx.Client, root: Path) -> None:
+        self._control = control
+        self._root = root
+        self.durations: dict[str, float] = {}
+
+    def fetch(self, name: str) -> Path:
+        path = self._root / name
+        if not path.exists():
+            body = self._control.get(f"/__files/fixtures/{name}").raise_for_status().content
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
+        return path
+
+    def __getitem__(self, name: str) -> Path:
+        return self.fetch(name if "/" in name else f"media/{name}")
+
+    def prepare(self, call: Json) -> None:
+        for step in (call.get("prior"), call):
+            if step is not None and "file" in step.get("args", {}):
+                self.fetch(step["args"]["file"])
+        if call["op"] == "probe":
+            listing = self._control.get("/__files/fixtures/media/durations.json")
+            self.durations = listing.raise_for_status().json()
+            for name in self.durations:
+                self.fetch(f"media/{name}")
 
 
 def _snake(key: str) -> str:
@@ -142,26 +385,56 @@ def check_error(expected: Json, error: BaseException) -> list[str]:
 
 
 def unmapped_ops(call: Json) -> list[str]:
+    mapped = {*OPS, "resume"}
     ops = [call["op"]]
     if "prior" in call:
         ops.append(call["prior"]["op"])
-    return [op for op in ops if op not in OPS]
+    return [op for op in ops if op not in mapped]
 
 
-def run_scenario(control: httpx.Client, name: str) -> tuple[str, str]:
+def _call(hs: Hushscript, call: Json, files: Files, token: str | None) -> Json:
+    if call["op"] == "resume":
+        return _resume(hs, call, files, token)
+    return OPS[call["op"]](hs, call.get("args", {}), files)
+
+
+def _resume(hs: Hushscript, call: Json, files: Files, token: str | None) -> Json:
+    transcript = hs.resume(token or "", str(files[call["args"]["file"]]))
+    return _transcript_result(dict(transcript.raw))
+
+
+def run_scenario(  # noqa: C901
+    control: httpx.Client, name: str, scratch: Path, counter: InFlight
+) -> tuple[str, str]:
     scenario = control.get(f"/__files/scenarios/{name}.json").raise_for_status().json()
     call = scenario["call"]
     missing = unmapped_ops(call)
     if missing:
         return "SKIP", f"op {', '.join(missing)} is not mapped yet"
+    files = Files(control, scratch)
+    files.prepare(call)
     control.post("/__scenario", json={"name": name}).raise_for_status()
-    clock = VirtualClock(control)
+    clock = VirtualClock()
+    counter.value = 0
+    driver = Driver(control, clock, counter)
     hs = Hushscript(TEST_TOKEN, base_url=BASE_URL, clock=clock)
-    control.post("/__mark").raise_for_status()
     expect = scenario["expect"]
     problems: list[str] = []
+    token: str | None = None
     try:
-        result = OPS[call["op"]](hs, call.get("args", {}))
+        prior = call.get("prior")
+        if prior is not None:
+            try:
+                driver.run(lambda: OPS[prior["op"]](hs, prior.get("args", {}), files))
+            except Exception as error:  # noqa: BLE001  # the prior call is meant to fail
+                problems += check_error(prior["expectError"], error)
+                token = getattr(error, "resume_token", None)
+            else:
+                problems.append("the prior call returned; it should have failed")
+        control.post("/__mark").raise_for_status()
+        result = driver.run(lambda: _call(hs, call, files, token))
+    except SDKStalledError:
+        problems.append("SDK stalled")
     except Exception as error:  # noqa: BLE001  # every failure is compared with the expectation
         if "error" in expect:
             problems += check_error(expect["error"], error)
@@ -182,13 +455,20 @@ def run_scenario(control: httpx.Client, name: str) -> tuple[str, str]:
 def main() -> int:
     strict = os.environ.get("CONFORMANCE_STRICT") == "1"
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0}
-    with httpx.Client(base_url=BASE_URL, timeout=30) as control:
+    counter = InFlight()
+    client_module._sync_inner = lambda: CountingTransport(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        httpx.HTTPTransport(), counter
+    )
+    with (
+        httpx.Client(base_url=BASE_URL, timeout=30) as control,
+        tempfile.TemporaryDirectory() as tmp,
+    ):
         names = control.get("/__scenarios").raise_for_status().json()["scenarios"]
         if not names:
             print("the mock lists no scenarios", file=sys.stderr)
             return 1
         for name in names:
-            status, reason = run_scenario(control, name)
+            status, reason = run_scenario(control, name, Path(tmp), counter)
             if status == "SKIP" and strict:
                 status, reason = "FAIL", f"skipped in strict mode: {reason}"
             counts[status] += 1

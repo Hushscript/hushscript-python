@@ -171,10 +171,6 @@ exclude_also = ["if TYPE_CHECKING:", "@overload", "\\.\\.\\."]
 extend_exclude = ["build"]
 known_first_party = ["hushscript"]
 
-[tool.deptry.per_rule_ignores]
-# Used by the transcribe pipeline (duration probe) that lands after the core client.
-DEP002 = ["mutagen"]
-
 [tool.mutmut]
 source_paths = ["src/hushscript/_retry.py", "src/hushscript/_pacing.py", "src/hushscript/_http.py"]
 # The mutated modules import their siblings, so the whole package is copied next to them.
