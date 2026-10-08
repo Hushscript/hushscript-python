@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from hushscript._errors import _RedactedCause  # pyright: ignore[reportPrivateUsage]
 from hushscript._http import (
     AsyncRetryingTransport,
     RetryingTransport,
@@ -43,6 +44,14 @@ class FakeClock:
 
     async def asleep(self, seconds: float) -> None:
         self.sleep(seconds)
+
+
+def stand_in(error: BaseException) -> str:
+    """The text of the redacted stand-in that is `error`'s cause (R86), once it is checked that the
+    cause is that stand-in and that the original is not `error`'s context either."""
+    assert type(error.__cause__) is _RedactedCause
+    assert error.__context__ is None
+    return str(error.__cause__)
 
 
 def snapshot(request: httpx.Request) -> httpx.Request:

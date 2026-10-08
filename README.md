@@ -248,10 +248,12 @@ An error raised after an upload started, or after a purchase was sent, carries `
 once the job exists it carries `resume_token` too. Pass the token to `hs.resume(token, file)` to
 carry on without a second charge.
 
-A wrapped error names the original: `network_error`, `outcome_unknown` and `unexpected_error` end
-their message with the original's type and its message, tokens and signed-URL queries removed, for
-example `(ConnectError: refused)`. A failure of the SDK itself, or of an HTTP client you supplied
-that is not a transport failure, is `unexpected_error`, with the original as a redacted `__cause__`.
+A wrapped error names the original: `network_error`, `outcome_unknown`, `unexpected_error` and a
+`bad_response` for a body that is not JSON end their message with the original's type and its
+message, tokens and signed-URL queries removed, for example `(ConnectError: refused)`. Their
+`__cause__` is a stand-in with that same text, not the original: an httpx error keeps the request
+it sent and a JSON error the body it read. A failure of the SDK itself that is not a transport
+failure is `unexpected_error`.
 
 ## What the SDK does for you
 
@@ -275,14 +277,13 @@ that is not a transport failure, is `unexpected_error`, with the original as a r
   error, log line, `repr`, pickle and copy. The results that hand you a secret
   (`AgentSignup.claim_secret`, `AgentAccount.token`, `RotatedToken.token`) keep it readable as a
   field, but `repr`, `str` and `pprint` show `[redacted]` in its place; `dataclasses.asdict`, `json`
-  and `pickle` are your own export and carry the value. Once an HTTP call has returned or raised,
-  no local of an SDK frame and no attribute of an SDK object reachable from one holds the token, a
+  and `pickle` are your own export and carry the value. Once an HTTP call has returned or raised, no
+  local of an SDK frame and no attribute of an SDK object reachable from one holds the token, a
   signed URL or a claim secret as plain text; the SDK keeps them in `Secret` and `Credentials`
-  holders that print nothing. This does not reach the HTTP library's own objects: a response, and the
-  transport error that `network_error` and `outcome_unknown` carry as `__cause__`, still refer to
-  the request it sent, which holds the bearer header and the signed URL, and a streamed response
-  keeps its request for as long as it lives. An error reporter that captures local variables (for
-  example Sentry with `include_local_variables`) can see them there.
+  holders that print nothing. This does not reach the HTTP library's own objects: a response still
+  refers to the request it sent, which holds the bearer header and the signed URL, and a streamed
+  response keeps its request for as long as it lives. An error reporter that captures local
+  variables (for example Sentry with `include_local_variables`) can see them there.
 
 ## Supported formats
 

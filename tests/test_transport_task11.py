@@ -22,6 +22,7 @@ from helpers import (
     failing_body,
     reply,
     settings_for,
+    stand_in,
     sync_client,
 )
 from hushscript import (
@@ -61,7 +62,7 @@ def test_a_get_whose_body_cannot_be_decoded_is_retried_then_a_network_error() ->
     with sync_client(script, FakeClock()) as client, pytest.raises(NetworkError) as raised:
         client.get("/v1/account")
     assert script.calls == 4
-    assert isinstance(raised.value.__cause__, httpx.DecodingError)
+    assert stand_in(raised.value) == "DecodingError: bad gzip"
 
 
 def test_a_claim_whose_body_cannot_be_decoded_is_unknown() -> None:
@@ -158,7 +159,7 @@ async def test_async_a_request_blocked_on_the_network_is_cut_at_its_deadline() -
     async with httpx.AsyncClient(base_url="http://127.0.0.1:4010", transport=transport) as client:
         with pytest.raises(NetworkError) as raised:
             await client.get("/v1/account")
-    assert isinstance(raised.value.__cause__, httpx.ReadTimeout)
+    assert stand_in(raised.value) == "ReadTimeout: the request took longer than 5 s"
 
 
 @pytest.mark.anyio

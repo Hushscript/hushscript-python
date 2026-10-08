@@ -15,6 +15,7 @@ from helpers import (
     failing_body,
     reply,
     settings_for,
+    stand_in,
     sync_client,
 )
 from hushscript import NetworkError, OutcomeUnknownError
@@ -60,7 +61,7 @@ def test_a_body_that_fails_after_the_headers_of_a_one_time_secret_is_unknown(
     assert script.calls == 1
     assert raised.value.hint is not None
     assert hint in raised.value.hint
-    assert isinstance(raised.value.__cause__, httpx.ReadTimeout)
+    assert stand_in(raised.value) == "ReadTimeout: slow"
 
 
 def test_a_get_whose_body_fails_is_retried_and_then_a_network_error() -> None:
@@ -175,7 +176,7 @@ def test_a_lost_signup_response_is_unknown_with_no_hint() -> None:
         client.post(SIGNUP, json={})
     assert raised.value.hint is None
     assert raised.value.code == "outcome_unknown"
-    assert isinstance(raised.value.__cause__, httpx.ReadError)
+    assert stand_in(raised.value) == "ReadError: reset"
     assert script.calls == 1
 
 
@@ -275,7 +276,7 @@ def test_a_response_that_trickles_past_the_deadline_times_out() -> None:
     with sync_client(script, clock, max_retries=0) as client, pytest.raises(NetworkError) as raised:
         client.get("/v1/account")
     assert "ReadTimeout" in str(raised.value)
-    assert isinstance(raised.value.__cause__, httpx.ReadTimeout)
+    assert stand_in(raised.value) == "ReadTimeout: the request took longer than 60 s"
 
 
 def test_a_get_past_the_deadline_is_retried() -> None:

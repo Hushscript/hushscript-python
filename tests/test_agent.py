@@ -9,7 +9,7 @@ import pytest
 import hushscript._client as client_module
 import hushscript.resources.agent as agent_module
 from conftest import TOKEN
-from helpers import BASE_URL, FakeClock, error_body, reply
+from helpers import BASE_URL, FakeClock, error_body, reply, stand_in
 from hushscript import (
     AgentInfo,
     ApiError,
@@ -162,7 +162,7 @@ def test_a_signup_is_never_retried_and_a_lost_answer_is_outcome_unknown_without_
         signup()
     assert raised.value.hint is None
     assert (raised.value.code, raised.value.status) == ("outcome_unknown", None)
-    assert isinstance(raised.value.__cause__, httpx.ReadError)
+    assert stand_in(raised.value) == "ReadError: reset"
     assert len(routes.requests) == 1
 
 
@@ -232,7 +232,7 @@ def test_a_lost_claim_is_outcome_unknown_with_the_hint_and_is_not_retried(
     with pytest.raises(OutcomeUnknownError) as raised:
         claim()
     assert raised.value.hint == CLAIM_HINT
-    assert isinstance(raised.value.__cause__, httpx.ReadError)
+    assert stand_in(raised.value) == "ReadError: reset"
     assert len(routes.requests) == 1
 
 
@@ -690,5 +690,5 @@ async def test_async_signup_refusals_and_lost_answers_are_not_retried(
         await call()
     assert (unknown.value.code, unknown.value.status) == ("outcome_unknown", None)
     assert unknown.value.hint is None
-    assert unknown.value.__cause__ is failure
+    assert stand_in(unknown.value) == "ReadError: lost"
     assert len(routes.requests) == 1

@@ -14,6 +14,7 @@ from ._errors import (
     OutcomeUnknownError,
     describe_failure,
     parse_retry_after,
+    redacted_cause,
     unexpected_error,
 )
 from ._guard import generated_parser, unusable_answer
@@ -350,15 +351,21 @@ class _Attempt:
         )
 
     def failure_error(self, failure: httpx.RequestError) -> NetworkError | OutcomeUnknownError:
+        """The error for a transport failure. Its cause is a stand-in: the httpx error keeps the
+        request it sent, bearer header and signed URL included (R86, R91)."""
         reason = describe_failure(failure, self.settings.credentials)
         where = f"{self.request.method} {self.label}"
+        error: NetworkError | OutcomeUnknownError
         if self.retry_class is RetryClass.NEVER and not is_not_sent(failure):
-            return OutcomeUnknownError(
+            error = OutcomeUnknownError(
                 f"No response arrived for {where} ({reason}).",
                 code="outcome_unknown",
                 hint=UNKNOWN_HINTS.get(self.route or ""),
             )
-        return NetworkError(f"Could not reach the Hushscript API: {where} ({reason}).")
+        else:
+            error = NetworkError(f"Could not reach the Hushscript API: {where} ({reason}).")
+        error.__cause__ = redacted_cause(failure, self.settings.credentials)
+        return error
 
     def unexpected(self, failure: Exception) -> HushscriptError:
         """Spec 9.2 and R61: a failure of the SDK's own. A claim, rotation or signup answer lost
@@ -428,25 +435,27 @@ class RetryingTransport(httpx.BaseTransport):
     def _once(self, attempt: _Attempt) -> tuple[Decision, httpx.Response | None]:
         """One attempt: what to do next and the response, if one came. Nothing but an SDK error
         leaves it (R61)."""
-        unexpected: HushscriptError | None = None
+        failed: HushscriptError
         try:
             try:
                 response = self._send(attempt)
             except httpx.RequestError as failure:
                 decision = attempt.judge(Outcome(failure=failure))
-                if not decision.retry:
-                    raise attempt.failure_error(failure) from failure
-                return decision, None
-            try:
-                return attempt.judge(attempt.outcome_of(response)), response
-            except BaseException:
-                response.close()
-                raise
+                if decision.retry:
+                    return decision, None
+                # Raised once the handlers have ended, so the httpx error is not its context.
+                failed = attempt.failure_error(failure)
+            else:
+                try:
+                    return attempt.judge(attempt.outcome_of(response)), response
+                except BaseException:
+                    response.close()
+                    raise
         except HushscriptError:
             raise
         except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
-            unexpected = attempt.unexpected(failure)
-        raise unexpected
+            failed = attempt.unexpected(failure)
+        raise failed
 
     def _send(self, attempt: _Attempt) -> httpx.Response:
         response = self._inner.handle_request(attempt.request)
@@ -503,28 +512,30 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
     async def _once(self, attempt: _Attempt) -> tuple[Decision, httpx.Response | None]:
         """One attempt: what to do next and the response, if one came. Nothing but an SDK error
         leaves it (R61); a cancellation passes through, with the note a lost secret needs."""
-        unexpected: HushscriptError | None = None
+        failed: HushscriptError
         try:
             try:
                 response = await self._send(attempt)
             except httpx.RequestError as failure:
                 decision = attempt.judge(Outcome(failure=failure))
-                if not decision.retry:
-                    raise attempt.failure_error(failure) from failure
-                return decision, None
+                if decision.retry:
+                    return decision, None
+                # Raised once the handlers have ended, so the httpx error is not its context.
+                failed = attempt.failure_error(failure)
             except asyncio.CancelledError as cancelled:
                 attempt.note_cancellation(cancelled)
                 raise
-            try:
-                return attempt.judge(attempt.outcome_of(response)), response
-            except BaseException:
-                await response.aclose()
-                raise
+            else:
+                try:
+                    return attempt.judge(attempt.outcome_of(response)), response
+                except BaseException:
+                    await response.aclose()
+                    raise
         except HushscriptError:
             raise
         except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
-            unexpected = attempt.unexpected(failure)
-        raise unexpected
+            failed = attempt.unexpected(failure)
+        raise failed
 
     async def _send(self, attempt: _Attempt) -> httpx.Response:
         """One attempt, held to its deadline even while blocked on the network. Only the expiry of

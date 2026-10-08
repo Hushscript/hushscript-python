@@ -16,6 +16,7 @@ from helpers import (
     failing_body,
     reply,
     settings_for,
+    stand_in,
     sync_client,
 )
 from hushscript import (
@@ -71,7 +72,7 @@ async def test_a_derived_api_failure_leaves_the_token_out_of_sdk_request_locals(
                 get_account.sync_detailed(client=derived)
     assert type(raised.value) is NetworkError
     assert (raised.value.code, raised.value.status) == ("network_error", None)
-    assert raised.value.__cause__ is failure
+    assert stand_in(raised.value) == "ReadError: reset"
     assert script.calls == 4
     assert len(clock.sleeps) == 3
     assert all(request.headers["Authorization"] == f"Bearer {TOKEN}" for request in script.requests)
@@ -165,7 +166,7 @@ def test_claim_is_never_retried_and_a_lost_response_is_unknown() -> None:
     assert script.calls == 1
     assert raised.value.hint is not None
     assert "The claim may have succeeded" in raised.value.hint
-    assert isinstance(raised.value.__cause__, httpx.ReadError)
+    assert stand_in(raised.value) == "ReadError: reset"
 
 
 def test_rotate_is_never_retried_and_a_lost_response_is_unknown() -> None:
@@ -628,7 +629,7 @@ async def test_a_transport_failure_names_its_type_and_redacted_message(
     assert type(raised.value) is error_class
     assert (raised.value.code, raised.value.status) == (code, None)
     assert raised.value.message == f"{prefix} ({_described(failure, message)})."
-    assert raised.value.__cause__ is failure
+    assert stand_in(raised.value) == _described(failure, message)
     assert script.calls == 1
     assert raised.value.idempotency_key == key
 

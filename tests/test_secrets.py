@@ -18,11 +18,22 @@ import hushscript._client as client_module
 import hushscript.resources.agent as agent_module
 from conftest import TOKEN
 from fakeapi import FakeApi
-from helpers import BASE_URL, FakeClock, reply, settings_for
+from helpers import (
+    BASE_URL,
+    FakeClock,
+    Script,
+    async_client,
+    reply,
+    settings_for,
+    snapshot,
+    stand_in,
+    sync_client,
+)
 from hushscript import (
     AgentAccount,
     AgentInfo,
     AgentSignup,
+    ApiError,
     AsyncHushscript,
     Balance,
     Hushscript,
@@ -543,3 +554,79 @@ def test_a_signup_answer_the_sdk_cannot_use_leaves_the_claim_secret_out_of_sdk_f
         )
     assert raised.value.code == "bad_response"
     assert_no_plain_secret(raised.value, CLAIM_SECRET)
+
+
+def frames_of(traceback: TracebackType | None) -> list[tuple[str, dict[str, object]]]:
+    """The code name and the locals of every frame on `traceback`, whoever's frame it is."""
+    frames: list[tuple[str, dict[str, object]]] = []
+    while traceback is not None:
+        frames.append((traceback.tb_frame.f_code.co_name, dict(traceback.tb_frame.f_locals)))
+        traceback = traceback.tb_next
+    return frames
+
+
+class Refusal(Script):
+    """Fails the way httpx does: the error keeps the request it was sending."""
+
+    def _next(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(snapshot(request))
+        raise httpx.ReadError("reset", request=request)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    ("path", "error_class"),
+    [
+        ("/v1/account", NetworkError),
+        ("/v1/agent/accounts/sg_1/claim", OutcomeUnknownError),
+    ],
+)
+async def test_a_transport_failure_carries_a_stand_in_whose_frames_hold_no_request(
+    asynchronous: bool,  # noqa: FBT001
+    path: str,
+    error_class: type[HushscriptError],
+) -> None:
+    script = Refusal([httpx.Response(200)])
+    if asynchronous:
+        async with async_client(script, FakeClock(), token=PAT, max_retries=0) as client:
+            with pytest.raises(error_class) as raised:
+                await client.post(path, json={"claim_secret": CLAIM_SECRET})
+    else:
+        with (
+            sync_client(script, FakeClock(), token=PAT, max_retries=0) as client,
+            pytest.raises(error_class) as raised,
+        ):
+            client.post(path, json={"claim_secret": CLAIM_SECRET})
+    assert script.requests[0].headers["Authorization"] == f"Bearer {PAT}"
+    assert json.loads(script.requests[0].content) == {"claim_secret": CLAIM_SECRET}
+    assert stand_in(raised.value) == "ReadError: reset"
+    cause = raised.value.__cause__
+    assert cause is not None
+    frames = frames_of(cause.__traceback__)
+    assert [held for code, held in frames if code == "_next"] == [{}]
+    for code, held in frames:
+        for name, value in held.items():
+            for secret in (PAT, CLAIM_SECRET):
+                assert holds_text(value, secret) is False, f"{secret!r} in {code}.{name}"
+
+
+def test_a_body_that_is_not_json_carries_a_stand_in_without_the_body() -> None:
+    truncated = b'{"signup_id": "sg_1", "claim_secret": "' + CLAIM_SECRET.encode()
+    routes = Routes(lambda _r: httpx.Response(200, content=truncated))
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(client_module, "_sync_inner", routes.sync)
+        with pytest.raises(ApiError) as raised:
+            Hushscript.agent_signup(
+                email="a@example.com",
+                pack="45min",
+                accept_terms="2026-10-01",
+                agent=AgentInfo("a", "p"),
+                base_url=BASE_URL,
+                clock=FakeClock(),
+            )
+    described = "JSONDecodeError: Unterminated string starting at: line 1 column 39 (char 38)"
+    assert (raised.value.code, raised.value.status) == ("bad_response", 200)
+    assert raised.value.message == f"The API's response could not be used ({described})."
+    assert stand_in(raised.value) == described
+    assert vars(raised.value.__cause__) == {}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import traceback
 from typing import TYPE_CHECKING, Any, ClassVar, Final
 
 from ._json import as_dict, as_list, loads
@@ -197,6 +198,18 @@ def describe_failure(failure: BaseException, credentials: Credentials | None = N
     return f"{name}: {shown}"
 
 
+def redacted_cause(failure: BaseException, credentials: Credentials | None = None) -> BaseException:
+    """R86: what stands in for a foreign exception as the cause of an SDK error. The original
+    cannot be redacted in place: an HTTP error keeps the request it sent (bearer header, signed
+    URL, body) and a JSON error keeps the whole text it read. The stand-in has its type and
+    redacted message, and its traceback with the locals of every finished frame cleared, so the
+    HTTP library's frames no longer hold their copy of the request either."""
+    traceback.clear_frames(failure.__traceback__)
+    return _RedactedCause(describe_failure(failure, credentials)).with_traceback(
+        failure.__traceback__
+    )
+
+
 def unexpected_error(
     failure: BaseException, credentials: Credentials | None = None
 ) -> HushscriptError:
@@ -209,8 +222,7 @@ def unexpected_error(
         f"({description}).",
         code=UNEXPECTED,
     )
-    cause = _RedactedCause(description)
-    error.__cause__ = cause.with_traceback(failure.__traceback__)
+    error.__cause__ = redacted_cause(failure, credentials)
     return error
 
 
