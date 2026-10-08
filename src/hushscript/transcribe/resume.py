@@ -42,8 +42,10 @@ def _whole(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def decode_token(token: str) -> ResumeState:
+def decode_token(token: object) -> ResumeState:
     invalid = ConfigurationError("This is not a resume token from this SDK.")
+    if not isinstance(token, str):
+        raise invalid
     try:
         raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
         fields = as_dict(loads(raw))

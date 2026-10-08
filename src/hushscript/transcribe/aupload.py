@@ -4,7 +4,7 @@ import asyncio
 from typing import TYPE_CHECKING
 
 from hushscript._errors import NetworkError, raise_for_response
-from hushscript._http import STREAM_EXTENSION
+from hushscript._http import STREAM_EXTENSION, release
 from hushscript._log import hiding_signed_url
 from hushscript._response import parsed
 
@@ -26,7 +26,6 @@ from .upload import (
     plan_for,
     r2_extensions,
     read_part,
-    release,
 )
 
 if TYPE_CHECKING:
@@ -103,44 +102,53 @@ class AsyncUploader:
 
     async def _put_direct(self, n: int, url: Secret, data: bytes) -> tuple[int | None, str | None]:
         client = self._session.r2
-        request = client.build_request(
-            "PUT", url.reveal(), content=data, timeout=PART_TIMEOUTS, extensions=r2_extensions(n)
-        )
         try:
             with hiding_signed_url(f"r2:part/{n}"):
-                response = await client.send(request, stream=True)
+                response = await client.send(
+                    client.build_request(
+                        "PUT",
+                        url.reveal(),
+                        content=data,
+                        timeout=PART_TIMEOUTS,
+                        extensions=r2_extensions(n),
+                    ),
+                    stream=True,
+                )
             try:
                 etag = etag_of(response)
                 if response.is_success and etag is None:
                     raise etag_missing(n)
                 return response.status_code, etag
             finally:
-                await response.aclose()
+                try:
+                    await response.aclose()
+                finally:
+                    release(response.request)
         except NetworkError:
             return None, None
-        finally:
-            release(request)
 
     async def _put_proxied(self, n: int, data: bytes) -> None:
         client = self._session.http
-        request = client.build_request(
-            "PUT",
-            f"/v1/uploads/{segment(self._job_id)}/parts/{n}",
-            content=data,
-            headers=OCTET_STREAM,
-            timeout=PART_TIMEOUTS,
-            extensions={STREAM_EXTENSION: True},
+        response = await client.send(
+            client.build_request(
+                "PUT",
+                f"/v1/uploads/{segment(self._job_id)}/parts/{n}",
+                content=data,
+                headers=OCTET_STREAM,
+                timeout=PART_TIMEOUTS,
+                extensions={STREAM_EXTENSION: True},
+            ),
+            stream=True,
         )
         try:
-            response = await client.send(request, stream=True)
-            try:
-                if not response.is_success:
-                    await response.aread()
-                    raise_for_response(response, credentials=self._session.credentials)
-            finally:
-                await response.aclose()
+            if not response.is_success:
+                await response.aread()
+                raise_for_response(response, credentials=self._session.credentials)
         finally:
-            release(request)
+            try:
+                await response.aclose()
+            finally:
+                release(response.request)
 
     async def _url_for(self, n: int) -> Secret | None:
         async with self._pages:

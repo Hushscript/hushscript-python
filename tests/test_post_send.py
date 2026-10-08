@@ -5,7 +5,6 @@ caller's, and passes through unchanged."""
 
 from __future__ import annotations
 
-import contextlib
 import json
 
 import httpx
@@ -15,7 +14,7 @@ import hushscript.resources.billing as billing_module
 import hushscript.transcribe.apipeline as apipeline_module
 import hushscript.transcribe.pipeline as pipeline_module
 from conftest import TOKEN
-from fakeapi import FakeApi
+from fakeapi import FakeApi, Job
 from helpers import (
     BASE_URL,
     FakeClock,
@@ -26,13 +25,14 @@ from helpers import (
     sync_client,
     transcript_body,
 )
-from hushscript import HushscriptError, OutcomeUnknownError, Purchase, Transcript
+from hushscript import HushscriptError, OutcomeUnknownError, PreflightError, Purchase, Transcript
 from hushscript._errors import parse_retry_after
 from hushscript._http import AsyncRetryingTransport, RetryingTransport, _Attempt
 from hushscript._redact import Credentials
 from hushscript._response import parsed
 from hushscript._shape import finite_number, number
 from hushscript.transcribe.preflight import Media, check_account, check_wait_timeout
+from hushscript.transcribe.resume import ResumeState, encode_token
 from pipe import async_hs_for, hs_for, media
 from routes import async_hs_on, hs_on
 from test_billing import PURCHASE, Shop
@@ -138,8 +138,32 @@ def test_the_preflight_account_read_never_overflows(balance: float) -> None:
         "balance_seconds": balance,
         "limits": {"max_daily_seconds": balance, "used_today_seconds": 10**400},
     }
-    with contextlib.suppress(HushscriptError):
-        check_account(account, Media(size=1000, duration_seconds=60))
+    check_account(account, Media(size=1000, duration_seconds=60))
+    check_account(
+        {"limits": {"max_daily_seconds": 36000, "used_today_seconds": balance}},
+        Media(size=1000, duration_seconds=60),
+    )
+
+
+def test_an_out_of_range_daily_usage_does_not_prevent_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(used_today=10**400)
+    hs = hs_for(monkeypatch, api)
+    assert hs.transcribe(media(), duration_seconds=100).id
+    assert api.count("GET", "/v1/account") == 1
+    assert api.count("POST", "/v1/uploads") == 1
+
+
+@pytest.mark.anyio
+async def test_async_an_out_of_range_daily_usage_does_not_prevent_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(used_today=10**400)
+    hs = async_hs_for(monkeypatch, api)
+    assert (await hs.transcribe(media(), duration_seconds=100)).id
+    assert api.count("GET", "/v1/account") == 1
+    assert api.count("POST", "/v1/uploads") == 1
 
 
 # --- a stray failure after the send ---
@@ -299,63 +323,151 @@ class MineError(Exception):
     pass
 
 
-def test_an_error_from_on_resume_token_propagates_unchanged(
+@pytest.mark.parametrize(
+    ("operation", "callback", "throw_at"),
+    [
+        ("transcribe", "on_resume_token", 1),
+        ("transcribe", "on_progress", 1),
+        ("transcribe", "on_progress", 2),
+        ("resume", "on_progress", 1),
+        ("resume", "on_progress", 2),
+    ],
+)
+@pytest.mark.parametrize("sdk_error", [False, True])
+def test_callback_errors_propagate_unchanged_and_stop_requests(
     monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    callback: str,
+    throw_at: int,
+    *,
+    sdk_error: bool,
 ) -> None:
-    hs = hs_for(monkeypatch, FakeApi())
-    mine = MineError("mine")
+    api = FakeApi()
+    hs = hs_for(monkeypatch, api)
+    key = "k" * 24
+    token = encode_token(ResumeState("job_1", key, 9000, 100))
+    if operation == "resume":
+        api.jobs["job_1"] = Job("job_1", 9000, 3000, 3, key)
+        api.keys[key] = "job_1"
+    mine = nested_failure() if sdk_error else MineError("mine")
+    events: list[object] = []
+    requests_at_throw: list[httpx.Request] = []
 
-    def callback(_token: str) -> None:
-        raise mine
-
-    with pytest.raises(MineError) as raised:
-        hs.transcribe(media(), duration_seconds=100, on_resume_token=callback)
-    assert raised.value is mine
-
-
-def test_an_error_from_on_progress_after_the_send_propagates_unchanged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    hs = hs_for(monkeypatch, FakeApi())
-    mine = MineError("mine")
-    calls: list[object] = []
-
-    def callback(progress: object) -> None:
-        calls.append(progress)
-        if len(calls) > 1:  # the first event is before the create
+    def raiser(event: object) -> None:
+        events.append(event)
+        if len(events) == throw_at:
+            requests_at_throw.extend(api.requests)
             raise mine
 
-    with pytest.raises(MineError) as raised:
-        hs.transcribe(media(), duration_seconds=100, on_progress=callback)
+    def invoke() -> None:
+        if operation == "resume":
+            hs.resume(
+                token,
+                media(),
+                concurrency=1,
+                on_progress=raiser if callback == "on_progress" else None,
+            )
+        else:
+            hs.transcribe(
+                media(),
+                duration_seconds=100,
+                concurrency=1,
+                on_progress=raiser if callback == "on_progress" else None,
+                on_resume_token=raiser if callback == "on_resume_token" else None,
+            )
+
+    with pytest.raises(type(mine)) as raised:
+        invoke()
     assert raised.value is mine
+    assert len(events) == throw_at
+    assert api.requests == requests_at_throw
+    assert api.count("POST", "/v1/uploads") == (
+        0 if callback == "on_progress" and throw_at == 1 else 1
+    )
+    if callback == "on_progress" and throw_at == 1:
+        path = "/v1/jobs/job_1" if operation == "resume" else "/v1/account"
+        assert [(request.method, request.url.path) for request in api.requests] == [("GET", path)]
+    if isinstance(mine, HushscriptError):
+        assert (mine.code, mine.status, mine.idempotency_key, mine.resume_token) == (
+            "unexpected_error",
+            None,
+            "buy-key",
+            None,
+        )
 
 
 @pytest.mark.anyio
-async def test_async_an_error_from_a_callback_after_the_send_propagates_unchanged(
+@pytest.mark.parametrize(
+    ("operation", "callback", "throw_at"),
+    [
+        ("transcribe", "on_resume_token", 1),
+        ("transcribe", "on_progress", 1),
+        ("transcribe", "on_progress", 2),
+        ("resume", "on_progress", 1),
+        ("resume", "on_progress", 2),
+    ],
+)
+@pytest.mark.parametrize("sdk_error", [False, True])
+async def test_async_callback_errors_propagate_unchanged_and_stop_requests(
     monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    callback: str,
+    throw_at: int,
+    *,
+    sdk_error: bool,
 ) -> None:
-    mine = MineError("mine")
+    api = FakeApi()
+    hs = async_hs_for(monkeypatch, api)
+    key = "k" * 24
+    token = encode_token(ResumeState("job_1", key, 9000, 100))
+    if operation == "resume":
+        api.jobs["job_1"] = Job("job_1", 9000, 3000, 3, key)
+        api.keys[key] = "job_1"
+    mine = nested_failure() if sdk_error else MineError("mine")
+    events: list[object] = []
+    requests_at_throw: list[httpx.Request] = []
 
-    def on_token(_token: str) -> None:
-        raise mine
-
-    with pytest.raises(MineError) as raised:
-        await async_hs_for(monkeypatch, FakeApi()).transcribe(
-            media(), duration_seconds=100, on_resume_token=on_token
-        )
-    assert raised.value is mine
-    calls: list[object] = []
-
-    def on_progress(progress: object) -> None:
-        calls.append(progress)
-        if len(calls) > 1:
+    def raiser(event: object) -> None:
+        events.append(event)
+        if len(events) == throw_at:
+            requests_at_throw.extend(api.requests)
             raise mine
 
-    with pytest.raises(MineError) as raised:
-        await async_hs_for(monkeypatch, FakeApi()).transcribe(
-            media(), duration_seconds=100, on_progress=on_progress
-        )
+    async def invoke() -> None:
+        if operation == "resume":
+            await hs.resume(
+                token,
+                media(),
+                concurrency=1,
+                on_progress=raiser if callback == "on_progress" else None,
+            )
+        else:
+            await hs.transcribe(
+                media(),
+                duration_seconds=100,
+                concurrency=1,
+                on_progress=raiser if callback == "on_progress" else None,
+                on_resume_token=raiser if callback == "on_resume_token" else None,
+            )
+
+    with pytest.raises(type(mine)) as raised:
+        await invoke()
     assert raised.value is mine
+    assert len(events) == throw_at
+    assert api.requests == requests_at_throw
+    assert api.count("POST", "/v1/uploads") == (
+        0 if callback == "on_progress" and throw_at == 1 else 1
+    )
+    if callback == "on_progress" and throw_at == 1:
+        path = "/v1/jobs/job_1" if operation == "resume" else "/v1/account"
+        assert [(request.method, request.url.path) for request in api.requests] == [("GET", path)]
+    if isinstance(mine, HushscriptError):
+        assert (mine.code, mine.status, mine.idempotency_key, mine.resume_token) == (
+            "unexpected_error",
+            None,
+            "buy-key",
+            None,
+        )
 
 
 # --- R63: an SDK error from the caller's callback is the caller's too ---
@@ -608,8 +720,11 @@ def test_an_option_that_is_a_huge_int_is_judged_not_overflowed(wait_timeout: int
     if wait_timeout > 0:
         check_wait_timeout(wait_timeout)
     else:
-        with pytest.raises(HushscriptError):
+        with pytest.raises(PreflightError) as raised:
             check_wait_timeout(wait_timeout)
+        assert type(raised.value) is PreflightError
+        assert raised.value.code == "invalid_option"
+        assert raised.value.status is None
 
 
 @pytest.mark.parametrize("value", [10**400, -(10**400), float("nan"), float("inf"), 2**63])
@@ -673,3 +788,56 @@ def test_annotated_returns_what_the_block_returns_and_leaves_an_unsent_failure_a
     with pytest.raises(TypeError) as raised:
         pipeline_module.annotated(unsent, run)
     assert raised.value is mine
+
+
+@pytest.mark.parametrize("sdk_error", [False, True])
+def test_the_first_progress_callback_failure_prevents_create(
+    monkeypatch: pytest.MonkeyPatch, *, sdk_error: bool
+) -> None:
+    api = FakeApi()
+    hs = hs_for(monkeypatch, api)
+    mine = nested_failure() if sdk_error else MineError("mine")
+    events: list[object] = []
+
+    def callback(event: object) -> None:
+        events.append(event)
+        raise mine
+
+    with pytest.raises(type(mine)) as raised:
+        hs.transcribe(media(), duration_seconds=100, on_progress=callback)
+    assert raised.value is mine
+    assert len(events) == 1
+    assert api.count("POST", "/v1/uploads") == 0
+    assert [request.url.path for request in api.requests] == ["/v1/account"]
+    if isinstance(mine, HushscriptError):
+        assert mine.code == "unexpected_error"
+        assert mine.status is None
+        assert mine.idempotency_key == "buy-key"
+        assert mine.resume_token is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("sdk_error", [False, True])
+async def test_async_the_first_progress_callback_failure_prevents_create(
+    monkeypatch: pytest.MonkeyPatch, *, sdk_error: bool
+) -> None:
+    api = FakeApi()
+    hs = async_hs_for(monkeypatch, api)
+    mine = nested_failure() if sdk_error else MineError("mine")
+    events: list[object] = []
+
+    def callback(event: object) -> None:
+        events.append(event)
+        raise mine
+
+    with pytest.raises(type(mine)) as raised:
+        await hs.transcribe(media(), duration_seconds=100, on_progress=callback)
+    assert raised.value is mine
+    assert len(events) == 1
+    assert api.count("POST", "/v1/uploads") == 0
+    assert [request.url.path for request in api.requests] == ["/v1/account"]
+    if isinstance(mine, HushscriptError):
+        assert mine.code == "unexpected_error"
+        assert mine.status is None
+        assert mine.idempotency_key == "buy-key"
+        assert mine.resume_token is None

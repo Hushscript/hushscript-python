@@ -106,8 +106,8 @@ new one.
 
 A purchase is retried at most once, on a network error, a 502 or a 503, with the same idempotency
 key, so those retries cannot charge you twice. When `buy()` still gives up after the request was
-sent (the connection dropped twice, or the answer was not one the SDK can use), the card may have
-been charged. Every such error carries `idempotency_key`; ask again with it and the purchase can
+sent, the card may have been charged: this includes network failures, answers the SDK cannot
+use, a 401, a 429, any 403 other than codes 4021 and 4023, and any 5xx response. Every such error carries `idempotency_key`; ask again with it and the purchase can
 never happen twice:
 
 ```python
@@ -116,7 +116,9 @@ from hushscript import HushscriptError
 try:
     purchase = hs.buy("300min", acknowledge_no_refund=True)
 except HushscriptError as error:
-    refused = error.status in {400, 402, 403, 404, 422}
+    refused = error.status in {400, 402, 404, 422} or (
+        error.status == 403 and error.numeric_code in {4021, 4023}
+    )
     if error.idempotency_key is None or refused:
         raise  # only these refusals charged nothing; any other failure keeps the key for a retry
     purchase = hs.buy("300min", acknowledge_no_refund=True, idempotency_key=error.idempotency_key)

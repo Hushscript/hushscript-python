@@ -47,6 +47,7 @@ from hushscript._errors import (
 from hushscript._json import loads
 from hushscript._redact import Credentials
 from hushscript._response import json_body
+from hushscript.generated.catalog import ERROR_CATALOG
 
 
 def response(
@@ -115,9 +116,21 @@ def test_a_json_body_without_an_error_slug_still_maps_by_status() -> None:
     assert error.code == "http_404"
 
 
-def test_message_is_the_catalog_meaning() -> None:
-    error = error_from_response(response(401, error_body("unauthorized", 2000)))
-    assert "token" in error.message.lower() or error.message
+@pytest.mark.parametrize(
+    ("slug", "code", "status", "expected"),
+    [
+        ("unauthorized", 2000, 401, AuthenticationError),
+        ("insufficient_balance", 3001, 402, InsufficientBalanceError),
+        ("policy_version_stale", 1043, 422, ValidationError),
+    ],
+)
+def test_message_is_the_catalog_meaning(
+    slug: str, code: int, status: int, expected: type[HushscriptError]
+) -> None:
+    error = error_from_response(response(status, error_body(slug, code)))
+    assert type(error) is expected
+    assert (error.code, error.numeric_code, error.status) == (slug, code, status)
+    assert error.message == ERROR_CATALOG[slug].meaning
 
 
 def test_extra_body_keys_become_details_and_nested_details_merge() -> None:

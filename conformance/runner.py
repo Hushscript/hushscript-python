@@ -25,7 +25,7 @@ import httpx
 import hushscript
 import hushscript._client as client_module
 import hushscript._http as http_module
-from hushscript import Hushscript, HushscriptError
+from hushscript import AsyncHushscript, Hushscript, HushscriptError
 from hushscript._json import as_dict, as_list
 from hushscript.transcribe.probe import probe_duration
 from hushscript.transcribe.sniff import sniff
@@ -36,7 +36,7 @@ BASE_URL = "http://127.0.0.1:4010"
 TEST_TOKEN = "hsr1:eu:pat." + "0123456789abcdef" * 2 + "." + "fedcba9876543210" * 4
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator
 
 Json = Any
 Attempt = http_module._Attempt  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
@@ -95,7 +95,13 @@ class VirtualClock:
         return stop.is_set()
 
     async def asleep(self, seconds: float) -> None:
-        await asyncio.to_thread(self.sleep, seconds)
+        if seconds > 0:
+            timer = self._register(seconds)
+            try:
+                while not await asyncio.to_thread(timer.fired.wait, 0.005):
+                    pass
+            finally:
+                self._drop(timer)
 
     def earliest(self) -> float | None:
         with self._lock:
@@ -188,6 +194,44 @@ class CountingTransport(httpx.BaseTransport):
 
     def close(self) -> None:
         self._inner.close()
+
+
+class CountedAsyncStream(httpx.AsyncByteStream):
+    def __init__(self, inner: httpx.AsyncByteStream, hold: Hold) -> None:
+        self._inner = inner
+        self._hold = hold
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._inner:
+            yield chunk
+
+    async def aclose(self) -> None:
+        try:
+            await self._inner.aclose()
+        finally:
+            self._hold.release()
+
+
+class AsyncCountingTransport(httpx.AsyncBaseTransport):
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self._inner = inner
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        hold = request.extensions.pop(HOLD_EXTENSION, None)
+        try:
+            response = await self._inner.handle_async_request(request)
+        except BaseException:
+            if hold is not None:
+                hold.release()
+            raise
+        if hold is not None:
+            response.stream = CountedAsyncStream(
+                cast("httpx.AsyncByteStream", response.stream), hold
+            )
+        return response
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
 
 
 def counted_begin(
@@ -327,7 +371,7 @@ def _transcribe(hs: Hushscript, args: Json, files: Files) -> Json:
     return _transcript_result(dict(transcript.to_json()), transcript.text)
 
 
-def _probe(_hs: Hushscript, args: Json, files: Files) -> Json:
+def _probe(_hs: Hushscript | None, args: Json, files: Files) -> Json:
     tolerance = args["toleranceSeconds"]
     refuse = set(args.get("refuse", []))
     failures: list[Json] = []
@@ -369,7 +413,7 @@ def _get_transcript(hs: Hushscript, args: Json, _files: Files) -> Json:
     return _transcript_result(dict(transcript.to_json()), transcript.text)
 
 
-def _format(_hs: Hushscript, _args: Json, files: Files) -> Json:
+def _format(_hs: Hushscript | None, _args: Json, files: Files) -> Json:
     """Every golden rendered from its transcript fixture; a mismatch is the golden's file name.
     The files come from the mock and the SDK sends no request."""
     goldens = golden_table.all_goldens()
@@ -529,8 +573,24 @@ def check_error(expected: Json, error: BaseException) -> list[str]:
     return problems
 
 
-def unmapped_ops(call: Json) -> list[str]:
-    mapped = {*OPS, "resume"}
+ASYNC_OPS = frozenset(
+    {
+        "transcribe",
+        "resume",
+        "getTranscript",
+        "balance",
+        "buy",
+        "claim",
+        "rotate",
+        "listTranscripts",
+        "probe",
+        "format",
+    }
+)
+
+
+def unmapped_ops(call: Json, *, asynchronous: bool = False) -> list[str]:
+    mapped = ASYNC_OPS if asynchronous else {*OPS, "resume"}
     ops = [call["op"]]
     if "prior" in call:
         ops.append(call["prior"]["op"])
@@ -548,12 +608,71 @@ def _resume(hs: Hushscript, call: Json, files: Files, token: str | None) -> Json
     return _transcript_result(dict(transcript.to_json()), transcript.text)
 
 
-def run_scenario(  # noqa: C901
-    control: httpx.Client, name: str, scratch: Path, counter: InFlight
+async def _async_call(  # noqa: C901, PLR0911  # mirrors the scenario operation table
+    hs: AsyncHushscript, call: Json, files: Files, token: str | None
+) -> Json:
+    args = call.get("args", {})
+    op = call["op"]
+    if op in {"transcribe", "resume", "getTranscript"}:
+        if op == "transcribe":
+            transcript = await hs.transcribe(str(files[args["file"]]), **_options(args))
+        elif op == "resume":
+            transcript = await hs.resume(token or "", str(files[args["file"]]))
+        else:
+            transcript = await hs.transcripts.get(args["id"])
+        return _transcript_result(dict(transcript.to_json()), transcript.text)
+    if op == "balance":
+        balance = await hs.balance()
+        return {
+            "seconds": balance.seconds,
+            "minutes": balance.minutes,
+            "heldSeconds": balance.held_seconds,
+            "expiresAt": None if balance.expires_at is None else balance.expires_at.isoformat(),
+        }
+    if op == "buy":
+        purchase = await hs.buy(args["pack"])
+        return {"seconds": purchase.seconds, "minutes": purchase.minutes}
+    if op == "claim":
+        account = await AsyncHushscript.agent_claim(
+            args["signupId"],
+            args["claimSecret"],
+            base_url=BASE_URL,
+            clock=hs._clock,  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        )
+        return {
+            "userId": account.user_id,
+            "scopes": account.scopes,
+            "seconds": account.balance.seconds,
+        }
+    if op == "rotate":
+        rotated = await hs.agent.rotate_token()
+        return {"tokenId": rotated.token_id, "scopes": rotated.scopes}
+    if op == "listTranscripts":
+        rows = [row async for row in hs.transcripts.list(page_size=args.get("pageSize"))]
+        return {
+            "count": len(rows),
+            "firstId": rows[0].id if rows else None,
+            "lastId": rows[-1].id if rows else None,
+        }
+    # These fixture-only operations do not use a client.
+    if op == "probe":
+        return _probe(None, args, files)
+    if op == "format":
+        return _format(None, args, files)
+    raise ValueError(f"unknown async op: {op}")
+
+
+def run_scenario(  # noqa: C901, PLR0912, PLR0915  # both clients share the scenario checks
+    control: httpx.Client,
+    name: str,
+    scratch: Path,
+    counter: InFlight,
+    *,
+    asynchronous: bool = False,
 ) -> tuple[str, str]:
     scenario = control.get(f"/__files/scenarios/{name}.json").raise_for_status().json()
     call = scenario["call"]
-    missing = unmapped_ops(call)
+    missing = unmapped_ops(call, asynchronous=asynchronous)
     if missing:
         return "SKIP", f"op {', '.join(missing)} is not mapped yet"
     files = Files(control, scratch)
@@ -562,22 +681,42 @@ def run_scenario(  # noqa: C901
     clock = VirtualClock()
     counter.value = 0
     driver = Driver(control, clock, counter)
-    hs = Hushscript(TEST_TOKEN, base_url=BASE_URL, clock=clock)
+    hs = None if asynchronous else Hushscript(TEST_TOKEN, base_url=BASE_URL, clock=clock)
     expect = scenario["expect"]
     problems: list[str] = []
     token: str | None = None
+
+    async def invoke_async() -> Json:
+        nonlocal token
+        async with AsyncHushscript(TEST_TOKEN, base_url=BASE_URL, clock=clock) as ahs:
+            prior = call.get("prior")
+            if prior is not None:
+                try:
+                    await _async_call(ahs, prior, files, None)
+                except Exception as error:  # noqa: BLE001  # expected prior failure
+                    problems.extend(check_error(prior["expectError"], error))
+                    token = getattr(error, "resume_token", None)
+                else:
+                    problems.append("the prior call returned; it should have failed")
+            marked = await asyncio.to_thread(control.post, "/__mark")
+            marked.raise_for_status()
+            return await _async_call(ahs, call, files, token)
+
     try:
-        prior = call.get("prior")
-        if prior is not None:
-            try:
-                driver.run(lambda: OPS[prior["op"]](hs, prior.get("args", {}), files))
-            except Exception as error:  # noqa: BLE001  # the prior call is meant to fail
-                problems += check_error(prior["expectError"], error)
-                token = getattr(error, "resume_token", None)
-            else:
-                problems.append("the prior call returned; it should have failed")
-        control.post("/__mark").raise_for_status()
-        result = driver.run(lambda: _call(hs, call, files, token))
+        if hs is None:
+            result = driver.run(lambda: asyncio.run(invoke_async()))
+        else:
+            prior = call.get("prior")
+            if prior is not None:
+                try:
+                    driver.run(lambda: OPS[prior["op"]](hs, prior.get("args", {}), files))
+                except Exception as error:  # noqa: BLE001  # the prior call is meant to fail
+                    problems += check_error(prior["expectError"], error)
+                    token = getattr(error, "resume_token", None)
+                else:
+                    problems.append("the prior call returned; it should have failed")
+            control.post("/__mark").raise_for_status()
+            result = driver.run(lambda: _call(hs, call, files, token))
     except SDKStalledError:
         problems.append("SDK stalled")
     except Exception as error:  # noqa: BLE001  # every failure is compared with the expectation
@@ -591,7 +730,8 @@ def run_scenario(  # noqa: C901
         elif "result" in expect:
             problems += subset(expect["result"], result)
     finally:
-        hs.close()
+        if hs is not None:
+            hs.close()
     verdict = control.get("/__verify").raise_for_status().json()
     problems += [f"mock: {failure}" for failure in verdict["failures"]]
     return ("FAIL", "; ".join(problems)) if problems else ("PASS", "")
@@ -604,6 +744,9 @@ def main() -> int:
     client_module._sync_inner = lambda: CountingTransport(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         httpx.HTTPTransport()
     )
+    client_module._async_inner = lambda: AsyncCountingTransport(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        httpx.AsyncHTTPTransport()
+    )
     Attempt.begin = counted_begin(counter, Attempt.begin)  # type: ignore[method-assign,assignment]
     with (
         httpx.Client(base_url=BASE_URL, timeout=30) as control,
@@ -613,12 +756,20 @@ def main() -> int:
         if not names:
             print("the mock lists no scenarios", file=sys.stderr)
             return 1
-        for name in names:
-            status, reason = run_scenario(control, name, Path(tmp), counter)
-            if status == "SKIP" and strict:
-                status, reason = "FAIL", f"skipped in strict mode: {reason}"
-            counts[status] += 1
-            print(f"{status} {name}" + (f": {reason}" if reason else ""))
+        for asynchronous in (False, True):
+            mode = "async" if asynchronous else "sync"
+            for name in names:
+                status, reason = run_scenario(
+                    control,
+                    name,
+                    Path(tmp),
+                    counter,
+                    asynchronous=asynchronous,
+                )
+                if status == "SKIP" and strict:
+                    status, reason = "FAIL", f"skipped in strict mode: {reason}"
+                counts[status] += 1
+                print(f"{status} {mode}/{name}" + (f": {reason}" if reason else ""))
     print(f"{counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped")
     return 1 if counts["FAIL"] or counts["PASS"] == 0 else 0
 

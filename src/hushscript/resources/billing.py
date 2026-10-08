@@ -4,7 +4,7 @@ import asyncio
 import re
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, TypeVar
+from typing import TYPE_CHECKING, Final, TypeVar, cast
 
 from hushscript._errors import (
     HushscriptError,
@@ -25,7 +25,7 @@ from hushscript._shape import (
 from hushscript._shapes import CARDS, HOLDS, LEDGER, PACKS, PURCHASE, SETUP_SESSION, TRANSACTIONS
 from hushscript.money import Money, to_money
 from hushscript.paginate import Page, apaginate, paginate
-from hushscript.resources._params import list_params
+from hushscript.resources._params import list_params, path_id
 from hushscript.resources.account import minutes_of
 from hushscript.transcribe.preflight import invalid_option
 
@@ -340,9 +340,8 @@ async def sent_purchase_async(
 
 
 def check_card_id(card_id: object) -> str:
-    if not isinstance(card_id, str) or not card_id:
-        raise invalid_option("card_id is a saved card's id.")
-    return card_id
+    path_id(card_id)
+    return cast("str", card_id)
 
 
 class Billing:

@@ -26,7 +26,10 @@ REFUSALS = frozenset({400, 402, 403, 404, 422})
 
 def may_have_charged(error: HushscriptError) -> bool:
     """True when the purchase request went out and the answer was not one of the refusals."""
-    return error.idempotency_key is not None and error.status not in REFUSALS
+    refused = error.status in REFUSALS and (
+        error.status != 403 or error.numeric_code in {4021, 4023}
+    )
+    return error.idempotency_key is not None and not refused
 
 
 def report(error: HushscriptError) -> None:

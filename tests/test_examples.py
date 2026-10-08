@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -43,28 +44,50 @@ buy = load("buy")
 agent_signup = load("agent_signup")
 
 
-def sent_error(status: int | None, key: str | None) -> HushscriptError:
-    error = HushscriptError("failed", code="x", status=status)
+def sent_error(
+    status: int | None, key: str | None, numeric_code: int | None = None
+) -> HushscriptError:
+    error = HushscriptError("failed", code="x", status=status, numeric_code=numeric_code)
     error.idempotency_key = key
     return error
 
 
-@pytest.mark.parametrize("status", [400, 402, 403, 404, 422])
+@pytest.mark.parametrize(
+    ("status", "numeric_code"),
+    [(400, None), (402, None), (403, 4021), (403, 4023), (404, None), (422, None)],
+)
 def test_a_refusal_says_nothing_was_charged(
-    status: int, capsys: pytest.CaptureFixture[str]
+    status: int, numeric_code: int | None, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    buy.report(sent_error(status, "key-1"))
+    buy.report(sent_error(status, "key-1", numeric_code))
     err = capsys.readouterr().err
     assert "Nothing was charged." in err
     assert "may have been charged" not in err
     assert "--key" not in err
 
 
-@pytest.mark.parametrize("status", [None, 401, 408, 409, 429, 500, 502, 503, 200, 201])
+@pytest.mark.parametrize(
+    ("status", "numeric_code"),
+    [
+        (None, None),
+        (401, 2000),
+        (403, 4037),
+        (403, 2013),
+        (403, None),
+        (408, None),
+        (409, None),
+        (429, 5000),
+        (500, None),
+        (502, None),
+        (503, None),
+        (200, None),
+        (201, None),
+    ],
+)
 def test_any_other_outcome_after_the_send_says_it_may_have_been_charged(
-    status: int | None, capsys: pytest.CaptureFixture[str]
+    status: int | None, numeric_code: int | None, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    buy.report(sent_error(status, "key-1"))
+    buy.report(sent_error(status, "key-1", numeric_code))
     err = capsys.readouterr().err
     assert "The card may have been charged." in err
     assert "--key key-1" in err
@@ -327,8 +350,41 @@ def test_a_failure_after_a_saved_token_says_where_it_is(
     assert f"Any token that was issued is in {path}." in capsys.readouterr().err
 
 
-def test_the_readme_retry_snippet_refuses_what_the_buy_example_refuses() -> None:
+@pytest.mark.parametrize(
+    ("status", "numeric_code", "refused"),
+    [
+        (400, None, True),
+        (402, None, True),
+        (404, None, True),
+        (422, None, True),
+        (403, 4021, True),
+        (403, 4023, True),
+        (403, 4037, False),
+        (403, 2013, False),
+        (401, 2000, False),
+        (429, 5000, False),
+    ],
+)
+def test_the_readme_retry_snippet_pins_charge_refusals(
+    status: int,
+    numeric_code: int | None,
+    refused: bool,  # noqa: FBT001
+) -> None:
     readme = (EXAMPLES.parent / "README.md").read_text(encoding="utf-8")
-    match = re.search(r"refused = error\.status in \{([^}]*)\}", readme)
-    assert match is not None
-    assert {int(code) for code in match.group(1).split(",")} == set(buy.REFUSALS)
+    snippets = re.findall(r"```python\n(.*?)```", readme, re.DOTALL)
+    assignments = [
+        node
+        for snippet in snippets
+        for node in ast.walk(ast.parse(snippet))
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "refused" for target in node.targets)
+    ]
+    assert len(assignments) == 1
+    expression = ast.Expression(assignments[0].value)
+    assert (
+        eval(  # noqa: S307  # Execute the documented decision, never network calls.
+            compile(expression, "README.md", "eval"),
+            {"error": sent_error(status, "key-1", numeric_code), "__builtins__": {}},
+        )
+        is refused
+    )

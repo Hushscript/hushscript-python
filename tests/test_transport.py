@@ -5,6 +5,7 @@ import logging
 import httpx
 import pytest
 
+import hushscript._client as client_module
 from conftest import TOKEN
 from helpers import (
     BASE_URL,
@@ -16,7 +17,7 @@ from helpers import (
     settings_for,
     sync_client,
 )
-from hushscript import NetworkError, OutcomeUnknownError
+from hushscript import AsyncHushscript, Hushscript, NetworkError, OutcomeUnknownError
 from hushscript._http import (
     ANONYMOUS_EXTENSION,
     CLASS_EXTENSION,
@@ -24,10 +25,71 @@ from hushscript._http import (
     RetryingTransport,
 )
 from hushscript._retry import RetryClass
+from hushscript.generated.api.default import get_account
 
 RATE_LIMITED = error_body("rate_limited", 5000)
 CONNECT = httpx.ConnectError("refused")
 READ = httpx.ReadError("reset")
+
+
+@pytest.mark.parametrize(
+    ("method", "argument"),
+    [
+        ("with_timeout", httpx.Timeout(7)),
+        ("with_headers", {"X-Test": "1"}),
+        ("with_cookies", {"a": "b"}),
+    ],
+)
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.anyio
+async def test_a_derived_api_failure_leaves_the_token_out_of_sdk_request_locals(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    argument: object,
+    asynchronous: bool,  # noqa: FBT001
+) -> None:
+    failure = httpx.ReadError("reset")
+    script, clock = Script([failure]), FakeClock()
+    monkeypatch.setattr(client_module, "_sync_inner", script.sync)
+    monkeypatch.setattr(client_module, "_async_inner", script.asynchronous)
+    if asynchronous:
+        async with AsyncHushscript(TOKEN, base_url=BASE_URL, clock=clock) as async_hs:
+            derived = getattr(async_hs.api, method)(argument)
+            with pytest.raises(NetworkError) as raised:
+                await get_account.asyncio_detailed(client=derived)
+    else:
+        with Hushscript(TOKEN, base_url=BASE_URL, clock=clock) as sync_hs:
+            derived = getattr(sync_hs.api, method)(argument)
+            with pytest.raises(NetworkError) as raised:
+                get_account.sync_detailed(client=derived)
+    assert type(raised.value) is NetworkError
+    assert (raised.value.code, raised.value.status) == ("network_error", None)
+    assert raised.value.__cause__ is failure
+    assert script.calls == 4
+    assert len(clock.sleeps) == 3
+    assert all(request.headers["Authorization"] == f"Bearer {TOKEN}" for request in script.requests)
+    seen: set[int] = set()
+    delegation_seen = False
+    delegation_method = "handle_async_request" if asynchronous else "handle_request"
+    pending: list[BaseException] = [raised.value]
+    while pending:
+        error = pending.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        traceback = error.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            module = str(frame.f_globals.get("__name__", ""))
+            if module.split(".", maxsplit=1)[0] == "hushscript":
+                if module == "hushscript._client" and frame.f_code.co_name == delegation_method:
+                    delegation_seen = True
+                for name, value in frame.f_locals.items():
+                    if isinstance(value, httpx.Request):
+                        assert TOKEN not in value.headers.get("Authorization", ""), (module, name)
+            traceback = traceback.tb_next
+        pending.extend(part for part in (error.__cause__, error.__context__) if part)
+    assert delegation_seen
 
 
 def test_does_not_wait_for_a_retry_after_above_60_seconds() -> None:
@@ -361,9 +423,14 @@ def test_a_purchase_makes_at_most_two_calls_and_retries_only_502_and_503(
 
 def test_a_purchase_makes_at_most_two_calls_on_network_errors() -> None:
     script = Script([READ])
-    with sync_client(script, FakeClock(), max_retries=5) as client, pytest.raises(NetworkError):
-        client.post("/v1/billing/setup-session", json={})
+    with (
+        sync_client(script, FakeClock(), max_retries=5) as client,
+        pytest.raises(NetworkError) as raised,
+    ):
+        client.post("/v1/billing/purchase", json={"idempotency_key": "purchase-key"})
+    assert (raised.value.code, raised.value.status) == ("network_error", None)
     assert script.calls == 2
+    assert script.requests[0].content == script.requests[1].content
 
 
 @pytest.mark.parametrize("status", [501, 505, 507])
@@ -458,3 +525,38 @@ def test_a_token_unset_since_an_earlier_attempt_is_not_sent_on_the_retry() -> No
     ) as client:
         assert client.get("/v1/account").status_code == 200
     assert sent == [f"Bearer {TOKEN}", None]
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "status"),
+    [
+        ("POST", "/v1/agent/accounts/sg_1/claim", 503),
+        ("POST", "/v1/agent/credentials/rotate", 503),
+        ("POST", "/v1/agent/accounts", 503),
+        ("POST", "/v1/billing/purchase", 429),
+        ("POST", "/v1/billing/purchase", 500),
+        ("PATCH", "/v1/org/members/u1", 503),
+        ("GET", "/v1/jobs/missing", 404),
+    ],
+)
+@pytest.mark.parametrize("retry_after", ["1", "60"])
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_retry_after_cannot_make_a_forbidden_status_retryable(
+    method: str,
+    path: str,
+    status: int,
+    retry_after: str,
+    asynchronous: bool,  # noqa: FBT001
+) -> None:
+    script = Script([reply(status, headers={"Retry-After": retry_after}), reply(200, {})])
+    clock = FakeClock()
+    if asynchronous:
+        async with async_client(script, clock) as client:
+            response = await client.request(method, path, json={"idempotency_key": "k"})
+    else:
+        with sync_client(script, clock) as client:
+            response = client.request(method, path, json={"idempotency_key": "k"})
+    assert response.status_code == status
+    assert script.calls == 1
+    assert clock.sleeps == []

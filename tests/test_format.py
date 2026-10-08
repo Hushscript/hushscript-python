@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import itertools
 import json
 import os
+import re
 from pathlib import Path
 
 import golden_table
 import pytest
 from golden_table import Golden
+from hypothesis import given
+from hypothesis import strategies as st
 
 from helpers import transcript_body
 from hushscript import Transcript, Utterance
@@ -15,6 +19,7 @@ from hushscript.format import (
     MAX_CAPTION_LINES,
     MAX_CUE_MS,
     cue_text,
+    render_text,
     round_half_up,
     segment_captions,
     timestamp,
@@ -130,4 +135,84 @@ def test_an_arrow_in_the_text_cannot_make_a_timing_line() -> None:
     assert t.to_srt() == "1\n00:00:00,000 --> 00:00:01,000\na -> b -> c <i> & d"
     assert t.to_vtt() == (
         "WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.000\na --&gt; b ---&gt; c &lt;i> &amp; d\n"
+    )
+
+
+@given(
+    text=st.text(alphabet="abc <>-&\n\r😀", min_size=1, max_size=100),
+    start=st.integers(min_value=0, max_value=360_000_000),
+    duration=st.integers(min_value=0, max_value=100_000),
+)
+def test_uncaptioned_exports_preserve_text_and_escape_markup(
+    text: str, start: int, duration: int
+) -> None:
+    def clock(ms: int, separator: str) -> str:
+        hours = ms // 3_600_000
+        minutes = ms // 60_000 % 60
+        seconds = ms // 1000 % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}{separator}{ms % 1000:03d}"
+
+    body = transcript_body()
+    body["body"] = {
+        "original": {
+            "utterances": [
+                {"speaker": "", "start_ms": start, "end_ms": start + duration, "text": text}
+            ]
+        },
+        "translations": {},
+    }
+    result = Transcript.from_api(body)
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    clean = "\n".join(line for line in lines if line.strip(" \t"))
+    assert result.to_srt(captions=False) == (
+        f"1\n{clock(start, ',')} --> {clock(start + duration, ',')}\n"
+        + re.sub(r"-{2,}>", "->", clean)
+    )
+    assert result.to_vtt(captions=False) == (
+        f"WEBVTT\n\n1\n{clock(start, '.')} --> {clock(start + duration, '.')}\n"
+        + clean.replace("&", "&amp;").replace("<", "&lt;").replace("-->", "--&gt;")
+        + "\n"
+    )
+    assert result.to_text(speakers=False, merge=False) == text
+
+
+@given(
+    words=st.lists(st.text(alphabet="abc😀", min_size=1, max_size=50), min_size=1, max_size=50),
+    start=st.integers(min_value=0, max_value=1_000_000),
+    duration=st.integers(min_value=1, max_value=600_000),
+)
+def test_caption_cues_preserve_words_and_enforce_readability(
+    words: list[str], start: int, duration: int
+) -> None:
+    cues = segment_captions([utterance(" \n ".join(words), start, start + duration, "Dana")])
+    assert " ".join(cue.text.replace("\n", " ") for cue in cues).split() == words
+    assert cues[0].start_ms == start
+    assert all(cue.speaker_name == "Dana" for cue in cues)
+    assert all(start <= cue.start_ms <= cue.end_ms <= start + duration for cue in cues)
+    assert all(cue.end_ms - cue.start_ms <= 7000 for cue in cues)
+    assert [cue.start_ms for cue in cues] == sorted(cue.start_ms for cue in cues)
+    assert all(left.end_ms <= right.start_ms for left, right in itertools.pairwise(cues))
+    for cue in cues:
+        lines = cue.text.split("\n")
+        assert len(lines) <= 2
+        for line in lines:
+            units = len(line.encode("utf-16-le")) // 2
+            assert units <= 42 or len(line.split()) == 1
+
+
+@given(
+    labels=st.lists(st.sampled_from(["A", "B", ""]), min_size=1, max_size=30),
+)
+def test_text_merges_only_consecutive_equal_raw_speakers(labels: list[str]) -> None:
+    rows = [
+        Utterance(label, "Dana" if label else "", 0, 1000, str(i)) for i, label in enumerate(labels)
+    ]
+    groups: list[tuple[str, list[str]]] = []
+    for label, group in itertools.groupby(enumerate(labels), key=lambda pair: pair[1]):
+        groups.append((label, [str(i) for i, _ in group]))
+    assert render_text(rows) == "\n\n".join(
+        ("Dana: " if label else "") + " ".join(words) for label, words in groups
+    )
+    assert render_text(rows, speakers=False, merge=False) == "\n\n".join(
+        str(i) for i in range(len(labels))
     )

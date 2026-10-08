@@ -173,20 +173,32 @@ omit = ["*/hushscript/generated/*"]
 [tool.coverage.report]
 show_missing = true
 skip_covered = false
-exclude_also = ["if TYPE_CHECKING:", "@overload", "\\.\\.\\."]
+exclude_also = ["if TYPE_CHECKING:", "@overload", "^\\s*\\.\\.\\.\\s*$"]
 
 [tool.deptry]
 extend_exclude = ["build"]
 known_first_party = ["hushscript", "golden_table"]
 
 [tool.mutmut]
-source_paths = ["src/hushscript/_retry.py", "src/hushscript/_pacing.py", "src/hushscript/_http.py"]
-# The mutated modules import their siblings, so the whole package is copied next to them.
-also_copy = ["src/hushscript/"]
-pytest_add_cli_args_test_selection = [
-  "tests/test_retry.py",
-  "tests/test_transport.py",
-  "tests/test_transport_sent.py",
-  "tests/test_pacing.py",
-  "tests/test_client.py",
+source_paths = [
+  "src/hushscript/_retry.py",
+  "src/hushscript/_pacing.py",
+  "src/hushscript/_http.py",
+  "src/hushscript/transcribe/",
+  "src/hushscript/resources/billing.py",
 ]
+# The selected tests read SDK siblings, examples, generated inputs and gate configuration.
+also_copy = [
+  "src/hushscript/",
+  "conformance/",
+  "examples/",
+  "scripts/",
+  ".github/",
+  "openapi.json",
+  "README.md",
+  "justfile",
+  "compose.yaml",
+  "conformance-ref",
+  ".release-please-manifest.json",
+]
+pytest_add_cli_args_test_selection = ["tests/"]

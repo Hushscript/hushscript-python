@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
 
+import hushscript._client as client_module
 from conftest import TOKEN
-from hushscript import ConfigurationError, Hushscript
-from hushscript._config import SETUP_HINT, resolve_config
+from helpers import Script, reply
+from hushscript import AgentInfo, AsyncHushscript, ConfigurationError, Hushscript
+from hushscript._config import resolve_config
 from hushscript.generated.hints import HINTS
 
 
@@ -14,9 +17,11 @@ def test_refuses_construction_without_a_token_and_says_where_to_get_one() -> Non
     with pytest.raises(ConfigurationError, match="HUSHSCRIPT_TOKEN") as raised:
         Hushscript()
     assert raised.value.code == "config_invalid"
-    assert raised.value.hint is not None
-    assert raised.value.hint.startswith("Set HUSHSCRIPT_TOKEN or pass a token.")
-    assert "app.hushscript.com/account/mcp" in raised.value.hint
+    assert raised.value.status is None
+    assert raised.value.hint == (
+        "Set HUSHSCRIPT_TOKEN or pass a token. Create one in the Hushscript app: "
+        "Account → MCP (app.hushscript.com/account/mcp)."
+    )
 
 
 def test_missing_token_message_is_in_the_exception_text() -> None:
@@ -159,4 +164,129 @@ def test_only_the_missing_token_carries_a_hint() -> None:
         assert raised.value.hint is None
     with pytest.raises(ConfigurationError) as missing:
         resolve_config(env={})
-    assert missing.value.hint == SETUP_HINT
+    assert missing.value.code == "config_invalid"
+    assert missing.value.status is None
+    assert missing.value.hint == (
+        "Set HUSHSCRIPT_TOKEN or pass a token. Create one in the Hushscript app: "
+        "Account → MCP (app.hushscript.com/account/mcp)."
+    )
+
+
+@pytest.mark.parametrize("client", [Hushscript, AsyncHushscript])
+@pytest.mark.parametrize("token", ["", " \t\r\n", "hsr\x00bad", "hsr\x7fbad"])
+def test_public_constructors_refuse_invalid_tokens_before_requests(
+    client: type[Hushscript | AsyncHushscript],
+    token: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Script([reply(200, {})])
+    monkeypatch.setattr(client_module, "_sync_inner", script.sync)
+    monkeypatch.setattr(client_module, "_async_inner", script.asynchronous)
+    with pytest.raises(ConfigurationError) as raised:
+        client(token)
+    assert (raised.value.code, raised.value.status) == ("config_invalid", None)
+    assert script.requests == []
+
+
+@pytest.mark.parametrize("client", [Hushscript, AsyncHushscript])
+@pytest.mark.parametrize("environment", [False, True])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://api.example.com",
+        "https://api.example.com/path",
+        "https://api.example.com?q=1",
+        "https://api.example.com#fragment",
+    ],
+)
+def test_public_constructors_validate_base_urls_from_either_source(
+    client: type[Hushscript | AsyncHushscript],
+    *,
+    environment: bool,
+    url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Script([reply(200, {})])
+    monkeypatch.setattr(client_module, "_sync_inner", script.sync)
+    monkeypatch.setattr(client_module, "_async_inner", script.asynchronous)
+    if environment:
+        monkeypatch.setenv("HUSHSCRIPT_BASE_URL", url)
+    with pytest.raises(ConfigurationError) as raised:
+        client(TOKEN, base_url=None if environment else url)
+    assert (raised.value.code, raised.value.status) == ("config_invalid", None)
+    assert script.requests == []
+
+
+@pytest.mark.parametrize("client", [Hushscript, AsyncHushscript])
+def test_an_explicit_base_url_beats_the_environment(
+    client: type[Hushscript | AsyncHushscript],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HUSHSCRIPT_BASE_URL", "http://api.example.com")
+    script = Script([reply(200)])
+    monkeypatch.setattr(client_module, "_sync_inner", script.sync)
+    monkeypatch.setattr(client_module, "_async_inner", script.asynchronous)
+    hs = client(TOKEN, base_url="https://api.explicit.example")
+    assert hs._config.base_url == "https://api.explicit.example"  # pyright: ignore[reportPrivateUsage]
+    if isinstance(hs, AsyncHushscript):
+        asyncio.run(hs.aclose())
+    else:
+        hs.close()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("operation", ["signup", "claim"])
+@pytest.mark.parametrize("environment", [False, True])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://api.example.com",
+        "https://api.example.com/path",
+        "https://api.example.com?q=1",
+        "https://api.example.com#fragment",
+    ],
+)
+def test_tokenless_entry_points_validate_base_urls_before_requests(
+    *,
+    asynchronous: bool,
+    operation: str,
+    environment: bool,
+    url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Script([reply(200, {})])
+    monkeypatch.setattr(client_module, "_sync_inner", script.sync)
+    monkeypatch.setattr(client_module, "_async_inner", script.asynchronous)
+    if environment:
+        monkeypatch.setenv("HUSHSCRIPT_BASE_URL", url)
+    base_url = None if environment else url
+
+    def invoke() -> None:
+        if asynchronous:
+            if operation == "claim":
+                asyncio.run(AsyncHushscript.agent_claim("signup", "secret", base_url=base_url))
+            else:
+                asyncio.run(
+                    AsyncHushscript.agent_signup(
+                        email="agent@example.com",
+                        pack="45min",
+                        accept_terms="version",
+                        agent=AgentInfo(name="agent", platform="test"),
+                        base_url=base_url,
+                    )
+                )
+        elif operation == "claim":
+            Hushscript.agent_claim("signup", "secret", base_url=base_url)
+        else:
+            Hushscript.agent_signup(
+                email="agent@example.com",
+                pack="45min",
+                accept_terms="version",
+                agent=AgentInfo(name="agent", platform="test"),
+                base_url=base_url,
+            )
+
+    with pytest.raises(ConfigurationError) as raised:
+        invoke()
+    assert (raised.value.code, raised.value.status) == ("config_invalid", None)
+    assert script.requests == []

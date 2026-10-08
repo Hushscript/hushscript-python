@@ -59,7 +59,10 @@ class _SharedTransport(httpx.BaseTransport):
         self._inner = inner
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
-        return self._inner.handle_request(request)
+        try:
+            return self._inner.handle_request(request)
+        finally:
+            del request
 
     def close(self) -> None:
         """The owning `Hushscript` closes the transport."""
@@ -70,7 +73,10 @@ class _SharedAsyncTransport(httpx.AsyncBaseTransport):
         self._inner = inner
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        return await self._inner.handle_async_request(request)
+        try:
+            return await self._inner.handle_async_request(request)
+        finally:
+            del request
 
     async def aclose(self) -> None:
         """The owning `AsyncHushscript` closes the transport."""

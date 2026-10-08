@@ -142,10 +142,12 @@ async def test_the_async_client_reads_balance_and_account(monkeypatch: pytest.Mo
     assert (await hs.balance()).minutes == -1
     assert (await hs.account()).balance_seconds == -61
     hs, _ = async_hs_on(monkeypatch, lambda _request: reply(200, []))
-    with pytest.raises(ApiError):
+    with pytest.raises(ApiError) as balance_error:
         await hs.balance()
-    with pytest.raises(ApiError):
+    assert (balance_error.value.code, balance_error.value.status) == ("bad_response", 200)
+    with pytest.raises(ApiError) as account_error:
         await hs.account()
+    assert (account_error.value.code, account_error.value.status) == ("bad_response", 200)
 
 
 @pytest.mark.parametrize("content", [b"[" * 200_000, b"not json", b"\xff\xfe", b'{"a": NaN'])

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import threading
 import time
@@ -110,9 +111,9 @@ def test_every_direct_put_failing_before_any_success_falls_back_to_the_api(
 ) -> None:
     api = FakeApi(r2_hook=lambda _n, _attempt: httpx.Response(500, text="boom"))
     hs = hs_for(monkeypatch, api)
-    hs.transcribe(media(), duration_seconds=100)
+    hs.transcribe(media(), duration_seconds=100, concurrency=1)
     assert api.count("PUT", PARTS) == 3
-    assert api.count("PUT", R2) >= 1
+    assert api.count("PUT", R2) == 4
     assert _complete_body(api) == b""
     assert sorted(put.url.path.rsplit("/", 1)[1] for put in api.of("PUT", PARTS)) == ["1", "2", "3"]
 
@@ -140,6 +141,16 @@ def test_a_part_that_fails_all_its_rounds_raises_parts_exhausted(
     with pytest.raises(UploadError) as raised:
         hs.transcribe(media(), duration_seconds=100, concurrency=1)
     assert raised.value.code == "parts_exhausted"
+    assert raised.value.status is None
+    assert (
+        raised.value.idempotency_key
+        == json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"]
+    )
+    assert raised.value.resume_token == encode_token(
+        ResumeState(
+            "job_1", json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"], 9000, 100
+        )
+    )
     assert api.r2_calls[2] == 8
     assert api.count("GET", PART_URLS) == 1
     assert api.count("POST", COMPLETE) == 0
@@ -153,8 +164,19 @@ def test_a_failure_at_the_network_level_is_a_failed_round_too(
 
     api = FakeApi(r2_hook=hook)
     hs = hs_for(monkeypatch, api)
-    with pytest.raises(UploadError):
+    with pytest.raises(UploadError) as raised:
         hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    assert raised.value.code == "parts_exhausted"
+    assert raised.value.status is None
+    assert (
+        raised.value.idempotency_key
+        == json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"]
+    )
+    assert raised.value.resume_token == encode_token(
+        ResumeState(
+            "job_1", json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"], 9000, 100
+        )
+    )
     assert api.r2_calls[3] == 8
 
 
@@ -163,8 +185,8 @@ def test_expired_urls_are_refetched_and_the_upload_stays_direct(
 ) -> None:
     api = FakeApi(url_ttl_expired=True)
     hs = hs_for(monkeypatch, api)
-    hs.transcribe(media(), duration_seconds=100)
-    assert api.count("GET", PART_URLS) >= 1
+    hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    assert api.count("GET", PART_URLS) == 1
     assert api.count("PUT", PARTS) == 0
     assert api.direct_successes == 3
 
@@ -236,6 +258,15 @@ def test_complete_answering_upload_incomplete_is_an_upload_error(
         422,
         1041,
     )
+    assert (
+        raised.value.idempotency_key
+        == json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"]
+    )
+    assert raised.value.resume_token == encode_token(
+        ResumeState(
+            "job_1", json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"], 9000, 100
+        )
+    )
     assert api.count("POST", COMPLETE) == 1
 
 
@@ -259,7 +290,7 @@ def test_a_queued_job_is_polled_until_done(monkeypatch: pytest.MonkeyPatch) -> N
     hs.transcribe(media(), duration_seconds=100, on_progress=seen.append)
     assert clock.sleeps == [5.0, 7.5, 11.25]
     states = [p.state for p in seen if isinstance(p, ProcessingProgress)]
-    assert states == ["queued", "queued", "queued"] or len(states) == 3
+    assert states == ["queued", "queued", "queued"]
 
 
 def test_a_failed_job_raises_with_its_error_and_never_fetches_a_transcript(
@@ -333,11 +364,19 @@ def test_resume_of_an_upload_that_never_finished_needs_the_file(
     api = FakeApi(r2_hook=r2)
     hs = hs_for(monkeypatch, api)
     tokens: list[str] = []
-    with pytest.raises(UploadError):
+    with pytest.raises(UploadError) as exhausted:
         hs.transcribe(media(), duration_seconds=100, concurrency=1, on_resume_token=tokens.append)
+    assert exhausted.value.code == "parts_exhausted"
+    assert exhausted.value.status is None
+    assert exhausted.value.resume_token == tokens[0]
+    assert (
+        exhausted.value.idempotency_key
+        == json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"]
+    )
     with pytest.raises(ResumeMismatchError) as raised:
         hs.resume(tokens[0])
     assert raised.value.code == "resume_file_required"
+    assert raised.value.status is None
     broken["on"] = False
     assert hs.resume(tokens[0], media()).id
     assert len(api.jobs) == 1
@@ -350,9 +389,13 @@ def test_resume_of_an_upload_that_never_finished_needs_the_file(
 
 
 def test_a_resume_token_from_elsewhere_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
-    hs = hs_for(monkeypatch, FakeApi())
-    with pytest.raises(ConfigurationError):
+    api = FakeApi()
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(ConfigurationError) as raised:
         hs.resume("nonsense")
+    assert raised.value.code == "config_invalid"
+    assert raised.value.status is None
+    assert api.requests == []
 
 
 def test_a_create_without_retry_after_waits_15_seconds_and_keeps_its_key(
@@ -496,8 +539,14 @@ def test_a_file_that_is_not_media_is_refused_with_no_request(
 ) -> None:
     api = FakeApi()
     hs = hs_for(monkeypatch, api)
-    with pytest.raises(UnsupportedMediaError):
+    with pytest.raises(UnsupportedMediaError) as raised:
         hs.transcribe(b"\x1a\x45\xdf\xa3" + bytes(100), duration_seconds=60)
+    assert raised.value.code == "unsupported_media"
+    assert raised.value.status is None
+    assert raised.value.hint == (
+        "Supported: MP3, M4A/MP4/MOV, WAV, FLAC, OGG/Opus. "
+        "Convert it first, e.g. ffmpeg -i input -vn -c:a libopus output.opus"
+    )
     assert api.requests == []
 
 
@@ -906,3 +955,157 @@ def test_resume_still_refuses_a_stream_of_another_size(
         hs_for(monkeypatch, api).resume(token, OneWay(media(size)))
     assert raised.value.code == "stream_size_mismatch"
     assert api.count("POST", COMPLETE) == 0
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"idempotency_key": 123},
+        {"idempotency_key": True},
+        {"idempotency_key": []},
+        {"idempotency_key": "x" * 15},
+        {"idempotency_key": "x" * 129},
+        {"idempotency_key": "x" * 15 + " "},
+        {"idempotency_key": "x" * 15 + "é"},
+        {"duration_seconds": True},
+        {"duration_seconds": "20"},
+        {"duration_seconds": float("nan")},
+        {"duration_seconds": float("inf")},
+        {"duration_seconds": 0},
+        {"concurrency": True},
+        {"concurrency": 0},
+        {"concurrency": -1},
+        {"concurrency": 1.5},
+        {"concurrency": 9},
+        {"wait_timeout": True},
+        {"wait_timeout": 0},
+        {"wait_timeout": float("nan")},
+    ],
+)
+def test_invalid_transcribe_options_never_send_a_request(
+    monkeypatch: pytest.MonkeyPatch, options: dict[str, object]
+) -> None:
+    api = FakeApi()
+    hs = hs_for(monkeypatch, api)
+    kwargs = {"duration_seconds": 100, **options}
+    with pytest.raises(PreflightError) as raised:
+        hs.transcribe(media(), **kwargs)  # type: ignore[arg-type]
+    assert type(raised.value) is PreflightError
+    assert raised.value.code == "invalid_option"
+    assert raised.value.status is None
+    assert raised.value.idempotency_key is None
+    assert raised.value.resume_token is None
+    assert api.requests == []
+
+
+@pytest.mark.parametrize("token", [None, 123, True, [], {}, b"abc", "", "nonsense"])
+def test_malformed_resume_tokens_never_send_a_request(
+    monkeypatch: pytest.MonkeyPatch, token: object
+) -> None:
+    api = FakeApi()
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(ConfigurationError) as raised:
+        hs.resume(token)  # type: ignore[arg-type]
+    assert raised.value.code == "config_invalid"
+    assert raised.value.status is None
+    assert raised.value.hint is None
+    assert api.requests == []
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"concurrency": 0},
+        {"concurrency": -1},
+        {"concurrency": 9},
+        {"concurrency": 1.5},
+        {"concurrency": True},
+        {"wait_timeout": 0},
+        {"wait_timeout": True},
+    ],
+)
+def test_invalid_resume_options_never_send_a_request(
+    monkeypatch: pytest.MonkeyPatch, options: dict[str, object]
+) -> None:
+    api = FakeApi()
+    hs = hs_for(monkeypatch, api)
+    token = encode_token(ResumeState("job_1", "k" * 36, 9000, 100))
+    with pytest.raises(PreflightError) as raised:
+        hs.resume(token, **options)  # type: ignore[arg-type]
+    assert type(raised.value) is PreflightError
+    assert raised.value.code == "invalid_option"
+    assert raised.value.status is None
+    assert api.requests == []
+
+
+@pytest.mark.parametrize("key", ["!" * 16, "~" * 128])
+def test_upload_key_boundaries_are_sent_unchanged(
+    monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    api = FakeApi()
+    hs = hs_for(monkeypatch, api)
+    assert (hs.transcribe(media(), duration_seconds=15, concurrency=8, idempotency_key=key)).id
+    assert json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"] == key
+
+
+@pytest.mark.parametrize(("age", "refreshes"), [(23 * 3600, 0), (23 * 3600 + 1, 1)])
+def test_part_urls_refresh_only_after_23_hours(
+    monkeypatch: pytest.MonkeyPatch, age: int, refreshes: int
+) -> None:
+    clock = PipeClock()
+
+    def advance(n: int, _attempt: int) -> None:
+        if n == 1:
+            clock.sleep(age)
+
+    api = FakeApi(parts=2, r2_hook=advance)
+    hs = hs_for(monkeypatch, api, clock)
+    assert hs.transcribe(media(), duration_seconds=100, concurrency=1).id
+    assert api.count("GET", PART_URLS) == refreshes
+    assert api.count("PUT", R2) == 2
+    assert api.count("PUT", PARTS) == 0
+
+
+@pytest.mark.parametrize(
+    ("seconds", "accepted"), [(14.99, False), (15, True), (36000, True), (36000.01, False)]
+)
+def test_duration_boundaries_place_no_hold_on_refusal(
+    monkeypatch: pytest.MonkeyPatch, seconds: float, *, accepted: bool
+) -> None:
+    api = FakeApi()
+    hs = hs_for(monkeypatch, api)
+    if accepted:
+        assert (hs.transcribe(media(), duration_seconds=seconds)).id
+        assert json.loads(api.of("POST", CREATE)[0].content)["duration_seconds"] == seconds
+    else:
+        with pytest.raises(FileLimitError) as raised:
+            hs.transcribe(media(), duration_seconds=seconds)
+        assert raised.value.code == "duration_out_of_range"
+        assert raised.value.status is None
+        assert api.requests == []
+
+
+@pytest.mark.parametrize("size", [True, False, 0, -1, 1.5, "9000", float("nan"), float("inf")])
+def test_invalid_stream_sizes_never_send_a_request(
+    monkeypatch: pytest.MonkeyPatch, size: object
+) -> None:
+    api = FakeApi()
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(PreflightError) as raised:
+        hs.transcribe(io.BytesIO(media()), duration_seconds=100, size=size)  # type: ignore[arg-type]
+    assert type(raised.value) is PreflightError
+    assert raised.value.code == "invalid_option"
+    assert raised.value.status is None
+    assert api.requests == []
+
+
+def test_a_declared_stream_size_over_5_gb_sends_no_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi()
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(FileLimitError) as raised:
+        hs.transcribe(io.BytesIO(media()), size=5_000_000_001, duration_seconds=60)
+    assert raised.value.code == "size_out_of_range"
+    assert raised.value.status is None
+    assert api.requests == []

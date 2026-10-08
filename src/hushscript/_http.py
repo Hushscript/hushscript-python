@@ -110,6 +110,13 @@ def _slug_of(body: bytes) -> str | None:
     return slug if isinstance(slug, str) else None
 
 
+def release(request: httpx.Request) -> None:
+    """Lets go of the part's bytes. httpx ties a response to its request in a reference cycle that
+    only the garbage collector clears, which would keep every finished part alive for a while."""
+    request.stream = httpx.ByteStream(b"")
+    request._content = b""  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]  # httpx cached the body
+
+
 class _WrittenBody(httpx.SyncByteStream, httpx.AsyncByteStream):
     """Passes a request body through and notes when the last chunk has been handed to the socket."""
 
@@ -376,18 +383,22 @@ class RetryingTransport(httpx.BaseTransport):
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         attempt = _Attempt(request, self._settings)
+        del request
         try:
-            return self._run(attempt, request)
-        except HushscriptError as error:
-            attempt.stamp(error)
+            return self._run(attempt)
+        except BaseException as error:
+            if isinstance(error, HushscriptError):
+                attempt.stamp(error)
+            if attempt.retry_class is RetryClass.PART:
+                release(attempt.request)
             raise
 
-    def _run(self, attempt: _Attempt, request: httpx.Request) -> httpx.Response:
+    def _run(self, attempt: _Attempt) -> httpx.Response:
         while True:
             if (paced := attempt.pace()) > 0:
                 self._settings.clock.sleep(paced)
             attempt.begin()
-            decision, response = self._once(attempt, request)
+            decision, response = self._once(attempt)
             if response is not None:
                 if not decision.retry:
                     if (unusable := attempt.unusable(response)) is not None:
@@ -397,15 +408,13 @@ class RetryingTransport(httpx.BaseTransport):
                 response.close()
             self._settings.clock.sleep(decision.delay)
 
-    def _once(
-        self, attempt: _Attempt, request: httpx.Request
-    ) -> tuple[Decision, httpx.Response | None]:
+    def _once(self, attempt: _Attempt) -> tuple[Decision, httpx.Response | None]:
         """One attempt: what to do next and the response, if one came. Nothing but an SDK error
         leaves it (R61)."""
         unexpected: HushscriptError | None = None
         try:
             try:
-                response = self._send(attempt, request)
+                response = self._send(attempt)
             except httpx.RequestError as failure:
                 decision = attempt.judge(Outcome(failure=failure))
                 if not decision.retry:
@@ -422,8 +431,8 @@ class RetryingTransport(httpx.BaseTransport):
             unexpected = attempt.unexpected(failure)
         raise unexpected
 
-    def _send(self, attempt: _Attempt, request: httpx.Request) -> httpx.Response:
-        response = self._inner.handle_request(request)
+    def _send(self, attempt: _Attempt) -> httpx.Response:
+        response = self._inner.handle_request(attempt.request)
         attempt.answered = True
         try:
             attempt.read(response)
@@ -445,10 +454,14 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         attempt = _Attempt(request, self._settings)
+        del request
         try:
             return await self._run(attempt)
-        except HushscriptError as error:
-            attempt.stamp(error)
+        except BaseException as error:
+            if isinstance(error, HushscriptError):
+                attempt.stamp(error)
+            if attempt.retry_class is RetryClass.PART:
+                release(attempt.request)
             raise
 
     async def _run(self, attempt: _Attempt) -> httpx.Response:

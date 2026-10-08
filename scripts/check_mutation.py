@@ -12,8 +12,9 @@ FLOOR = 80.0
 def main(stats: str) -> int:
     data = json.loads(Path(stats).read_text(encoding="utf-8"))
     killed = data["killed"]
-    judged = killed + data["survived"] + data.get("timeout", 0) + data.get("suspicious", 0)
-    score = 100.0 * killed / judged if judged else 100.0
+    statuses = sum(count for status, count in data.items() if status != "total")
+    judged = max(data.get("total", 0), statuses)
+    score = 100.0 * killed / judged if judged else 0.0
     print(f"mutation score {score:.1f}% ({killed} killed of {judged}, floor {FLOOR})")
     return 0 if score >= FLOOR else 1
 

@@ -16,7 +16,7 @@ import pytest
 
 from conftest import TOKEN
 from helpers import FakeClock
-from hushscript import AsyncHushscript, Hushscript, HushscriptError
+from hushscript import AsyncHushscript, Hushscript, NetworkError, OutcomeUnknownError
 from hushscript._client import _async_inner, _sync_inner
 
 if TYPE_CHECKING:
@@ -127,8 +127,8 @@ def server(request: pytest.FixtureRequest) -> Iterator[Server]:
 WARM = ("GET", "/v1/account")
 
 
-def client(server: Server) -> Hushscript:
-    return Hushscript(TOKEN, base_url=server.base_url, clock=FakeClock(), max_retries=3)
+def client(server: Server, *, max_retries: int = 3) -> Hushscript:
+    return Hushscript(TOKEN, base_url=server.base_url, clock=FakeClock(), max_retries=max_retries)
 
 
 def raw_post(hs: Hushscript, path: str, body: dict[str, object]) -> None:
@@ -136,6 +136,7 @@ def raw_post(hs: Hushscript, path: str, body: dict[str, object]) -> None:
 
 
 MUTATIONS = {
+    "purchase": ("POST", "/v1/billing/purchase"),
     "rotate": ("POST", "/v1/agent/credentials/rotate"),
     "org mutation": ("POST", "/v1/orgs/org_1/members"),
     "unkeyed create": ("POST", "/v1/uploads"),
@@ -143,6 +144,8 @@ MUTATIONS = {
 
 
 def body_for(path: str) -> dict[str, object]:
+    if path == "/v1/billing/purchase":
+        return {"pack": "300min", "idempotency_key": "socket_purchase_key"}
     return {"size_bytes": 1000, "duration_seconds": 60} if path == "/v1/uploads" else {}
 
 
@@ -158,11 +161,18 @@ def send(hs: Hushscript, name: str) -> None:
 def test_a_mutation_on_a_connection_that_dies_after_the_body_is_sent_once(
     server: Server, name: str
 ) -> None:
-    hs = client(server)
+    hs = client(server, max_retries=0 if name == "purchase" else 3)
     hs.balance()  # warms the connection every later request would be pooled on
     method, path = MUTATIONS[name]
-    with pytest.raises(HushscriptError):
+    expected = OutcomeUnknownError if name == "rotate" else NetworkError
+    with pytest.raises(expected) as raised:
         send(hs, name)
+    assert (raised.value.code, raised.value.status) == (
+        "outcome_unknown" if name == "rotate" else "network_error",
+        None,
+    )
+    if name == "purchase":
+        assert raised.value.idempotency_key == body_for(path)["idempotency_key"]
     assert server.count(*WARM) == 1
     assert server.count(method, path) == 1
     assert server.connections_of(method, path) == server.connections_of(*WARM)  # the warm one
@@ -191,11 +201,23 @@ async def send_async(hs: AsyncHushscript, name: str) -> None:
 async def test_async_a_mutation_on_a_connection_that_dies_after_the_body_is_sent_once(
     server: Server, name: str
 ) -> None:
-    hs = AsyncHushscript(TOKEN, base_url=server.base_url, clock=FakeClock(), max_retries=3)
+    hs = AsyncHushscript(
+        TOKEN,
+        base_url=server.base_url,
+        clock=FakeClock(),
+        max_retries=0 if name == "purchase" else 3,
+    )
     await hs.balance()
     method, path = MUTATIONS[name]
-    with pytest.raises(HushscriptError):
+    expected = OutcomeUnknownError if name == "rotate" else NetworkError
+    with pytest.raises(expected) as raised:
         await send_async(hs, name)
+    assert (raised.value.code, raised.value.status) == (
+        "outcome_unknown" if name == "rotate" else "network_error",
+        None,
+    )
+    if name == "purchase":
+        assert raised.value.idempotency_key == body_for(path)["idempotency_key"]
     assert server.count(*WARM) == 1
     assert server.count(method, path) == 1
     assert server.connections_of(method, path) == server.connections_of(*WARM)

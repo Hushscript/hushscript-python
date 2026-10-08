@@ -147,9 +147,11 @@ def test_an_unusable_signup_answer_is_bad_response(
 def test_a_signup_is_never_retried_and_a_lost_answer_is_outcome_unknown_without_a_hint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    routes = static(monkeypatch, lambda _r: reply(503))
-    with pytest.raises(ApiError):
+    routes = static(monkeypatch, lambda _r: reply(503, error_body("internal_error", 9000)))
+    with pytest.raises(ApiError) as refusal:
         signup()
+    assert type(refusal.value) is ApiError
+    assert (refusal.value.code, refusal.value.status) == ("internal_error", 503)
     assert len(routes.requests) == 1
 
     def lost(_request: httpx.Request) -> httpx.Response:
@@ -159,6 +161,8 @@ def test_a_signup_is_never_retried_and_a_lost_answer_is_outcome_unknown_without_
     with pytest.raises(OutcomeUnknownError) as raised:
         signup()
     assert raised.value.hint is None
+    assert (raised.value.code, raised.value.status) == ("outcome_unknown", None)
+    assert isinstance(raised.value.__cause__, httpx.ReadError)
     assert len(routes.requests) == 1
 
 
@@ -173,8 +177,8 @@ def test_a_policy_version_error_quotes_the_current_version(monkeypatch: pytest.M
     with pytest.raises(ValidationError) as raised:
         signup()
     assert raised.value.details == {"current_version": "2026-11-01"}
-    assert raised.value.hint
-    assert "2026-11-01" in raised.value.hint
+    assert (raised.value.code, raised.value.status) == ("policy_version_stale", 422)
+    assert raised.value.hint == ("Accept the current terms version: 2026-11-01.")
 
 
 # --- claim ---
@@ -201,13 +205,14 @@ def test_a_claim_before_the_checkout_is_paid_is_a_conflict_without_the_job_hint(
     assert raised.value.hint is None
 
 
-@pytest.mark.parametrize("signup_id", ["", ".", "..", "\ud800", None])
+@pytest.mark.parametrize("signup_id", ["", ".", "..", "\ud800", None, 42])
 def test_a_signup_id_that_cannot_be_a_path_segment_is_refused(
     monkeypatch: pytest.MonkeyPatch, signup_id: object
 ) -> None:
     routes = static(monkeypatch, lambda _r: reply(201, CLAIMED))
-    with pytest.raises(PreflightError):
+    with pytest.raises(PreflightError) as raised:
         Hushscript.agent_claim(signup_id, "s", base_url=BASE_URL)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+    assert (raised.value.code, raised.value.status) == ("invalid_option", None)
     assert routes.requests == []
 
 
@@ -634,3 +639,56 @@ def test_a_pat_with_a_lone_surrogate_in_a_rotation_is_never_stored_and_breaks_no
         hs.balance()
     assert later.value.status == 500
     assert routes.requests[1].headers["authorization"] == f"Bearer {TOKEN}"
+
+
+@pytest.mark.parametrize("signup_id", ["", ".", "..", "\ud800", None, 42, 5])
+@pytest.mark.anyio
+async def test_async_claim_ids_are_invalid_before_any_request(
+    monkeypatch: pytest.MonkeyPatch, signup_id: object
+) -> None:
+    routes = static(monkeypatch, lambda _r: reply(201, CLAIMED))
+    with pytest.raises(PreflightError) as raised:
+        await AsyncHushscript.agent_claim(signup_id, "s", base_url=BASE_URL)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+    assert (raised.value.code, raised.value.status) == ("invalid_option", None)
+    assert routes.requests == []
+
+
+@pytest.mark.anyio
+async def test_async_claim_encodes_the_signup_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    routes = static(monkeypatch, lambda _r: reply(201, CLAIMED))
+    await AsyncHushscript.agent_claim("a/b?c#d", "s", base_url=BASE_URL)
+    assert routes.requests[0].url.raw_path == b"/v1/agent/accounts/a%2Fb%3Fc%23d/claim"
+
+
+@pytest.mark.anyio
+async def test_async_signup_refusals_and_lost_answers_are_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def call() -> object:
+        return await AsyncHushscript.agent_signup(
+            email="a@b.c",
+            pack="45min",
+            accept_terms="2026-10-01",
+            agent=AGENT,
+            base_url=BASE_URL,
+        )
+
+    routes = static(monkeypatch, lambda _r: reply(503, error_body("internal_error", 9000)))
+    with pytest.raises(ApiError) as raised:
+        await call()
+    assert type(raised.value) is ApiError
+    assert (raised.value.code, raised.value.status) == ("internal_error", 503)
+    assert len(routes.requests) == 1
+
+    failure = httpx.ReadError("lost")
+
+    def lost(_r: httpx.Request) -> httpx.Response:
+        raise failure
+
+    routes = static(monkeypatch, lost)
+    with pytest.raises(OutcomeUnknownError) as unknown:
+        await call()
+    assert (unknown.value.code, unknown.value.status) == ("outcome_unknown", None)
+    assert unknown.value.hint is None
+    assert unknown.value.__cause__ is failure
+    assert len(routes.requests) == 1

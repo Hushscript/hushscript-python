@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+
 import pytest
 
 from hushscript import (
@@ -15,7 +17,7 @@ from hushscript.transcribe.preflight import (
     check_media,
     create_body,
 )
-from hushscript.transcribe.source import BytesSource
+from hushscript.transcribe.source import BytesSource, SeekableSource
 from pipe import media
 
 MP3 = media(4000)
@@ -127,9 +129,26 @@ def test_a_file_that_is_not_media_is_refused_by_its_bytes() -> None:
     assert "ffmpeg -i input -vn -c:a libopus output.opus" in raised.value.hint
 
 
-def test_an_empty_file_is_out_of_range() -> None:
-    with pytest.raises(UnsupportedMediaError):
+def test_an_empty_file_is_refused_by_its_bytes() -> None:
+    with pytest.raises(UnsupportedMediaError) as raised:
         check_media(BytesSource(b""), Options(duration_seconds=60))
+    assert raised.value.code == "unsupported_media"
+    assert raised.value.status is None
+
+
+def test_the_size_lower_bound_is_checked_after_supported_magic() -> None:
+    class HeaderStream(SeekableSource):
+        def head(self) -> bytes:
+            return self.read_range(0, 100)
+
+    source = HeaderStream(io.BytesIO(MP3), size=0)
+    with pytest.raises(FileLimitError) as raised:
+        check_media(source, Options(duration_seconds=60))
+    assert raised.value.code == "size_out_of_range"
+    assert raised.value.status is None
+    assert (
+        check_media(HeaderStream(io.BytesIO(MP3), size=1), Options(duration_seconds=60)).size == 1
+    )
 
 
 @pytest.mark.parametrize("seconds", [14, 36_001])
@@ -146,15 +165,14 @@ def test_the_limits_are_inclusive() -> None:
     )
 
 
-def test_a_file_past_5_gb_is_a_size_limit() -> None:
-    class Huge(BytesSource):
-        def __init__(self) -> None:
-            super().__init__(MP3)
-            self.size = 5_000_000_001
-
+def test_declared_stream_size_stops_at_5_gb() -> None:
+    source = SeekableSource(io.BytesIO(MP3), size=5_000_000_000)
+    assert check_media(source, Options(duration_seconds=60)).size == 5_000_000_000
+    source = SeekableSource(io.BytesIO(MP3), size=5_000_000_001)
     with pytest.raises(FileLimitError) as raised:
-        check_media(Huge(), Options(duration_seconds=60))
+        check_media(source, Options(duration_seconds=60))
     assert raised.value.code == "size_out_of_range"
+    assert raised.value.status is None
 
 
 def test_an_mp3_with_no_readable_duration_asks_for_one() -> None:

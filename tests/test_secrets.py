@@ -32,6 +32,7 @@ from hushscript import (
     Purchase,
     RotatedToken,
     UploadError,
+    ValidationError,
 )
 from hushscript._redact import REDACTED, Credentials, Secret
 from hushscript.money import to_money
@@ -162,19 +163,26 @@ def test_the_client_and_the_objects_it_returns_print_no_token(
 def test_a_token_in_an_error_message_is_redacted_whatever_its_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    hs, _ = hs_on(
-        monkeypatch,
-        lambda _r: httpx.Response(
-            400, json={"error": "bad_request", "code": 1, "details": {"echo": TOKEN}}
-        ),
-    )
-    with pytest.raises(Exception) as raised:  # noqa: PT011
-        hs.buy("300min")
-    texts: list[Any] = [
-        str(raised.value),
-        repr(raised.value),
-        repr(getattr(raised.value, "details", {})),
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/billing/cards":
+            return reply(200, {"default_id": "pm_1", "methods": []})
+        assert request.url.path == "/v1/billing/purchase"
+        return reply(400, {"error": "bad_request", "code": 1, "details": {"echo": TOKEN}})
+
+    hs, routes = hs_on(monkeypatch, handler)
+    with pytest.raises(ValidationError) as raised:
+        hs.buy("300min", idempotency_key="redaction_key")
+    assert (raised.value.code, raised.value.status) == ("bad_request", 400)
+    assert [request.url.path for request in routes.requests] == [
+        "/v1/billing/cards",
+        "/v1/billing/purchase",
     ]
+    assert (
+        raised.value.idempotency_key
+        == json.loads(routes.requests[-1].content)["idempotency_key"]
+        == "redaction_key"
+    )
+    texts = [str(raised.value), repr(raised.value), repr(raised.value.details)]
     assert all(TOKEN not in text for text in texts)
 
 
@@ -239,13 +247,17 @@ def sdk_locals(error: BaseException) -> Iterator[tuple[str, str, object]]:
 
 
 def holds_text(value: object, secret: str, depth: int = 0) -> bool:
-    """Whether `value` is, or is a plain container of, text that carries `secret`."""
+    """Whether a local carries plain secret text, including HTTP request and URL holders."""
     if depth > 6:  # a frame local nests a few levels at most
         return False
-    if isinstance(value, str):
-        return secret in value
-    if isinstance(value, bytes):
-        return secret.encode() in value
+    if isinstance(value, httpx.Request):
+        return (
+            holds_text(value.url, secret, depth + 1)
+            or holds_text(dict(value.headers), secret, depth + 1)
+            or holds_text(value.content, secret, depth + 1)
+        )
+    if isinstance(value, (str, bytes, httpx.URL)):
+        return secret.encode() in value if isinstance(value, bytes) else secret in str(value)
     if isinstance(value, dict):
         pairs = cast("dict[object, object]", value)
         return any(
@@ -255,6 +267,34 @@ def holds_text(value: object, secret: str, depth: int = 0) -> bool:
     if isinstance(value, (list, tuple, set, frozenset)):
         return any(holds_text(part, secret, depth + 1) for part in cast("Iterable[object]", value))
     return False
+
+
+@pytest.mark.parametrize(
+    ("value", "secret", "expected"),
+    [
+        pytest.param(httpx.URL(SIGNED), "SIGNED-SECRET", True, id="url"),
+        pytest.param(httpx.Request("PUT", SIGNED), "SIGNED-SECRET", True, id="request-url"),
+        pytest.param(
+            httpx.Request("GET", BASE_URL, headers={"Authorization": f"Bearer {PAT}"}),
+            PAT,
+            True,
+            id="request-header",
+        ),
+        pytest.param(
+            httpx.Request("POST", BASE_URL, json={"claim_secret": CLAIM_SECRET}),
+            CLAIM_SECRET,
+            True,
+            id="request-body",
+        ),
+        pytest.param(Secret(SIGNED), "SIGNED-SECRET", False, id="secret-holder"),
+    ],
+)
+def test_the_frame_probe_detects_plain_http_secrets(
+    value: object,
+    secret: str,
+    expected: bool,  # noqa: FBT001  # detector expectation
+) -> None:
+    assert holds_text(value, secret) is expected
 
 
 def assert_no_plain_secret(error: BaseException, *secrets: str) -> None:
@@ -280,6 +320,7 @@ def test_a_failure_while_putting_a_part_leaves_the_signed_url_out_of_sdk_frames(
     hs = hs_for(monkeypatch, api)
     with pytest.raises(UploadError) as raised:
         hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    assert (raised.value.code, raised.value.status) == ("etag_missing", None)
     url = signed_url_of(api)
     assert "sig=" in url
     assert_no_plain_secret(raised.value, url, url.split("?")[1])
@@ -293,8 +334,42 @@ async def test_the_asyncio_upload_leaves_the_signed_url_out_of_sdk_frames_too(
     hs = async_hs_for(monkeypatch, api)
     with pytest.raises(UploadError) as raised:
         await hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    assert (raised.value.code, raised.value.status) == ("etag_missing", None)
     url = signed_url_of(api)
     assert_no_plain_secret(raised.value, url, url.split("?")[1])
+
+
+def refuse_part(_n: int, _attempt: int) -> httpx.Response:
+    return reply(400, {"error": "bad_request", "code": 1000})
+
+
+def test_a_proxied_part_failure_leaves_the_token_out_of_sdk_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(proxied=True, part_hook=refuse_part)
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(ValidationError) as raised:
+        hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    assert (raised.value.code, raised.value.status) == ("bad_request", 400)
+    parts = api.of("PUT", r"/v1/uploads/[^/]+/parts/[^/]+")
+    assert len(parts) == 1
+    assert parts[0].headers["Authorization"] == f"Bearer {TOKEN}"
+    assert_no_plain_secret(raised.value, TOKEN)
+
+
+@pytest.mark.anyio
+async def test_an_asyncio_proxied_part_failure_leaves_the_token_out_of_sdk_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(proxied=True, part_hook=refuse_part)
+    hs = async_hs_for(monkeypatch, api)
+    with pytest.raises(ValidationError) as raised:
+        await hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    assert (raised.value.code, raised.value.status) == ("bad_request", 400)
+    parts = api.of("PUT", r"/v1/uploads/[^/]+/parts/[^/]+")
+    assert len(parts) == 1
+    assert parts[0].headers["Authorization"] == f"Bearer {TOKEN}"
+    assert_no_plain_secret(raised.value, TOKEN)
 
 
 def test_a_claim_answer_the_sdk_cannot_use_leaves_the_token_out_of_sdk_frames(
@@ -347,6 +422,7 @@ def test_a_claim_that_fails_leaves_the_claim_secret_out_of_sdk_frames(
     with pytest.raises(NetworkError) as raised:
         Hushscript.agent_claim("sg_1", CLAIM_SECRET, base_url=BASE_URL, clock=FakeClock())
     assert json.loads(routes.requests[0].content) == {"claim_secret": CLAIM_SECRET}
+    assert (raised.value.code, raised.value.status) == ("network_error", None)
     assert_no_plain_secret(raised.value, CLAIM_SECRET)
 
 
@@ -363,6 +439,7 @@ async def test_an_asyncio_claim_that_fails_leaves_the_claim_secret_out_of_sdk_fr
         await AsyncHushscript.agent_claim(
             "sg_1", CLAIM_SECRET, base_url=BASE_URL, clock=FakeClock()
         )
+    assert (raised.value.code, raised.value.status) == ("network_error", None)
     assert_no_plain_secret(raised.value, CLAIM_SECRET)
 
 

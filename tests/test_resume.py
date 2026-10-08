@@ -65,6 +65,8 @@ def _token(payload: object) -> str:
 def test_a_token_that_is_not_ours_is_refused(token: str) -> None:
     with pytest.raises(ConfigurationError) as raised:
         decode_token(token)
+    assert raised.value.code == "config_invalid"
+    assert raised.value.status is None
     assert raised.value.hint is None
 
 

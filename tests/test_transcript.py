@@ -109,35 +109,66 @@ def _without(body: dict[str, object], key: str) -> dict[str, object]:
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "problem"),
     [
-        [],
-        None,
-        _without(transcript_body(), "created_at"),
-        _without(transcript_body(), "id"),
-        transcript_body(created_at="1700000000"),
-        transcript_body(created_at=True),
-        transcript_body(created_at=-1),
-        transcript_body(created_at=10**30),
-        transcript_body(created_at=1.5),
-        transcript_body(duration_seconds=1.5),
-        transcript_body(duration_seconds=-1),
-        transcript_body(tags=[1]),
-        transcript_body(speaker_names=[]),
-        transcript_body(speaker_names={"A": 1}),
-        transcript_body(edited="yes"),
-        transcript_body(body={"original": {"utterances": []}}),
-        transcript_body(body={"original": {}, "translations": {}}),
-        _body([{"speaker": "A", "start_ms": float("nan"), "end_ms": 1, "text": "x"}]),
-        _body([{"speaker": "A", "start_ms": 0, "end_ms": float("inf"), "text": "x"}]),
-        _body([{"speaker": "A", "start_ms": True, "end_ms": 1, "text": "x"}]),
-        _body([{"speaker": 1, "start_ms": 0, "end_ms": 1, "text": "x"}]),
-        _body([_utterance("A", "x")], translations={"es": {"utterances": "none"}}),
+        ([], "expected an object"),
+        (None, "expected an object"),
+        (_without(transcript_body(), "created_at"), "created_at: expected a value"),
+        (_without(transcript_body(), "id"), "id: expected a value"),
+        (
+            transcript_body(created_at="1700000000"),
+            "created_at: expected a unix timestamp in seconds",
+        ),
+        (transcript_body(created_at=True), "created_at: expected a unix timestamp in seconds"),
+        (transcript_body(created_at=-1), "created_at: expected a unix timestamp in seconds"),
+        (transcript_body(created_at=10**30), "created_at: expected a unix timestamp in seconds"),
+        (transcript_body(created_at=1.5), "created_at: expected a unix timestamp in seconds"),
+        (
+            transcript_body(duration_seconds=1.5),
+            "duration_seconds: expected a whole number of 0 or more",
+        ),
+        (
+            transcript_body(duration_seconds=-1),
+            "duration_seconds: expected a whole number of 0 or more",
+        ),
+        (transcript_body(tags=[1]), "tags[0]: expected a string"),
+        (transcript_body(speaker_names=[]), "speaker_names: expected an object"),
+        (transcript_body(speaker_names={"A": 1}), "speaker_names.A: expected a string"),
+        (transcript_body(edited="yes"), "edited: expected a boolean"),
+        (
+            transcript_body(body={"original": {"utterances": []}}),
+            "body.translations: expected a value",
+        ),
+        (
+            transcript_body(body={"original": {}, "translations": {}}),
+            "body.original.utterances: expected a value",
+        ),
+        (
+            _body([{"speaker": "A", "start_ms": float("nan"), "end_ms": 1, "text": "x"}]),
+            "body.original.utterances[0].start_ms: expected a number",
+        ),
+        (
+            _body([{"speaker": "A", "start_ms": 0, "end_ms": float("inf"), "text": "x"}]),
+            "body.original.utterances[0].end_ms: expected a number",
+        ),
+        (
+            _body([{"speaker": "A", "start_ms": True, "end_ms": 1, "text": "x"}]),
+            "body.original.utterances[0].start_ms: expected a number",
+        ),
+        (
+            _body([{"speaker": 1, "start_ms": 0, "end_ms": 1, "text": "x"}]),
+            "body.original.utterances[0].speaker: expected a string",
+        ),
+        (
+            _body([_utterance("A", "x")], translations={"es": {"utterances": "none"}}),
+            "body.translations.es.utterances: expected an array",
+        ),
     ],
 )
-def test_a_body_that_does_not_fit_is_refused(body: object) -> None:
-    with pytest.raises(BadBodyError):
+def test_a_body_that_does_not_fit_is_refused(body: object, problem: str) -> None:
+    with pytest.raises(BadBodyError) as raised:
         Transcript.from_api(body)
+    assert str(raised.value) == f"transcript response ({problem})"
 
 
 def test_a_transcript_without_created_at_is_a_bad_response(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -169,11 +200,13 @@ def test_get_refuses_an_id_that_is_not_a_name(
     hs, routes = hs_on(monkeypatch, lambda _request: reply(200, transcript_body()))
     with pytest.raises(PreflightError, match="id is a non-empty string") as raised:
         hs.transcripts.get(bad_id)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
-    assert raised.value.code == "invalid_option"
+    assert (raised.value.code, raised.value.status) == ("invalid_option", None)
     assert routes.requests == []
 
 
-@pytest.mark.parametrize("bad_id", [".", "..", "\ud800", "ok\udfff", b"id", ["id"]])
+@pytest.mark.parametrize(
+    "bad_id", ["", ".", "..", "\ud800", "ok\udfff", None, 42, 5, b"id", ["id"]]
+)
 def test_an_id_that_is_a_dot_segment_or_cannot_be_encoded_is_refused_everywhere(
     monkeypatch: pytest.MonkeyPatch, bad_id: object
 ) -> None:
@@ -181,7 +214,7 @@ def test_an_id_that_is_a_dot_segment_or_cannot_be_encoded_is_refused_everywhere(
     for call in (hs.transcripts.get, hs.jobs.get, hs.jobs.wait):
         with pytest.raises(PreflightError) as raised:
             call(bad_id)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
-        assert raised.value.code == "invalid_option"
+        assert (raised.value.code, raised.value.status) == ("invalid_option", None)
     assert routes.requests == []
 
 
@@ -269,3 +302,67 @@ def test_a_replaced_transcript_keeps_its_private_state() -> None:
     assert copy.to_json() == original.to_json()
     assert "hola" in copy.to_text("es")
     assert copy.to_srt("es") == original.to_srt("es")
+
+
+@pytest.mark.parametrize("bad_id", ["", ".", "..", "\ud800", None, 42, 5])
+@pytest.mark.anyio
+async def test_async_resource_ids_are_rejected_before_any_request(
+    monkeypatch: pytest.MonkeyPatch, bad_id: object
+) -> None:
+    hs, routes = async_hs_on(monkeypatch, lambda _r: reply(200, transcript_body()))
+    for call in (hs.transcripts.get, hs.jobs.get, hs.jobs.wait):
+        with pytest.raises(PreflightError) as raised:
+            await call(bad_id)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+        assert (raised.value.code, raised.value.status) == ("invalid_option", None)
+    assert routes.requests == []
+
+
+@pytest.mark.anyio
+async def test_async_resource_ids_are_encoded_as_one_path_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/v1/transcripts/"):
+            return reply(200, transcript_body())
+        return reply(200, job_body("a/b?c#d", "done"))
+
+    hs, routes = async_hs_on(monkeypatch, handler)
+    await hs.transcripts.get("a/b?c#d")
+    await hs.jobs.get("a/b?c#d")
+    await hs.jobs.wait("a/b?c#d")
+    assert [request.url.raw_path for request in routes.requests] == [
+        b"/v1/transcripts/a%2Fb%3Fc%23d",
+        b"/v1/jobs/a%2Fb%3Fc%23d",
+        b"/v1/jobs/a%2Fb%3Fc%23d",
+    ]
+
+
+def test_job_wait_propagates_the_callers_callback_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hs, routes = hs_on(monkeypatch, lambda _r: reply(200, job_body("job_1", "queued")))
+    failure = RuntimeError("caller failure")
+
+    def on_progress(_progress: object) -> None:
+        raise failure
+
+    with pytest.raises(RuntimeError) as raised:
+        hs.jobs.wait("job_1", on_progress=on_progress)
+    assert raised.value is failure
+    assert len(routes.requests) == 1
+
+
+@pytest.mark.anyio
+async def test_async_job_wait_propagates_the_callers_callback_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hs, routes = async_hs_on(monkeypatch, lambda _r: reply(200, job_body("job_1", "queued")))
+    failure = RuntimeError("caller failure")
+
+    def on_progress(_progress: object) -> None:
+        raise failure
+
+    with pytest.raises(RuntimeError) as raised:
+        await hs.jobs.wait("job_1", on_progress=on_progress)
+    assert raised.value is failure
+    assert len(routes.requests) == 1

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,7 @@ from conftest import TOKEN
 from fakeapi import FakeApi, Job, error_reply
 from hushscript import (
     AuthenticationError,
+    ConfigurationError,
     FileLimitError,
     JobFailedError,
     PreflightError,
@@ -89,8 +91,19 @@ async def test_network_failures_on_a_part_are_failed_rounds(
 ) -> None:
     api = FakeApi(r2_hook=lambda n, _a: httpx.ReadError("reset") if n == 3 else None)
     hs = async_hs_for(monkeypatch, api)
-    with pytest.raises(UploadError):
+    with pytest.raises(UploadError) as raised:
         await hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    assert raised.value.code == "parts_exhausted"
+    assert raised.value.status is None
+    assert (
+        raised.value.idempotency_key
+        == json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"]
+    )
+    assert raised.value.resume_token == encode_token(
+        ResumeState(
+            "job_1", json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"], 9000, 100
+        )
+    )
 
 
 async def test_expired_urls_and_paging(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -216,11 +229,29 @@ async def test_stream_sizes_and_validation(monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(UploadError) as raised:
         await hs.transcribe(io.BytesIO(media()), size=8000, duration_seconds=100)
     assert raised.value.code == "stream_size_mismatch"
+    assert raised.value.status is None
+    assert (
+        raised.value.idempotency_key
+        == json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"]
+    )
+    assert raised.value.resume_token == encode_token(
+        ResumeState(
+            "job_1", json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"], 8000, 100
+        )
+    )
     assert api.count("POST", COMPLETE) == 0
-    with pytest.raises(PreflightError):
+    before = len(api.requests)
+    with pytest.raises(PreflightError) as invalid:
         await hs.transcribe(media(), duration_seconds=100, concurrency=12)
-    with pytest.raises(FileLimitError):
+    assert type(invalid.value) is PreflightError
+    assert invalid.value.code == "invalid_option"
+    assert invalid.value.status is None
+    assert len(api.requests) == before
+    with pytest.raises(FileLimitError) as short:
         await hs.transcribe(media(), duration_seconds=14.5)
+    assert short.value.code == "duration_out_of_range"
+    assert short.value.status is None
+    assert len(api.requests) == before
 
 
 async def test_an_unauthorized_heartbeat_aborts_the_upload(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -339,10 +370,17 @@ async def test_resume_takes_a_stream_that_cannot_seek_with_the_size_from_the_tok
     api = FakeApi(r2_hook=r2)
     hs = async_hs_for(monkeypatch, api)
     tokens: list[str] = []
-    with pytest.raises(UploadError):
+    with pytest.raises(UploadError) as exhausted:
         await hs.transcribe(
             media(), duration_seconds=100, concurrency=1, on_resume_token=tokens.append
         )
+    assert exhausted.value.code == "parts_exhausted"
+    assert exhausted.value.status is None
+    assert exhausted.value.resume_token == tokens[0]
+    assert (
+        exhausted.value.idempotency_key
+        == json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"]
+    )
     broken["on"] = False
 
     class OneWay(io.BytesIO):
@@ -352,6 +390,187 @@ async def test_resume_takes_a_stream_that_cannot_seek_with_the_size_from_the_tok
     with pytest.raises(UploadError) as raised:
         await hs.resume(tokens[0], OneWay(media(8999)))
     assert raised.value.code == "stream_size_mismatch"
+    assert raised.value.status is None
+    assert raised.value.resume_token == tokens[0]
+    assert (
+        raised.value.idempotency_key
+        == json.loads(api.of("POST", CREATE)[-1].content)["idempotency_key"]
+    )
     assert (await hs.resume(tokens[0], OneWay(media()))).id
     assert len(api.jobs) == 1
     await hs.aclose()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"idempotency_key": 123},
+        {"idempotency_key": True},
+        {"idempotency_key": []},
+        {"idempotency_key": "x" * 15},
+        {"idempotency_key": "x" * 129},
+        {"idempotency_key": "x" * 15 + " "},
+        {"idempotency_key": "x" * 15 + "é"},
+        {"duration_seconds": True},
+        {"duration_seconds": "20"},
+        {"duration_seconds": float("nan")},
+        {"duration_seconds": float("inf")},
+        {"duration_seconds": 0},
+        {"duration_seconds": -1},
+        {"concurrency": True},
+        {"concurrency": 0},
+        {"concurrency": -1},
+        {"concurrency": 1.5},
+        {"concurrency": 9},
+        {"wait_timeout": True},
+        {"wait_timeout": 0},
+        {"wait_timeout": float("nan")},
+    ],
+)
+async def test_invalid_transcribe_options_never_send_a_request(
+    monkeypatch: pytest.MonkeyPatch, options: dict[str, object]
+) -> None:
+    api = FakeApi()
+    hs = async_hs_for(monkeypatch, api)
+    kwargs = {"duration_seconds": 100, **options}
+    with pytest.raises(PreflightError) as raised:
+        await hs.transcribe(media(), **kwargs)  # type: ignore[arg-type]
+    assert type(raised.value) is PreflightError
+    assert raised.value.code == "invalid_option"
+    assert raised.value.status is None
+    assert raised.value.idempotency_key is None
+    assert raised.value.resume_token is None
+    assert api.requests == []
+
+
+@pytest.mark.parametrize("token", [None, 123, True, [], {}, b"abc", "", "nonsense"])
+async def test_malformed_resume_tokens_never_send_a_request(
+    monkeypatch: pytest.MonkeyPatch, token: object
+) -> None:
+    api = FakeApi()
+    hs = async_hs_for(monkeypatch, api)
+    with pytest.raises(ConfigurationError) as raised:
+        await hs.resume(token)  # type: ignore[arg-type]
+    assert raised.value.code == "config_invalid"
+    assert raised.value.status is None
+    assert raised.value.hint is None
+    assert api.requests == []
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"concurrency": 0},
+        {"concurrency": -1},
+        {"concurrency": 9},
+        {"concurrency": 1.5},
+        {"concurrency": True},
+        {"wait_timeout": 0},
+        {"wait_timeout": True},
+    ],
+)
+async def test_invalid_resume_options_never_send_a_request(
+    monkeypatch: pytest.MonkeyPatch, options: dict[str, object]
+) -> None:
+    api = FakeApi()
+    hs = async_hs_for(monkeypatch, api)
+    token = encode_token(ResumeState("job_1", "k" * 36, 9000, 100))
+    with pytest.raises(PreflightError) as raised:
+        await hs.resume(token, **options)  # type: ignore[arg-type]
+    assert type(raised.value) is PreflightError
+    assert raised.value.code == "invalid_option"
+    assert raised.value.status is None
+    assert api.requests == []
+
+
+@pytest.mark.parametrize("key", ["!" * 16, "~" * 128])
+async def test_upload_key_boundaries_are_sent_unchanged(
+    monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    api = FakeApi()
+    hs = async_hs_for(monkeypatch, api)
+    assert (
+        await hs.transcribe(media(), duration_seconds=15, concurrency=8, idempotency_key=key)
+    ).id
+    assert json.loads(api.of("POST", CREATE)[0].content)["idempotency_key"] == key
+
+
+async def test_cancel_before_start_sends_no_request_and_has_no_recovery_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi()
+    hs = async_hs_for(monkeypatch, api)
+    tokens: list[str] = []
+    task = asyncio.ensure_future(
+        hs.transcribe(media(), duration_seconds=100, on_resume_token=tokens.append)
+    )
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+    assert getattr(raised.value, "__notes__", []) == []
+    assert api.requests == []
+    assert tokens == []
+    await hs.aclose()
+
+
+@pytest.mark.parametrize(
+    ("seconds", "accepted"), [(14.99, False), (15, True), (36000, True), (36000.01, False)]
+)
+async def test_duration_boundaries_place_no_hold_on_refusal(
+    monkeypatch: pytest.MonkeyPatch, seconds: float, *, accepted: bool
+) -> None:
+    api = FakeApi()
+    hs = async_hs_for(monkeypatch, api)
+    if accepted:
+        assert (await hs.transcribe(media(), duration_seconds=seconds)).id
+        assert json.loads(api.of("POST", CREATE)[0].content)["duration_seconds"] == seconds
+    else:
+        with pytest.raises(FileLimitError) as raised:
+            await hs.transcribe(media(), duration_seconds=seconds)
+        assert raised.value.code == "duration_out_of_range"
+        assert raised.value.status is None
+        assert api.requests == []
+
+
+@pytest.mark.parametrize(("age", "refreshes"), [(23 * 3600, 0), (23 * 3600 + 1, 1)])
+async def test_part_urls_refresh_only_after_23_hours(
+    monkeypatch: pytest.MonkeyPatch, age: int, refreshes: int
+) -> None:
+    clock = PipeClock()
+
+    def advance(n: int, _attempt: int) -> None:
+        if n == 1:
+            clock.sleep(age)
+
+    api = FakeApi(parts=2, r2_hook=advance)
+    hs = async_hs_for(monkeypatch, api, clock)
+    assert (await hs.transcribe(media(), duration_seconds=100, concurrency=1)).id
+    assert api.count("GET", PART_URLS) == refreshes
+    assert api.count("PUT", R2) == 2
+    assert api.count("PUT", PARTS) == 0
+
+
+@pytest.mark.parametrize("size", [True, False, 0, -1, 1.5, "9000", float("nan"), float("inf")])
+async def test_invalid_stream_sizes_never_send_a_request(
+    monkeypatch: pytest.MonkeyPatch, size: object
+) -> None:
+    api = FakeApi()
+    hs = async_hs_for(monkeypatch, api)
+    with pytest.raises(PreflightError) as raised:
+        await hs.transcribe(io.BytesIO(media()), duration_seconds=100, size=size)  # type: ignore[arg-type]
+    assert type(raised.value) is PreflightError
+    assert raised.value.code == "invalid_option"
+    assert raised.value.status is None
+    assert api.requests == []
+
+
+async def test_a_declared_stream_size_over_5_gb_sends_no_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi()
+    hs = async_hs_for(monkeypatch, api)
+    with pytest.raises(FileLimitError) as raised:
+        await hs.transcribe(io.BytesIO(media()), size=5_000_000_001, duration_seconds=60)
+    assert raised.value.code == "size_out_of_range"
+    assert raised.value.status is None
+    assert api.requests == []

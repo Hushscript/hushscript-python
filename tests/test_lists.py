@@ -17,6 +17,7 @@ from hushscript import (
     Job,
     NotFoundError,
     Page,
+    PermissionDeniedError,
     PreflightError,
     TranscriptSummary,
 )
@@ -88,19 +89,25 @@ def test_list_is_lazy_and_closing_it_sends_no_further_request(
     assert next(items, None) is None
 
 
-def test_a_page_size_goes_out_as_limit_and_is_checked_before_any_request(
+def test_a_page_size_goes_out_as_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     hs, routes = hs_on(monkeypatch, pager(3, size=3))
     assert len(list(hs.transcripts.list(page_size=3))) == 3
     assert routes.queries() == [{"limit": "3"}]
-    for bad in (0, -1, True, 1.5, "5"):
-        with pytest.raises(PreflightError) as raised:
-            hs.transcripts.list(page_size=bad)  # type: ignore[arg-type]  # the point
-        assert raised.value.code == "invalid_option"
-        with pytest.raises(PreflightError):
-            hs.transcripts.page(page_size=bad)  # type: ignore[arg-type]
     assert len(routes.requests) == 1
+
+
+@pytest.mark.parametrize("bad_size", [0, -1, True, 1.5, "5"])
+def test_page_size_is_invalid_before_any_request(
+    monkeypatch: pytest.MonkeyPatch, bad_size: object
+) -> None:
+    hs, routes = hs_on(monkeypatch, pager(1))
+    for call in (hs.transcripts.list, hs.transcripts.page):
+        with pytest.raises(PreflightError) as raised:
+            call(page_size=bad_size)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+        assert (raised.value.code, raised.value.status) == ("invalid_option", None)
+    assert routes.requests == []
 
 
 def test_page_reads_one_page_and_hands_back_the_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -134,7 +141,7 @@ def test_a_cursor_equal_to_the_one_just_sent_is_a_pagination_loop(
     seen: list[str] = []
     with pytest.raises(HushscriptError) as raised:
         seen.extend(item.id for item in hs.transcripts.list())
-    assert raised.value.code == "pagination_loop"
+    assert (raised.value.code, raised.value.status) == ("pagination_loop", None)
     assert type(raised.value) is HushscriptError
     # The page that repeats the cursor it was sent still yields its items before the error.
     assert routes.queries() == [{}, {"cursor": "7"}]
@@ -182,8 +189,8 @@ def test_jobs_list_passes_active_and_walks_the_pages(monkeypatch: pytest.MonkeyP
     jobs = list(hs.jobs.list(active=True))
     assert [(j.id, j.state) for j in jobs] == [("job_1", "done"), ("job_2", "mystery_state")]
     assert routes.queries() == [{"active": "true"}, {"active": "true", "cursor": "j2"}]
-    list(hs.jobs.list())
-    assert routes.queries()[2] == {}
+    list(hs.jobs.list(active=False))
+    assert routes.queries()[2:] == [{}, {"cursor": "j2"}]
 
 
 def test_a_job_maps_the_spec_fields_and_leaves_the_private_ones_out(
@@ -264,9 +271,9 @@ def test_a_list_body_that_does_not_fit_is_a_bad_response(
 def test_a_list_error_is_the_api_error(monkeypatch: pytest.MonkeyPatch) -> None:
     denied = httpx.Response(403, json=error_body("pat_scope_missing", 2023))
     hs, _ = hs_on(monkeypatch, lambda _request: denied)
-    with pytest.raises(HushscriptError) as raised:
+    with pytest.raises(PermissionDeniedError) as raised:
         list(hs.transcripts.list())
-    assert raised.value.code == "pat_scope_missing"
+    assert (raised.value.code, raised.value.status) == ("pat_scope_missing", 403)
     assert OPERATION_SCOPES["GET /v1/transcripts"] in (raised.value.hint or "")
 
 
@@ -291,7 +298,7 @@ async def test_the_async_list_detects_a_loop_and_serves_jobs_and_deleted(
     hs, _ = async_hs_on(monkeypatch, stuck)
     with pytest.raises(HushscriptError) as raised:
         _ = [item async for item in hs.transcripts.list()]
-    assert raised.value.code == "pagination_loop"
+    assert (raised.value.code, raised.value.status) == ("pagination_loop", None)
     hs, _ = async_hs_on(monkeypatch, jobs_handler)
     assert [job.id async for job in hs.jobs.list(active=True)] == ["job_1", "job_2"]
     assert (await hs.jobs.get("job_3")).state == "queued"
@@ -355,3 +362,48 @@ def test_a_summary_and_a_deleted_record_are_unhashable_by_design(
     ):
         with pytest.raises(TypeError, match="unhashable"):
             hash(value)
+
+
+@pytest.mark.parametrize("bad_size", [0, -1, True, 1.5, "5"])
+@pytest.mark.anyio
+async def test_async_page_size_is_invalid_before_any_request(
+    monkeypatch: pytest.MonkeyPatch, bad_size: object
+) -> None:
+    hs, routes = async_hs_on(monkeypatch, pager(1))
+    with pytest.raises(PreflightError) as raised:
+        hs.transcripts.list(page_size=bad_size)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+    assert (raised.value.code, raised.value.status) == ("invalid_option", None)
+    with pytest.raises(PreflightError) as raised:
+        await hs.transcripts.page(page_size=bad_size)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+    assert (raised.value.code, raised.value.status) == ("invalid_option", None)
+    assert routes.requests == []
+
+
+@pytest.mark.anyio
+async def test_async_jobs_active_false_omits_the_filter_on_every_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hs, routes = async_hs_on(monkeypatch, jobs_handler)
+    assert [job.id async for job in hs.jobs.list(active=False)] == ["job_1", "job_2"]
+    assert routes.queries() == [{}, {"cursor": "j2"}]
+
+
+@pytest.mark.parametrize("page_size", [1, 100, 101])
+def test_page_size_is_sent_without_a_client_side_upper_clamp(
+    monkeypatch: pytest.MonkeyPatch, page_size: int
+) -> None:
+    hs, routes = hs_on(monkeypatch, pager(1))
+    assert hs.transcripts.page(page_size=page_size).items[0].id == "tr_001"
+    assert next(hs.transcripts.list(page_size=page_size)).id == "tr_001"
+    assert routes.queries() == [{"limit": str(page_size)}, {"limit": str(page_size)}]
+
+
+@pytest.mark.parametrize("page_size", [1, 100, 101])
+@pytest.mark.anyio
+async def test_async_page_size_is_sent_without_a_client_side_upper_clamp(
+    monkeypatch: pytest.MonkeyPatch, page_size: int
+) -> None:
+    hs, routes = async_hs_on(monkeypatch, pager(1))
+    assert (await hs.transcripts.page(page_size=page_size)).items[0].id == "tr_001"
+    assert [item.id async for item in hs.transcripts.list(page_size=page_size)] == ["tr_001"]
+    assert routes.queries() == [{"limit": str(page_size)}, {"limit": str(page_size)}]

@@ -26,7 +26,7 @@ LOOPBACK_HOSTS: Final = frozenset({"localhost", "127.0.0.1", "::1"})
 
 SETUP_HINT: Final = (
     "Set HUSHSCRIPT_TOKEN or pass a token. Create one in the Hushscript app: "
-    "Account → Connected apps (app.hushscript.com/account/mcp)."
+    "Account → MCP (app.hushscript.com/account/mcp)."
 )
 
 

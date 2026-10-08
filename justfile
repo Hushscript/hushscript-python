@@ -32,15 +32,16 @@ test version=floor:
     docker compose build mock test
     docker compose run --rm ${extra[@]+"${extra[@]}"} test
 
-# mutmut on the transport and retry modules (nightly)
+# mutmut on transport, transcription and billing (nightly)
 mutation version=floor:
     #!/usr/bin/env bash
     set -euo pipefail
     {{ if version == "3.11" { "" } else if version == "3.14" { "" } else { error("version must be 3.11 or 3.14") } }}
     export PYTHON_VERSION={{version}}
     trap 'docker compose down --remove-orphans >/dev/null 2>&1 || true' EXIT
+    extra=(-v "$(realpath "${CONFORMANCE_DIR:-../hushscript-sdk-conformance}")":/conformance:ro -e CONFORMANCE_DIR=/conformance)
     docker compose build mock mutation
-    docker compose run --rm mutation
+    docker compose run --rm ${extra[@]+"${extra[@]}"} mutation
 
 # the conformance suite against the mock
 conformance version=floor:

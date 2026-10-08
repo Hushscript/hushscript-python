@@ -12,6 +12,7 @@ from hushscript._errors import (
     UnsupportedMediaError,
 )
 from hushscript._json import as_dict
+from hushscript._shape import INT_LIMIT
 
 from .probe import probe_duration
 from .sniff import sniff
@@ -82,9 +83,10 @@ class Options:
             not _is_number(self.duration_seconds) or self.duration_seconds <= 0
         ):
             raise invalid_option("duration_seconds must be a positive number of seconds.")
-        key = self.idempotency_key
+        key = cast("object", self.idempotency_key)
         if key is not None and not (
-            KEY_MIN <= len(key) <= KEY_MAX
+            isinstance(key, str)
+            and KEY_MIN <= len(key) <= KEY_MAX
             and all(_PRINTABLE_FIRST <= ord(char) <= _PRINTABLE_LAST for char in key)
         ):
             raise invalid_option(
@@ -169,7 +171,11 @@ def check_media(source: Source, options: Options) -> Media:
 
 
 def _whole(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
+    return (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and abs(value) < INT_LIMIT
+        else None
+    )
 
 
 def check_account(account: object, media: Media) -> None:
