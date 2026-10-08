@@ -291,9 +291,11 @@ ffmpeg -i input -vn -c:a libopus output.opus
 | `log_level`              | `HUSHSCRIPT_LOG`      | `off` (`debug` logs one metadata line per request to standard error) |
 | `clock`                  | none                  | `SystemClock`; pass a `Clock` in tests                               |
 
-An explicit option beats its environment variable. The base URL must be `https://`, or `http://` to
-`localhost`, `127.0.0.1` or `[::1]`, with no path. Each upload part has its own 300 s timeout, which
-you cannot change.
+An explicit option beats its environment variable. A `None`, empty or whitespace-only option, and
+an empty or whitespace-only environment variable, count as not set: the option falls back to the
+environment variable, then to the default. A token that is still missing raises `ConfigurationError`
+with the setup hint. The base URL must be `https://`, or `http://` to `localhost`, `127.0.0.1` or
+`[::1]`, with no path. Each upload part has its own 300 s timeout, which you cannot change.
 
 ## Privacy
 

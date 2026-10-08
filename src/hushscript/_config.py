@@ -39,6 +39,11 @@ class Config:
     log_level: str
 
 
+def _set(value: str | None) -> str | None:
+    """R85: None, "" and whitespace-only text all mean "not set"."""
+    return value if value is not None and value.strip() else None
+
+
 def _validate_base_url(raw: str) -> str:
     parts = urlsplit(raw)
     if parts.path not in {"", "/"} or "?" in raw or "#" in raw:
@@ -79,10 +84,12 @@ def resolve_tokenless_config(  # mirrors the keyword surface of the static agent
 ) -> Config:
     """The config of a call that needs no token: HUSHSCRIPT_TOKEN is neither read nor sent."""
     environment = os.environ if env is None else env
-    resolved_url = _validate_base_url(base_url or environment.get(BASE_URL_ENV) or DEFAULT_BASE_URL)
+    resolved_url = _validate_base_url(
+        _set(base_url) or _set(environment.get(BASE_URL_ENV)) or DEFAULT_BASE_URL
+    )
     if not _is_positive_number(timeout):
         raise ConfigurationError("timeout must be a positive number of seconds.")
-    level = log_level if log_level is not None else environment.get(LOG_ENV) or "off"
+    level = _set(log_level) or _set(environment.get(LOG_ENV)) or "off"
     if level not in LOG_LEVELS:
         raise ConfigurationError(f"log_level must be one of {', '.join(LOG_LEVELS)}.")
     return Config(
@@ -104,20 +111,23 @@ def resolve_config(  # mirrors the public constructor
     env: Mapping[str, str] | None = None,
 ) -> Config:
     environment = os.environ if env is None else env
-    resolved_token = (token or environment.get(TOKEN_ENV, "")).strip()
-    if not resolved_token:
+    chosen_token = _set(token) or _set(environment.get(TOKEN_ENV))
+    if chosen_token is None:
         raise ConfigurationError("No Hushscript token was provided.", hint=SETUP_HINT)
+    resolved_token = chosen_token.strip()
     if any(not PRINTABLE_FIRST <= ord(char) <= PRINTABLE_LAST for char in resolved_token):
         # The message never echoes the token (spec 7.4).
         raise ConfigurationError("The token contains control or non-printable characters.")
     if not resolved_token.startswith(TOKEN_PREFIX):
         raise ConfigurationError("This doesn't look like a Hushscript token.")
-    resolved_url = _validate_base_url(base_url or environment.get(BASE_URL_ENV) or DEFAULT_BASE_URL)
+    resolved_url = _validate_base_url(
+        _set(base_url) or _set(environment.get(BASE_URL_ENV)) or DEFAULT_BASE_URL
+    )
     if not _is_positive_number(timeout):
         raise ConfigurationError("timeout must be a positive number of seconds.")
     if not _is_non_negative_int(max_retries):
         raise ConfigurationError("max_retries must be a non-negative integer.")
-    level = log_level if log_level is not None else environment.get(LOG_ENV) or "off"
+    level = _set(log_level) or _set(environment.get(LOG_ENV)) or "off"
     if level not in LOG_LEVELS:
         raise ConfigurationError(f"log_level must be one of {', '.join(LOG_LEVELS)}.")
     return Config(
