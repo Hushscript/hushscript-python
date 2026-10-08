@@ -790,3 +790,43 @@ def test_a_body_that_is_not_json_carries_a_stand_in_without_the_body() -> None:
     assert raised.value.message == f"The API's response could not be used ({described})."
     assert stand_in(raised.value) == described
     assert vars(raised.value.__cause__) == {}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_a_claim_secret_echoed_by_a_failure_or_an_answer_is_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+    asynchronous: bool,  # noqa: FBT001
+) -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"refused {CLAIM_SECRET}", request=request)
+
+    def echo(_request: httpx.Request) -> httpx.Response:
+        return reply(
+            401, {"error": "agent_claim_invalid", "code": 3005, "details": {"seen": CLAIM_SECRET}}
+        )
+
+    async def claim() -> None:
+        if asynchronous:
+            await AsyncHushscript.agent_claim(
+                "sg_1", CLAIM_SECRET, base_url=BASE_URL, clock=FakeClock()
+            )
+        else:
+            Hushscript.agent_claim("sg_1", CLAIM_SECRET, base_url=BASE_URL, clock=FakeClock())
+
+    errors: list[HushscriptError] = []
+    for handler, kind in ((refuse, NetworkError), (echo, HushscriptError)):
+        routes = Routes(handler)
+        monkeypatch.setattr(client_module, "_sync_inner", routes.sync)
+        monkeypatch.setattr(client_module, "_async_inner", routes.asynchronous)
+        with pytest.raises(kind) as raised:
+            await claim()
+        errors.append(raised.value)
+    lost, refused = errors
+    assert lost.message == (
+        "Could not reach the Hushscript API: POST /v1/agent/accounts/sg_1/claim "
+        f"(ConnectError: refused {REDACTED})."
+    )
+    assert stand_in(lost) == f"ConnectError: refused {REDACTED}"
+    assert (refused.code, refused.status) == ("agent_claim_invalid", 401)
+    assert refused.details == {"seen": REDACTED}

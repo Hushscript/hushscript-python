@@ -15,7 +15,7 @@ from hushscript._errors import (
 )
 from hushscript._http import UNKNOWN_HINTS
 from hushscript._json import as_dict, as_list, loads
-from hushscript._redact import REDACTED, Secret
+from hushscript._redact import MIN_SECRET_TAIL, REDACTED, Secret
 from hushscript._response import bad_response, forget_body, parsed
 from hushscript._retry import CLAIM, ROTATE
 from hushscript._shape import INT_LIMIT, as_text, as_whole, check_shape, to_datetime
@@ -330,6 +330,14 @@ def rotated_of(token: Secret, fields: dict[str, object]) -> RotatedToken:
 
 def claim_path(signup_id: object) -> str:
     return f"/v1/agent/accounts/{path_id(signup_id)}/claim"
+
+
+def remember_claim_secret(credentials: Credentials, claim_secret: Secret) -> None:
+    """R96: the claim secret is scrubbed from every error text while the claim runs, like the
+    token. A text shorter than a token's secret part is not one the server issues, and scrubbing
+    it would cut every word that contains it, so it is left out."""
+    if len(claim_secret.reveal()) >= MIN_SECRET_TAIL:
+        credentials.remember(claim_secret.reveal())
 
 
 def claim_body(claim_secret: Secret) -> dict[str, object]:

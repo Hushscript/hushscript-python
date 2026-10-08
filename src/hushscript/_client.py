@@ -27,6 +27,7 @@ from .resources.agent import (
     claim_body,
     claim_path,
     claimed,
+    remember_claim_secret,
     signed_up,
     signup_body,
 )
@@ -396,6 +397,7 @@ class Hushscript:
         secret = Secret(claim_secret)
         del claim_secret  # no frame of the SDK holds the secret as text from here on (R81)
         config = resolve_tokenless_config(base_url=base_url, timeout=timeout, log_level=log_level)
+        remember_claim_secret(config.credentials, secret)
         with _tokenless_http(config, clock) as http:
             response = http.post(path, json=claim_body(secret))
             return claimed(response, config.credentials)
@@ -592,6 +594,7 @@ class AsyncHushscript:
         secret = Secret(claim_secret)
         del claim_secret  # no frame of the SDK holds the secret as text from here on (R81)
         config = resolve_tokenless_config(base_url=base_url, timeout=timeout, log_level=log_level)
+        remember_claim_secret(config.credentials, secret)
         async with _tokenless_async_http(config, clock) as http:
             response = await http.post(path, json=claim_body(secret))
             return claimed(response, config.credentials)
