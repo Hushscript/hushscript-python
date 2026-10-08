@@ -9,8 +9,9 @@ from hushscript._errors import (
     HushscriptError,
     OutcomeUnknownError,
     ValidationError,
+    describe_failure,
     raise_for_response,
-    unexpected_error,
+    redacted_cause,
 )
 from hushscript._http import UNKNOWN_HINTS
 from hushscript._json import as_dict, as_list, loads
@@ -218,10 +219,17 @@ def _decode(response: httpx.Response) -> dict[str, object]:
 
 
 def _unknown(
-    route: str, hint_key: str, seen: Secret | None, credentials: Credentials
+    route: str,
+    hint_key: str,
+    seen: Secret | None,
+    credentials: Credentials,
+    reason: str | None = None,
 ) -> OutcomeUnknownError:
+    because = "" if reason is None else f" ({reason})"
     return OutcomeUnknownError(
-        credentials.scrub(f"The answer to {route} could not be used, so the token may be lost."),
+        credentials.scrub(
+            f"The answer to {route} could not be used{because}, so the token may be lost."
+        ),
         hint=UNKNOWN_HINTS[hint_key],
         received_token=seen,
     )
@@ -247,8 +255,8 @@ def _stray_credential(
 ) -> OutcomeUnknownError:
     """The same loss when the SDK itself failed on the answer (R61): the original rides along as
     a redacted cause, and `seen` is kept on the error."""
-    lost = _unknown(route, hint_key, seen, credentials)
-    lost.__cause__ = unexpected_error(failure, credentials).__cause__
+    lost = _unknown(route, hint_key, seen, credentials, describe_failure(failure, credentials))
+    lost.__cause__ = redacted_cause(failure, credentials)
     return lost
 
 

@@ -13,7 +13,7 @@ from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 from mutagen.wave import WAVE
 
-from hushscript._errors import UnsupportedMediaError
+from hushscript._errors import UnsupportedMediaError, describe_failure
 
 from .sniff import MediaFormat, sniff
 
@@ -179,7 +179,7 @@ def probe_duration(source: Source) -> float:
         try:
             seconds = _read(kind, handle)
         except (MutagenError, ValueError, struct.error, EOFError, OSError) as failure:
-            raise _unreadable(type(failure).__name__) from failure
+            raise _unreadable(describe_failure(failure)) from failure
     if not math.isfinite(seconds) or seconds <= 0:
         raise _unreadable("the file reports no length")
     return seconds

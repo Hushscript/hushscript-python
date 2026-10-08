@@ -13,8 +13,8 @@ import inspect
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Final
 
-from ._errors import HushscriptError, error_from_response, unexpected_error
-from ._response import bad_response
+from ._errors import HushscriptError, error_from_response, redacted_cause
+from ._response import unreadable_response
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -53,11 +53,9 @@ def unusable_answer(
     try:
         parse(client=_LENIENT_CLIENT, response=response)
     except Exception as failure:  # noqa: BLE001  # whatever the generated parser trips on
-        cause = unexpected_error(failure, credentials).__cause__
         if response.is_success:
-            error: HushscriptError = bad_response(response, "response (not usable)")
-        else:
-            error = error_from_response(response, credentials=credentials)
-        error.__cause__ = cause
+            return unreadable_response(response, failure, credentials)
+        error = error_from_response(response, credentials=credentials)
+        error.__cause__ = redacted_cause(failure, credentials)
         return error
     return None

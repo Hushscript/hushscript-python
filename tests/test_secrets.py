@@ -641,6 +641,11 @@ def test_a_failure_of_the_sdk_while_reading_a_claim_leaves_the_token_out_of_sdk_
     with pytest.raises(OutcomeUnknownError) as raised:
         Hushscript.agent_claim("sg_1", "s", base_url=BASE_URL, clock=FakeClock())
     assert raised.value.received_token == PAT
+    assert raised.value.message == (
+        "The answer to POST /v1/agent/accounts/{signup_id}/claim could not be used (RuntimeError), "
+        "so the token may be lost."
+    )
+    assert stand_in(raised.value) == "RuntimeError"
     assert_no_plain_secret(raised.value, PAT)
 
 

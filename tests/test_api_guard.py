@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 import hushscript.generated.api
+from helpers import stand_in
 from hushscript import ApiError, HushscriptError, NetworkError
 from hushscript.generated.api.default import buy_minutes, get_account
 from hushscript.generated.models.buy_minutes_body import BuyMinutesBody
@@ -20,6 +21,7 @@ from routes import Handler, async_hs_on, hs_on
 KEY = "api-key-1"
 BODY = BuyMinutesBody(pack="300min", idempotency_key=KEY, quick_payment_method_id="pm_1")
 HTML = "<html><body>502 Bad Gateway</body></html>"
+NOT_JSON = "JSONDecodeError: Expecting value: line 1 column 1 (char 0)"
 
 
 def html(status: int) -> httpx.Response:
@@ -51,6 +53,8 @@ def test_a_purchase_answered_200_with_a_body_that_is_not_json_is_bad_response_wi
     assert len(routes.requests) == 1
     assert raised.value.code == "bad_response"
     assert raised.value.status == 200
+    assert raised.value.message == f"The API's response could not be used ({NOT_JSON})."
+    assert stand_in(raised.value) == NOT_JSON
     assert raised.value.idempotency_key == KEY
 
 
@@ -111,7 +115,11 @@ def test_a_non_billing_operation_answered_200_without_a_field_is_bad_response(
     with pytest.raises(HushscriptError) as raised:
         get_account.sync(client=hs.api)
     assert raised.value.code == "bad_response"
-    assert not isinstance(raised.value.__cause__, KeyError)
+    assert (
+        raised.value.message
+        == "The API's response could not be used (KeyError: 'balance_seconds')."
+    )
+    assert stand_in(raised.value) == "KeyError: 'balance_seconds'"
 
 
 def test_a_non_billing_operation_answered_with_html_500_is_the_error_of_its_status(

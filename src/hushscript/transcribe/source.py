@@ -7,7 +7,7 @@ import threading
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, BinaryIO, Final
 
-from hushscript._errors import PreflightError, UploadError
+from hushscript._errors import PreflightError, UploadError, describe_failure
 
 from .sniff import HEAD_BYTES
 
@@ -86,7 +86,10 @@ class PathSource(Source):
             with open(self._path, "rb"):  # noqa: PTH123  # proves the file can be opened
                 pass
         except OSError as failure:
-            raise unreadable(self._path, failure.strerror or "it cannot be opened") from failure
+            raise PreflightError(
+                f"The file {self._path} cannot be read ({describe_failure(failure)}).",
+                code="file_unreadable",
+            ) from failure
         self.size = status.st_size
 
     def read_range(self, offset: int, length: int) -> bytes:
