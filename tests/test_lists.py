@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import fields
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 import pytest
@@ -24,7 +24,7 @@ from hushscript import (
 from routes import async_hs_on, hs_on
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterator
+    from collections.abc import AsyncIterator, Callable, Generator, Iterator
 
 
 def row(number: int) -> dict[str, object]:
@@ -475,3 +475,73 @@ async def test_async_single_page_accepts_terminal_and_advancing_cursors(
     page = await hs.transcripts.page(cursor=cursor)
     assert [item.id for item in page.items] == ["tr_001"]
     assert page.next_cursor == next_cursor
+
+
+def deleted_row(number: int) -> dict[str, object]:
+    return {
+        "id": f"tr_d{number}",
+        "title": "Gone",
+        "duration_seconds": 30,
+        "created_at": 1_700_000_000,
+        "deleted_at": 1_700_000_500,
+        "cause": "manual",
+        "receipt": None,
+    }
+
+
+def stuck_on(kind: str) -> Callable[[httpx.Request], httpx.Response]:
+    """Answers every page of a list with the same next_cursor, `7`."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        number = 1 if request.url.params.get("cursor") is None else 2
+        items = {
+            "transcripts": {"transcripts": [row(number)]},
+            "jobs": {"jobs": [job_body(f"job_{number}", "done")]},
+            "deleted": {"deleted": [deleted_row(number)]},
+        }[kind]
+        return reply(200, {**items, "next_cursor": "7"})
+
+    return handle
+
+
+LOOPED = {
+    "transcripts": ["tr_001", "tr_002"],
+    "jobs": ["job_1", "job_2"],
+    "deleted": ["tr_d1", "tr_d2"],
+}
+
+
+def listing(hs: Any, kind: str) -> Any:  # the sync and asyncio clients share the shape
+    return {
+        "transcripts": hs.transcripts.list,
+        "jobs": hs.jobs.list,
+        "deleted": hs.transcripts.deleted,
+    }[kind]()
+
+
+async def collect(items: AsyncIterator[Any], seen: list[str]) -> None:
+    async for item in items:
+        seen.append(item.id)  # noqa: PERF401  # the items before the error must stay
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("kind", ["transcripts", "jobs", "deleted"])
+async def test_every_list_yields_the_page_that_repeats_its_cursor_then_raises_pagination_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    asynchronous: bool,  # noqa: FBT001
+) -> None:
+    seen: list[str] = []
+    if asynchronous:
+        hs, routes = async_hs_on(monkeypatch, stuck_on(kind))
+        with pytest.raises(HushscriptError) as raised:
+            await collect(listing(hs, kind), seen)
+    else:
+        sync_hs, routes = hs_on(monkeypatch, stuck_on(kind))
+        with pytest.raises(HushscriptError) as raised:
+            seen.extend(item.id for item in listing(sync_hs, kind))
+    assert type(raised.value) is HushscriptError
+    assert (raised.value.code, raised.value.status) == ("pagination_loop", None)
+    assert [query.get("cursor") for query in routes.queries()] == [None, "7"]
+    assert seen == LOOPED[kind]
