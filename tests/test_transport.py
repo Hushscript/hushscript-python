@@ -32,6 +32,7 @@ from hushscript._http import (
     LABEL_EXTENSION,
     RetryingTransport,
 )
+from hushscript._redact import REDACTED
 from hushscript._retry import RetryClass
 from hushscript.generated.api.default import get_account
 
@@ -570,17 +571,27 @@ async def test_retry_after_cannot_make_a_forbidden_status_retryable(
     assert clock.sleeps == []
 
 
-MESSAGES = ["", "   ", "\t", "\u2003", "transport failed", "echo hsr-odd-secret"]
-
-
-def _described(failure: Exception, message: str) -> str:
-    redacted = message.replace("hsr-odd-secret", "hsr…[redacted]")
-    return f"{type(failure).__name__}: {redacted}" if message.strip() else type(failure).__name__
+# Each foreign message and what the description shows after the original's type name.
+MESSAGES = [
+    ("", ""),
+    ("   ", ""),
+    ("\t", ""),
+    ("\u2003", ""),
+    ("transport failed", ": transport failed"),
+    ("echo hsr-odd-secret", f": echo {REDACTED}"),
+    (
+        "put https://r2.example/b/k?X-Amz-Signature=abc failed",
+        ": put https://r2.example/b/k?[redacted] failed",
+    ),
+    ("PUT /b/k?sig=abc failed", ": PUT /b/k?[redacted] failed"),
+    ("HTTPS://R2.EXAMPLE/b/k?sig=abc", ": HTTPS://R2.EXAMPLE/b/k?[redacted]"),
+    ("ready? what? yes", ": ready? what? yes"),
+]
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("message", MESSAGES)
+@pytest.mark.parametrize("foreign", MESSAGES)
 @pytest.mark.parametrize(
     ("make", "path", "error_class", "code", "prefix", "key"),
     [
@@ -604,7 +615,7 @@ def _described(failure: Exception, message: str) -> str:
 )
 async def test_a_transport_failure_names_its_type_and_redacted_message(
     asynchronous: bool,  # noqa: FBT001
-    message: str,
+    foreign: tuple[str, str],
     make: type[httpx.RequestError],
     path: str,
     error_class: type[HushscriptError],
@@ -612,6 +623,7 @@ async def test_a_transport_failure_names_its_type_and_redacted_message(
     prefix: str,
     key: str | None,
 ) -> None:
+    message, shown = foreign
     failure = make(message)
     script = Script([failure])
     if asynchronous:
@@ -628,15 +640,16 @@ async def test_a_transport_failure_names_its_type_and_redacted_message(
             client.post(path, json={"idempotency_key": "purchase-key"})
     assert type(raised.value) is error_class
     assert (raised.value.code, raised.value.status) == (code, None)
-    assert raised.value.message == f"{prefix} ({_described(failure, message)})."
-    assert stand_in(raised.value) == _described(failure, message)
+    described = type(failure).__name__ + shown
+    assert raised.value.message == f"{prefix} ({described})."
+    assert stand_in(raised.value) == described
     assert script.calls == 1
     assert raised.value.idempotency_key == key
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("message", MESSAGES)
+@pytest.mark.parametrize("foreign", MESSAGES)
 @pytest.mark.parametrize(
     ("body_fails", "path", "error_class", "code", "prefix", "key"),
     [
@@ -660,7 +673,7 @@ async def test_a_transport_failure_names_its_type_and_redacted_message(
 )
 async def test_an_unexpected_failure_names_its_type_and_redacted_message(
     asynchronous: bool,  # noqa: FBT001
-    message: str,
+    foreign: tuple[str, str],
     body_fails: bool,  # noqa: FBT001
     path: str,
     error_class: type[HushscriptError],
@@ -668,6 +681,7 @@ async def test_an_unexpected_failure_names_its_type_and_redacted_message(
     prefix: str,
     key: str | None,
 ) -> None:
+    message, shown = foreign
     failure = TypeError(message)
     script = Script([failing_body(failure) if body_fails else failure])
     if asynchronous:
@@ -682,7 +696,7 @@ async def test_an_unexpected_failure_names_its_type_and_redacted_message(
             pytest.raises(error_class) as raised,
         ):
             client.post(path, json={"idempotency_key": "purchase-key"})
-    described = _described(failure, message)
+    described = type(failure).__name__ + shown
     assert type(raised.value) is error_class
     assert (raised.value.code, raised.value.status) == (code, None)
     assert raised.value.message == f"{prefix} ({described})."

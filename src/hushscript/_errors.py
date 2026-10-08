@@ -6,7 +6,7 @@ import traceback
 from typing import TYPE_CHECKING, Any, ClassVar, Final
 
 from ._json import as_dict, as_list, loads
-from ._redact import Credentials, Secret, redact
+from ._redact import Credentials, Secret, redact, redact_queries
 from .generated.catalog import ERROR_CATALOG
 from .generated.hints import HINTS
 from .generated.scopes import OPERATION_SCOPES
@@ -20,7 +20,6 @@ _PLACEHOLDER: Final = re.compile(r"\{(\w+)\}")
 _SENTENCE_BREAK: Final = re.compile(r"(?<=\.) ")
 _TEMPLATE_PARAMETER: Final = re.compile(r"\\\{[^}/]+\\\}")
 _JOB_OR_UPLOAD: Final = re.compile(r"^[A-Z]+ /v1/(?:jobs|uploads)(?:/|$)")
-_URL_QUERY: Final = re.compile(r"(https?://[^\s\"'<>?#]+)\?[^\s\"'<>#]*")
 _INT_LIMIT: Final = 2**63
 """Numbers the SDK reads stay inside a signed 64-bit range; beyond it, or not finite, they are
 absent."""
@@ -162,8 +161,8 @@ class HushscriptError(Exception):
         self.resume_token: str | None = None
         if hint is None and self.auto_hint:
             hint = render_hint(self.code, self.details, retry_after, scope)
-        self.hint: str | None = redact(hint) if hint is not None else None
-        self.message: str = redact(message)
+        self.hint: str | None = redact_queries(redact(hint)) if hint is not None else None
+        self.message: str = redact_queries(redact(message))
         super().__init__(self.message)
 
     def __str__(self) -> str:
@@ -194,8 +193,7 @@ def describe_failure(failure: BaseException, credentials: Credentials | None = N
     if not text.strip():
         return name
     scrubbed = credentials.scrub(text) if credentials is not None else redact(text)
-    shown = _URL_QUERY.sub(r"\1?…[redacted]", scrubbed)
-    return f"{name}: {shown}"
+    return f"{name}: {redact_queries(scrubbed)}"
 
 
 def redacted_cause(failure: BaseException, credentials: Credentials | None = None) -> BaseException:

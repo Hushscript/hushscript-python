@@ -35,6 +35,22 @@ def redact(text: str) -> str:
     return TOKEN_PATTERN.sub(REDACTED, text)
 
 
+QUERY_REDACTED: Final = "?[redacted]"
+_URL_QUERY: Final = re.compile(
+    # a URL with any scheme, or a path at the start of the text or after a space, quote, bracket
+    # or `=`; a query stops at a space, quote, angle bracket, `#` or `)`
+    r"((?:\b[a-z][a-z0-9+.-]*://[^\s\"'<>?#]+)|(?:(?<![^\s\"'(\[<=])/[^\s\"'<>?#]*))"
+    r"\?[^\s\"'<>#)]+",
+    re.IGNORECASE,
+)
+
+
+def redact_queries(text: str) -> str:
+    """R96: every URL or path in `text` keeps its scheme, host and path; its query string, which
+    holds a signed URL's signature, becomes `?[redacted]`."""
+    return _URL_QUERY.sub(lambda match: match.group(1) + QUERY_REDACTED, text)
+
+
 class Secret:
     """A token or a signed URL held at rest: nothing prints, pickles or copies its text.
 
