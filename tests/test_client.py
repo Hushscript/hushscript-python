@@ -1,7 +1,7 @@
 # pyright: reportPrivateUsage=false
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import attrs
 import httpx
@@ -9,7 +9,16 @@ import pytest
 
 import hushscript._client as client_module
 from conftest import TOKEN
-from helpers import FakeClock, Script, error_body, failing_body, reply
+from helpers import (
+    FakeClock,
+    Script,
+    account_body,
+    error_body,
+    failing_body,
+    job_body,
+    reply,
+    transcript_body,
+)
 from hushscript import (
     AsyncHushscript,
     AuthenticationError,
@@ -21,7 +30,12 @@ from hushscript import (
 )
 from hushscript._client import user_agent
 from hushscript._errors import ApiError
-from hushscript.generated.api.default import get_account
+from hushscript.generated.api.default import (
+    get_account,
+    get_job,
+    get_transcript,
+    list_saved_cards,
+)
 
 if TYPE_CHECKING:
     from hushscript.generated.client import AuthenticatedClient
@@ -316,3 +330,53 @@ def test_a_body_that_fails_after_the_headers_is_a_network_error(
     with pytest.raises(NetworkError):
         Hushscript(TOKEN, base_url="http://127.0.0.1:4010", clock=FakeClock()).balance()
     assert script.calls == 4
+
+
+UNKNOWN_FIELD = {"x_future": {"nested": [1, None, {"new": True}]}}
+
+
+def test_hs_api_keeps_unknown_fields_of_nested_response_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The friendly models drop unknown nested fields; `hs.api` is where they stay reachable."""
+    account = account_body()
+    account["limits"] = {**account["limits"], **UNKNOWN_FIELD}  # type: ignore[dict-item]
+    card = {
+        "id": "pm_1",
+        "type": "card",
+        "brand": "visa",
+        "last4": "4242",
+        "exp_month": 12,
+        "exp_year": 2030,
+        "email": None,
+        "is_default": True,
+        "fast_checkout_eligible": True,
+        **UNKNOWN_FIELD,
+    }
+    job = job_body("job_1", "done")
+    job["options"] = {**job["options"], **UNKNOWN_FIELD}  # type: ignore[dict-item]
+    transcript = transcript_body()
+    utterance = {"speaker": "A", "start_ms": 0, "end_ms": 1000, "text": "Hi.", **UNKNOWN_FIELD}
+    transcript["body"] = {
+        "version": 1,
+        "original": {"utterances": [utterance]},
+        "translations": {},
+    }
+    script = Script(
+        [
+            reply(200, account),
+            reply(200, {"default_id": "pm_1", "methods": [card]}),
+            reply(200, job),
+            reply(200, transcript),
+        ]
+    )
+    _patch(monkeypatch, script)
+    with Hushscript(TOKEN, base_url="http://127.0.0.1:4010", clock=FakeClock()) as hs:
+        limits = cast("Any", get_account.sync(client=hs.api)).limits
+        methods = cast("Any", list_saved_cards.sync(client=hs.api)).methods
+        options = cast("Any", get_job.sync("job_1", client=hs.api)).options
+        found = cast("Any", get_transcript.sync("tr_1", client=hs.api))
+    assert limits.additional_properties == UNKNOWN_FIELD
+    assert methods[0].additional_properties == UNKNOWN_FIELD
+    assert options.additional_properties == UNKNOWN_FIELD
+    assert found.body.original.utterances[0].additional_properties == UNKNOWN_FIELD

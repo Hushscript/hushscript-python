@@ -366,3 +366,39 @@ async def test_async_job_wait_propagates_the_callers_callback_unchanged(
         await hs.jobs.wait("job_1", on_progress=on_progress)
     assert raised.value is failure
     assert len(routes.requests) == 1
+
+
+NESTED_EXTRAS = [
+    {},
+    {"x_future": None},
+    {"x_future": ""},
+    {"x_future": " \t\u2003"},
+    {"x_future": {"nested": [1, None, {"new": True}]}},
+]
+
+
+@pytest.mark.parametrize("extra", NESTED_EXTRAS)
+def test_to_json_keeps_unknown_fields_of_every_nested_object(extra: dict[str, object]) -> None:
+    utterance = {**_utterance("A", "Hi."), **extra}
+    body = _body(
+        [utterance],
+        translations={
+            "es": {"utterances": [utterance], **extra},
+            "cleaned": {"utterances": [utterance]},
+        },
+    )
+    body["body"] = {**cast("dict[str, object]", body["body"]), **extra}
+    body.update(extra)
+    transcript = Transcript.from_api(body)
+    assert transcript.to_json() == body
+    assert transcript.utterances_for("es")[0].text == "Hi."
+
+
+def test_to_json_returns_a_deep_copy_of_the_nested_objects() -> None:
+    utterance = {**_utterance("A", "Hi."), "x_future": {"nested": [1]}}
+    body = _body([utterance])
+    transcript = Transcript.from_api(body)
+    raw = transcript.to_json()
+    original = cast("dict[str, object]", cast("dict[str, object]", raw["body"])["original"])
+    cast("list[dict[str, object]]", original["utterances"])[0]["text"] = "changed"
+    assert transcript.to_json() == body
