@@ -244,6 +244,11 @@ An error raised after an upload started, or after a purchase was sent, carries `
 once the job exists it carries `resume_token` too. Pass the token to `hs.resume(token, file)` to
 carry on without a second charge.
 
+A wrapped error names the original: `network_error`, `outcome_unknown` and `unexpected_error` end
+their message with the original's type and its message, tokens and signed-URL queries removed, for
+example `(ConnectError: refused)`. A failure of the SDK itself, or of an HTTP client you supplied
+that is not a transport failure, is `unexpected_error`, with the original as a redacted `__cause__`.
+
 ## What the SDK does for you
 
 - **Checks before it spends.** It sniffs the format from the file's bytes, probes the duration,

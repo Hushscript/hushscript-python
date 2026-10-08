@@ -182,21 +182,34 @@ class _RedactedCause(Exception):  # noqa: N818  # a stand-in for an exception, n
 UNEXPECTED: Final = "unexpected_error"
 
 
+def describe_failure(failure: BaseException, credentials: Credentials | None = None) -> str:
+    """R86: the original's type and its message, with tokens and signed-URL queries removed. A
+    message that is blank, or whose own text breaks, leaves the type alone."""
+    name = type(failure).__name__
+    try:
+        text = str(failure)
+    except Exception:  # noqa: BLE001  # an exception whose own text breaks still has a name
+        text = ""
+    if not text.strip():
+        return name
+    scrubbed = credentials.scrub(text) if credentials is not None else redact(text)
+    shown = _URL_QUERY.sub(r"\1?…[redacted]", scrubbed)
+    return f"{name}: {shown}"
+
+
 def unexpected_error(
     failure: BaseException, credentials: Credentials | None = None
 ) -> HushscriptError:
     """Spec 9.2: a failure inside the SDK, after a request was sent, that fits no other class. The
-    original rides along as a redacted cause."""
-    name = type(failure).__name__
+    message names the original's type and redacted message (R86); the original rides along as a
+    redacted cause."""
+    description = describe_failure(failure, credentials)
     error = HushscriptError(
-        f"An unexpected {name} interrupted the SDK after the request was sent.", code=UNEXPECTED
+        f"An unexpected {type(failure).__name__} interrupted the SDK after the request was sent "
+        f"({description}).",
+        code=UNEXPECTED,
     )
-    try:
-        text = f"{name}: {failure}"
-    except Exception:  # noqa: BLE001  # an exception whose own text breaks still has a name
-        text = name
-    scrubbed = credentials.scrub(text) if credentials is not None else redact(text)
-    cause = _RedactedCause(_URL_QUERY.sub(r"\1?…[redacted]", scrubbed))
+    cause = _RedactedCause(description)
     error.__cause__ = cause.with_traceback(failure.__traceback__)
     return error
 

@@ -13,11 +13,18 @@ from helpers import (
     Script,
     async_client,
     error_body,
+    failing_body,
     reply,
     settings_for,
     sync_client,
 )
-from hushscript import AsyncHushscript, Hushscript, NetworkError, OutcomeUnknownError
+from hushscript import (
+    AsyncHushscript,
+    Hushscript,
+    HushscriptError,
+    NetworkError,
+    OutcomeUnknownError,
+)
 from hushscript._http import (
     ANONYMOUS_EXTENSION,
     CLASS_EXTENSION,
@@ -560,3 +567,126 @@ async def test_retry_after_cannot_make_a_forbidden_status_retryable(
     assert response.status_code == status
     assert script.calls == 1
     assert clock.sleeps == []
+
+
+MESSAGES = ["", "   ", "\t", "\u2003", "transport failed", "echo hsr-odd-secret"]
+
+
+def _described(failure: Exception, message: str) -> str:
+    redacted = message.replace("hsr-odd-secret", "hsr…[redacted]")
+    return f"{type(failure).__name__}: {redacted}" if message.strip() else type(failure).__name__
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("message", MESSAGES)
+@pytest.mark.parametrize(
+    ("make", "path", "error_class", "code", "prefix", "key"),
+    [
+        (
+            httpx.ConnectError,
+            "/v1/account",
+            NetworkError,
+            "network_error",
+            "Could not reach the Hushscript API: POST /v1/account",
+            None,
+        ),
+        (
+            httpx.ReadError,
+            "/v1/agent/accounts/sg_1/claim",
+            OutcomeUnknownError,
+            "outcome_unknown",
+            "No response arrived for POST /v1/agent/accounts/sg_1/claim",
+            None,
+        ),
+    ],
+)
+async def test_a_transport_failure_names_its_type_and_redacted_message(
+    asynchronous: bool,  # noqa: FBT001
+    message: str,
+    make: type[httpx.RequestError],
+    path: str,
+    error_class: type[HushscriptError],
+    code: str,
+    prefix: str,
+    key: str | None,
+) -> None:
+    failure = make(message)
+    script = Script([failure])
+    if asynchronous:
+        async with async_client(
+            script, FakeClock(), token="hsr-odd-secret", max_retries=0
+        ) as client:
+            with pytest.raises(error_class) as raised:
+                await client.post(path, json={"idempotency_key": "purchase-key"})
+    else:
+        with (
+            sync_client(script, FakeClock(), token="hsr-odd-secret", max_retries=0) as client,
+            pytest.raises(error_class) as raised,
+        ):
+            client.post(path, json={"idempotency_key": "purchase-key"})
+    assert type(raised.value) is error_class
+    assert (raised.value.code, raised.value.status) == (code, None)
+    assert raised.value.message == f"{prefix} ({_described(failure, message)})."
+    assert raised.value.__cause__ is failure
+    assert script.calls == 1
+    assert raised.value.idempotency_key == key
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("message", MESSAGES)
+@pytest.mark.parametrize(
+    ("body_fails", "path", "error_class", "code", "prefix", "key"),
+    [
+        (
+            False,
+            "/v1/billing/purchase",
+            HushscriptError,
+            "unexpected_error",
+            "An unexpected TypeError interrupted the SDK after the request was sent",
+            "purchase-key",
+        ),
+        (
+            True,
+            "/v1/agent/accounts/sg_1/claim",
+            OutcomeUnknownError,
+            "outcome_unknown",
+            "The answer to POST /v1/agent/accounts/sg_1/claim could not be used",
+            None,
+        ),
+    ],
+)
+async def test_an_unexpected_failure_names_its_type_and_redacted_message(
+    asynchronous: bool,  # noqa: FBT001
+    message: str,
+    body_fails: bool,  # noqa: FBT001
+    path: str,
+    error_class: type[HushscriptError],
+    code: str,
+    prefix: str,
+    key: str | None,
+) -> None:
+    failure = TypeError(message)
+    script = Script([failing_body(failure) if body_fails else failure])
+    if asynchronous:
+        async with async_client(
+            script, FakeClock(), token="hsr-odd-secret", max_retries=0
+        ) as client:
+            with pytest.raises(error_class) as raised:
+                await client.post(path, json={"idempotency_key": "purchase-key"})
+    else:
+        with (
+            sync_client(script, FakeClock(), token="hsr-odd-secret", max_retries=0) as client,
+            pytest.raises(error_class) as raised,
+        ):
+            client.post(path, json={"idempotency_key": "purchase-key"})
+    described = _described(failure, message)
+    assert type(raised.value) is error_class
+    assert (raised.value.code, raised.value.status) == (code, None)
+    assert raised.value.message == f"{prefix} ({described})."
+    assert type(raised.value.__cause__).__name__ == "_RedactedCause"
+    assert str(raised.value.__cause__) == described
+    assert raised.value.__context__ is None
+    assert script.calls == 1
+    assert raised.value.idempotency_key == key

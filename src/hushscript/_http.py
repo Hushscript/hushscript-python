@@ -12,6 +12,7 @@ from ._errors import (
     HushscriptError,
     NetworkError,
     OutcomeUnknownError,
+    describe_failure,
     parse_retry_after,
     unexpected_error,
 )
@@ -337,7 +338,7 @@ class _Attempt:
         )
 
     def failure_error(self, failure: httpx.RequestError) -> NetworkError | OutcomeUnknownError:
-        reason = type(failure).__name__
+        reason = describe_failure(failure, self.settings.credentials)
         where = f"{self.request.method} {self.label}"
         if self.retry_class is RetryClass.NEVER and not is_not_sent(failure):
             return OutcomeUnknownError(
@@ -356,7 +357,7 @@ class _Attempt:
             return error
         unknown = OutcomeUnknownError(
             f"The answer to {self.request.method} {self.label} could not be used "
-            f"({type(failure).__name__}).",
+            f"({describe_failure(failure, self.settings.credentials)}).",
             code="outcome_unknown",
             hint=UNKNOWN_HINTS.get(self.route or ""),
         )
