@@ -830,3 +830,16 @@ async def test_a_claim_secret_echoed_by_a_failure_or_an_answer_is_redacted(
     assert stand_in(lost) == f"ConnectError: refused {REDACTED}"
     assert (refused.code, refused.status) == ("agent_claim_invalid", 401)
     assert refused.details == {"seen": REDACTED}
+
+
+@pytest.mark.parametrize(("length", "scrubbed"), [(15, False), (16, True)])
+def test_a_claim_secret_is_registered_from_the_length_of_a_token_secret_part(
+    length: int,
+    scrubbed: bool,  # noqa: FBT001
+) -> None:
+    secret = "c" * length
+    credentials = Credentials()
+    agent_module.remember_claim_secret(credentials, Secret(secret))
+    assert credentials.scrub(f"echo {secret}") == (
+        f"echo {REDACTED}" if scrubbed else f"echo {secret}"
+    )
