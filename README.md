@@ -56,6 +56,10 @@ The list holds finished transcripts only. A recording that is still processing i
 it in `hs.jobs.list(active=True)`. `hs.jobs.wait(job_id)` waits for one, and
 `hs.transcripts.get(transcript_id)` returns the full `Transcript` once it is done.
 
+`hs.transcripts.page(cursor=...)` returns one page. A page that hands back the cursor it was sent
+raises `HushscriptError` with the code `pagination_loop`, from `page` and from the list iterators
+alike.
+
 ## Buy a pack
 
 ```python

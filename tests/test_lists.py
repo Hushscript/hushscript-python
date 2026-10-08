@@ -407,3 +407,71 @@ async def test_async_page_size_is_sent_without_a_client_side_upper_clamp(
     assert (await hs.transcripts.page(page_size=page_size)).items[0].id == "tr_001"
     assert [item.id async for item in hs.transcripts.list(page_size=page_size)] == ["tr_001"]
     assert routes.queries() == [{"limit": str(page_size)}, {"limit": str(page_size)}]
+
+
+@pytest.mark.parametrize("cursor", ["7", " ", "\t", "\u2003"])
+def test_single_page_rejects_the_cursor_just_sent(
+    monkeypatch: pytest.MonkeyPatch, cursor: str
+) -> None:
+    hs, routes = hs_on(
+        monkeypatch, lambda _request: reply(200, {"transcripts": [row(1)], "next_cursor": cursor})
+    )
+    with pytest.raises(HushscriptError) as raised:
+        hs.transcripts.page(cursor=cursor)
+    assert type(raised.value) is HushscriptError
+    assert (raised.value.code, raised.value.status) == ("pagination_loop", None)
+    assert str(raised.value) == (
+        "The API returned the same page cursor it was sent; stopping instead of repeating it."
+    )
+    assert routes.queries() == [{"cursor": cursor}]
+
+
+@pytest.mark.parametrize("cursor", ["7", " ", "\t", "\u2003"])
+@pytest.mark.anyio
+async def test_async_single_page_rejects_the_cursor_just_sent(
+    monkeypatch: pytest.MonkeyPatch, cursor: str
+) -> None:
+    hs, routes = async_hs_on(
+        monkeypatch, lambda _request: reply(200, {"transcripts": [row(1)], "next_cursor": cursor})
+    )
+    with pytest.raises(HushscriptError) as raised:
+        await hs.transcripts.page(cursor=cursor)
+    assert type(raised.value) is HushscriptError
+    assert (raised.value.code, raised.value.status) == ("pagination_loop", None)
+    assert str(raised.value) == (
+        "The API returned the same page cursor it was sent; stopping instead of repeating it."
+    )
+    assert routes.queries() == [{"cursor": cursor}]
+
+
+@pytest.mark.parametrize(
+    ("cursor", "next_cursor"),
+    [(None, None), (None, ""), ("", ""), ("7", None), ("7", ""), ("7", "8")],
+)
+def test_single_page_accepts_terminal_and_advancing_cursors(
+    monkeypatch: pytest.MonkeyPatch, cursor: str | None, next_cursor: str | None
+) -> None:
+    hs, _ = hs_on(
+        monkeypatch,
+        lambda _request: reply(200, {"transcripts": [row(1)], "next_cursor": next_cursor}),
+    )
+    page = hs.transcripts.page(cursor=cursor)
+    assert [item.id for item in page.items] == ["tr_001"]
+    assert page.next_cursor == next_cursor
+
+
+@pytest.mark.parametrize(
+    ("cursor", "next_cursor"),
+    [(None, None), (None, ""), ("", ""), ("7", None), ("7", ""), ("7", "8")],
+)
+@pytest.mark.anyio
+async def test_async_single_page_accepts_terminal_and_advancing_cursors(
+    monkeypatch: pytest.MonkeyPatch, cursor: str | None, next_cursor: str | None
+) -> None:
+    hs, _ = async_hs_on(
+        monkeypatch,
+        lambda _request: reply(200, {"transcripts": [row(1)], "next_cursor": next_cursor}),
+    )
+    page = await hs.transcripts.page(cursor=cursor)
+    assert [item.id for item in page.items] == ["tr_001"]
+    assert page.next_cursor == next_cursor
