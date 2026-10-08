@@ -71,13 +71,30 @@ def test_a_purchase_answered_200_without_a_field_is_bad_response_with_the_key(
 def test_a_purchase_that_never_got_an_answer_carries_the_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def refuse(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("refused", request=request)
+    def lose(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError("reset", request=request)
 
-    hs, _ = hs_on(monkeypatch, refuse)
+    hs, _ = hs_on(monkeypatch, lose)
     with pytest.raises(NetworkError) as raised:
         buy_minutes.sync_detailed(client=hs.api, body=BODY)
     assert raised.value.idempotency_key == KEY
+
+
+def test_a_purchase_whose_connection_was_refused_every_time_carries_no_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    hs, routes = hs_on(monkeypatch, refuse)
+    with pytest.raises(NetworkError) as raised:
+        buy_minutes.sync_detailed(client=hs.api, body=BODY)
+    assert len(routes.requests) == 2
+    assert raised.value.idempotency_key is None
+    assert raised.value.message == (
+        "Could not reach the Hushscript API before the request was sent: "
+        "POST /v1/billing/purchase (ConnectError: refused)."
+    )
 
 
 def test_a_usable_purchase_answer_is_returned_as_the_generated_code_parses_it(

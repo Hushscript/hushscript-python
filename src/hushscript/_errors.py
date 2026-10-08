@@ -159,6 +159,7 @@ class HushscriptError(Exception):
         """Set on every error `transcribe()` raises once its create was sent (spec 7.3): passing it
         back to `transcribe()` replays the same job."""
         self.resume_token: str | None = None
+        self._unsent = False
         if hint is None and self.auto_hint:
             hint = render_hint(self.code, self.details, retry_after, scope)
         self.hint: str | None = redact_queries(redact(hint)) if hint is not None else None
@@ -173,6 +174,15 @@ class HushscriptError(Exception):
             f"{type(self).__name__}(code={self.code!r}, status={self.status!r}, "
             f"message={self.message!r})"
         )
+
+
+def mark_unsent(error: HushscriptError) -> None:
+    """R103: the request provably never went out, so a purchase key must not ride along."""
+    error._unsent = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]  # the one writer
+
+
+def is_unsent(error: HushscriptError) -> bool:
+    return error._unsent  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]  # the one reader
 
 
 class _RedactedCause(Exception):  # noqa: N818  # a stand-in for an exception, never raised by name

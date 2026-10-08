@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Final, TypeVar, cast
 from hushscript._errors import (
     HushscriptError,
     PaymentMethodRequiredError,
+    is_unsent,
     raise_for_response,
     unexpected_error,
 )
@@ -313,7 +314,8 @@ def sent_purchase(key: str, credentials: Credentials, send: Callable[[], T]) -> 
         _interrupted(interrupted, key)
         raise
     except HushscriptError as error:
-        error.idempotency_key = key
+        if not is_unsent(error):  # R103: provably never sent, so nothing was charged
+            error.idempotency_key = key
         raise
     except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
         failed = unexpected_error(failure, credentials)
@@ -331,7 +333,8 @@ async def sent_purchase_async(
         _interrupted(interrupted, key)
         raise
     except HushscriptError as error:
-        error.idempotency_key = key
+        if not is_unsent(error):  # R103: provably never sent, so nothing was charged
+            error.idempotency_key = key
         raise
     except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
         failed = unexpected_error(failure, credentials)

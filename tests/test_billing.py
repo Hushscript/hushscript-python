@@ -251,6 +251,33 @@ def test_a_network_error_is_retried_once_then_carries_the_key(
     assert raised.value.idempotency_key == shop.sent()[0]["idempotency_key"]
 
 
+def test_a_purchase_that_provably_never_went_out_carries_no_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shop = Shop(purchases=[httpx.ConnectError("refused")])
+    with pytest.raises(NetworkError) as raised:
+        buy(monkeypatch, shop)
+    assert len(shop.sent()) == 2
+    assert raised.value.idempotency_key is None
+    assert raised.value.message == (
+        "Could not reach the Hushscript API before the request was sent: "
+        "POST /v1/billing/purchase (ConnectError: refused)."
+    )
+
+
+def test_a_purchase_that_may_have_gone_out_once_keeps_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shop = Shop(purchases=[httpx.ReadError("reset"), httpx.ConnectError("refused")])
+    with pytest.raises(NetworkError) as raised:
+        buy(monkeypatch, shop)
+    assert len(shop.sent()) == 2
+    assert raised.value.idempotency_key == shop.sent()[0]["idempotency_key"]
+    assert raised.value.message == (
+        "Could not reach the Hushscript API: POST /v1/billing/purchase (ConnectError: refused)."
+    )
+
+
 def test_a_key_from_a_failed_attempt_asks_again_with_the_same_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

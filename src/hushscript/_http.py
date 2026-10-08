@@ -13,6 +13,7 @@ from ._errors import (
     NetworkError,
     OutcomeUnknownError,
     describe_failure,
+    mark_unsent,
     parse_retry_after,
     redacted_cause,
     unexpected_error,
@@ -239,6 +240,9 @@ class _Attempt:
         self.deadline = self.started + self.budget
         self.body: _WrittenBody | None = None
         self.answered = False
+        self.maybe_sent = False
+        """Some attempt may have reached the server: an answer came, a failure was not one of
+        those raised before anything is written, or the SDK cannot tell (R103)."""
         self.handed_out = False
         """The response went to the caller with its body unread; reading or closing that body
         ends the call."""
@@ -339,7 +343,9 @@ class _Attempt:
         response.stream = _DeadlineBody(response.stream, self)
 
     def stamp(self, error: HushscriptError) -> None:
-        if self.purchase_key is not None and error.idempotency_key is None:
+        """R61 and R103: the purchase key rides on every error unless no attempt can have been
+        sent, when nothing can have been charged."""
+        if self.purchase_key is not None and self.maybe_sent and error.idempotency_key is None:
             error.idempotency_key = self.purchase_key
 
     def unusable(self, response: httpx.Response) -> HushscriptError | None:
@@ -402,6 +408,12 @@ class _Attempt:
                 code="outcome_unknown",
                 hint=UNKNOWN_HINTS.get(self.route or ""),
             )
+        elif self.purchase_key is not None and not self.maybe_sent:
+            error = NetworkError(
+                "Could not reach the Hushscript API before the request was sent: "
+                f"{where} ({reason})."
+            )
+            mark_unsent(error)
         else:
             error = NetworkError(f"Could not reach the Hushscript API: {where} ({reason}).")
         error.__cause__ = redacted_cause(failure, self.settings.credentials)
@@ -413,6 +425,7 @@ class _Attempt:
         before it was sent lost nothing. Whether it was sent is known once an answer came, or,
         for a request whose body is tracked, from that body (R100)."""
         sent: bool | None = True if self.sent() else (None if self.body is None else False)
+        self.maybe_sent = self.maybe_sent or sent is not False
         error = unexpected_error(failure, self.settings.credentials, sent=sent)
         if self.retry_class is not RetryClass.NEVER or not self.sent():
             return error
@@ -484,6 +497,7 @@ class RetryingTransport(httpx.BaseTransport):
             try:
                 response = self._send(attempt)
             except httpx.RequestError as failure:
+                attempt.maybe_sent = attempt.maybe_sent or not is_not_sent(failure)
                 decision = attempt.judge(Outcome(failure=failure))
                 if decision.retry:
                     return decision, None
@@ -503,7 +517,7 @@ class RetryingTransport(httpx.BaseTransport):
 
     def _send(self, attempt: _Attempt) -> httpx.Response:
         response = self._inner.handle_request(attempt.request)
-        attempt.answered = True
+        attempt.answered = attempt.maybe_sent = True
         try:
             attempt.read(response)
             if not attempt.stream:
@@ -563,6 +577,7 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
             try:
                 response = await self._send(attempt)
             except httpx.RequestError as failure:
+                attempt.maybe_sent = attempt.maybe_sent or not is_not_sent(failure)
                 decision = attempt.judge(Outcome(failure=failure))
                 if decision.retry:
                     return decision, None
@@ -589,7 +604,7 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
         try:
             async with asyncio.timeout(max(attempt.remaining(), 0.0)):
                 response = await self._inner.handle_async_request(attempt.request)
-                attempt.answered = True
+                attempt.answered = attempt.maybe_sent = True
                 try:
                     attempt.read(response)
                     if not attempt.stream:
