@@ -70,6 +70,21 @@ def test_a_token_that_is_not_ours_is_refused(token: str) -> None:
     assert raised.value.hint is None
 
 
+@pytest.mark.parametrize(
+    ("token", "shown"),
+    [
+        ("%%%", " (JSONDecodeError: Expecting value: line 1 column 1 (char 0))"),
+        ("eyJ2Ijo=", " (JSONDecodeError: Expecting value: line 1 column 6 (char 5))"),
+        (_token([1, 2]), ""),
+        (_token({"v": 2}), ""),
+    ],
+)
+def test_a_token_that_does_not_decode_names_the_failure(token: str, shown: str) -> None:
+    with pytest.raises(ConfigurationError) as raised:
+        decode_token(token)
+    assert raised.value.message == f"This is not a resume token from this SDK{shown}."
+
+
 def test_a_file_of_another_size_is_refused() -> None:
     check_same_file(STATE, 1234)
     with pytest.raises(ResumeMismatchError) as raised:

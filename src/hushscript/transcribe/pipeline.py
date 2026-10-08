@@ -86,7 +86,7 @@ def annotate(tracker: Tracker, failure: Exception) -> HushscriptError:
     # R61: once the create is out nothing but an SDK error leaves.
     if not tracker.sent:
         raise failure
-    failed = unexpected_error(failure, tracker.credentials)
+    failed = unexpected_error(failure, tracker.credentials, sent=True)
     failed.idempotency_key = tracker.key
     failed.resume_token = tracker.token
     return failed

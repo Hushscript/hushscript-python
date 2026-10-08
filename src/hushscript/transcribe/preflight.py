@@ -10,6 +10,7 @@ from hushscript._errors import (
     FileLimitError,
     PreflightError,
     UnsupportedMediaError,
+    describe_failure,
 )
 from hushscript._json import as_dict
 from hushscript._shape import INT_LIMIT
@@ -144,7 +145,7 @@ def check_media(source: Source, options: Options) -> Media:
         head = source.head()
     except OSError as failure:
         raise PreflightError(
-            f"The file cannot be read: {failure.strerror or failure}.", code="file_unreadable"
+            f"The file cannot be read ({describe_failure(failure)}).", code="file_unreadable"
         ) from failure
     if sniff(head) is None:
         raise UnsupportedMediaError("The file is not a supported audio or video format.")
@@ -159,7 +160,7 @@ def check_media(source: Source, options: Options) -> Media:
             seconds = probe_duration(source)
         except OSError as failure:
             raise PreflightError(
-                f"The file cannot be read: {failure.strerror or failure}.", code="file_unreadable"
+                f"The file cannot be read ({describe_failure(failure)}).", code="file_unreadable"
             ) from failure
     declared = math.ceil(seconds)
     if seconds < MIN_SECONDS or declared > MAX_SECONDS:

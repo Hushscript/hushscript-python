@@ -9,7 +9,7 @@ import hushscript._client as client_module
 from conftest import TOKEN
 from helpers import Script, reply
 from hushscript import AgentInfo, AsyncHushscript, ConfigurationError, Hushscript
-from hushscript._config import resolve_config
+from hushscript._config import SETUP_HINT, resolve_config, resolve_tokenless_config
 from hushscript.generated.hints import HINTS
 
 
@@ -290,3 +290,235 @@ def test_tokenless_entry_points_validate_base_urls_before_requests(
         invoke()
     assert (raised.value.code, raised.value.status) == ("config_invalid", None)
     assert script.requests == []
+
+
+UNSET_STRINGS = [None, "", " ", "\t", " \t\r\n", "\u00a0", "\u2003\u3000"]
+
+
+@pytest.mark.parametrize("client", [Hushscript, AsyncHushscript])
+@pytest.mark.parametrize("unset", UNSET_STRINGS)
+@pytest.mark.parametrize(
+    ("option", "environment", "value"),
+    [
+        ("token", "HUSHSCRIPT_TOKEN", TOKEN),
+        ("base_url", "HUSHSCRIPT_BASE_URL", "https://api.environment.example"),
+        ("log_level", "HUSHSCRIPT_LOG", "debug"),
+    ],
+)
+def test_unset_constructor_options_fall_back_to_the_environment(
+    client: type[Hushscript | AsyncHushscript],
+    unset: str | None,
+    option: str,
+    environment: str,
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(environment, value)
+    options: dict[str, Any] = {"token": TOKEN, option: unset}
+    hs = client(**options)
+    config = hs._config  # pyright: ignore[reportPrivateUsage]
+    actual = config.credentials.token if option == "token" else getattr(config, option)
+    assert actual == value
+    if isinstance(hs, AsyncHushscript):
+        asyncio.run(hs.aclose())
+    else:
+        hs.close()
+
+
+@pytest.mark.parametrize("client", [Hushscript, AsyncHushscript])
+@pytest.mark.parametrize("option_unset", UNSET_STRINGS)
+@pytest.mark.parametrize("environment_unset", UNSET_STRINGS)
+def test_unset_token_sources_raise_the_exact_missing_token_error(
+    client: type[Hushscript | AsyncHushscript],
+    option_unset: str | None,
+    environment_unset: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if environment_unset is not None:
+        monkeypatch.setenv("HUSHSCRIPT_TOKEN", environment_unset)
+    with pytest.raises(ConfigurationError) as raised:
+        client(option_unset)
+    assert type(raised.value) is ConfigurationError
+    assert raised.value.code == "config_invalid"
+    assert raised.value.status is None
+    assert raised.value.message == "No Hushscript token was provided."
+    assert raised.value.hint == SETUP_HINT
+    assert str(raised.value) == f"No Hushscript token was provided. {SETUP_HINT}"
+
+
+@pytest.mark.parametrize("client", [Hushscript, AsyncHushscript])
+@pytest.mark.parametrize("option_unset", UNSET_STRINGS)
+@pytest.mark.parametrize("environment_unset", UNSET_STRINGS)
+def test_unset_base_url_and_log_sources_use_defaults(
+    client: type[Hushscript | AsyncHushscript],
+    option_unset: str | None,
+    environment_unset: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if environment_unset is not None:
+        monkeypatch.setenv("HUSHSCRIPT_BASE_URL", environment_unset)
+        monkeypatch.setenv("HUSHSCRIPT_LOG", environment_unset)
+    hs = client(TOKEN, base_url=option_unset, log_level=option_unset)
+    assert hs._config.base_url == "https://api.hushscript.com"  # pyright: ignore[reportPrivateUsage]
+    assert hs._config.log_level == "off"  # pyright: ignore[reportPrivateUsage]
+    if isinstance(hs, AsyncHushscript):
+        asyncio.run(hs.aclose())
+    else:
+        hs.close()
+
+
+@pytest.mark.parametrize("client", [Hushscript, AsyncHushscript])
+@pytest.mark.parametrize("from_environment", [False, True])
+@pytest.mark.parametrize(
+    ("option", "environment", "invalid", "message"),
+    [
+        ("token", "HUSHSCRIPT_TOKEN", "x", "This doesn't look like a Hushscript token."),
+        (
+            "token",
+            "HUSHSCRIPT_TOKEN",
+            "hsr\u200b",
+            "The token contains control or non-printable characters.",
+        ),
+        (
+            "base_url",
+            "HUSHSCRIPT_BASE_URL",
+            "ftp://x.example",
+            "base_url must be https://, or http:// to localhost, 127.0.0.1 or [::1].",
+        ),
+        (
+            "log_level",
+            "HUSHSCRIPT_LOG",
+            " debug ",
+            "log_level must be one of off, debug.",
+        ),
+        ("log_level", "HUSHSCRIPT_LOG", "\u200b", "log_level must be one of off, debug."),
+    ],
+)
+def test_nonblank_invalid_strings_do_not_fall_back(
+    client: type[Hushscript | AsyncHushscript],
+    *,
+    from_environment: bool,
+    option: str,
+    environment: str,
+    invalid: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options: dict[str, Any] = {"token": TOKEN}
+    if from_environment:
+        monkeypatch.setenv(environment, invalid)
+        options[option] = "\u2003"
+    else:
+        valid = {"token": TOKEN, "base_url": "https://valid.example", "log_level": "off"}
+        monkeypatch.setenv(environment, valid[option])
+        options[option] = invalid
+    with pytest.raises(ConfigurationError) as raised:
+        client(**options)
+    assert type(raised.value) is ConfigurationError
+    assert raised.value.code == "config_invalid"
+    assert raised.value.status is None
+    assert raised.value.message == message
+    assert raised.value.hint is None
+    assert str(raised.value) == message
+
+
+@pytest.mark.parametrize("option_unset", UNSET_STRINGS)
+@pytest.mark.parametrize("environment_unset", UNSET_STRINGS)
+def test_tokenless_unset_string_sources_use_defaults(
+    option_unset: str | None,
+    environment_unset: str | None,
+) -> None:
+    environment = {"HUSHSCRIPT_TOKEN": "invalid token is never read"}
+    if environment_unset is not None:
+        environment.update(HUSHSCRIPT_BASE_URL=environment_unset, HUSHSCRIPT_LOG=environment_unset)
+    config = resolve_tokenless_config(
+        base_url=option_unset,
+        log_level=option_unset,
+        env=environment,
+    )
+    assert config.base_url == "https://api.hushscript.com"
+    assert config.log_level == "off"
+    assert config.credentials.token is None
+
+
+@pytest.mark.parametrize("unset", UNSET_STRINGS)
+def test_tokenless_unset_options_fall_back_to_environment(unset: str | None) -> None:
+    config = resolve_tokenless_config(
+        base_url=unset,
+        log_level=unset,
+        env={"HUSHSCRIPT_BASE_URL": "https://environment.example", "HUSHSCRIPT_LOG": "debug"},
+    )
+    assert config.base_url == "https://environment.example"
+    assert config.log_level == "debug"
+    assert config.credentials.token is None
+
+
+@pytest.mark.parametrize("client", [Hushscript, AsyncHushscript])
+@pytest.mark.parametrize(
+    ("option", "environment", "value", "expected"),
+    [
+        ("token", "HUSHSCRIPT_TOKEN", "\u2003hsr\u3000", "hsr"),
+        (
+            "base_url",
+            "HUSHSCRIPT_BASE_URL",
+            "https://explicit.example/",
+            "https://explicit.example",
+        ),
+        ("log_level", "HUSHSCRIPT_LOG", "off", "off"),
+    ],
+)
+def test_valid_constructor_options_override_invalid_environment(
+    client: type[Hushscript | AsyncHushscript],
+    option: str,
+    environment: str,
+    value: str,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(environment, "invalid")
+    options: dict[str, Any] = {"token": TOKEN, option: value}
+    hs = client(**options)
+    config = hs._config  # pyright: ignore[reportPrivateUsage]
+    actual = config.credentials.token if option == "token" else getattr(config, option)
+    assert actual == expected
+    if isinstance(hs, AsyncHushscript):
+        asyncio.run(hs.aclose())
+    else:
+        hs.close()
+
+
+@pytest.mark.parametrize("from_environment", [False, True])
+@pytest.mark.parametrize(
+    ("option", "environment", "invalid", "message"),
+    [
+        (
+            "base_url",
+            "HUSHSCRIPT_BASE_URL",
+            "ftp://x.example",
+            "base_url must be https://, or http:// to localhost, 127.0.0.1 or [::1].",
+        ),
+        ("log_level", "HUSHSCRIPT_LOG", " debug ", "log_level must be one of off, debug."),
+    ],
+)
+def test_tokenless_nonblank_invalid_strings_do_not_fall_back(
+    *,
+    from_environment: bool,
+    option: str,
+    environment: str,
+    invalid: str,
+    message: str,
+) -> None:
+    values = {"base_url": "https://valid.example", "log_level": "off"}
+    options: dict[str, Any] = {option: invalid}
+    env = {environment: values[option]}
+    if from_environment:
+        options[option] = "\u2003"
+        env[environment] = invalid
+    with pytest.raises(ConfigurationError) as raised:
+        resolve_tokenless_config(env=env, **options)
+    assert type(raised.value) is ConfigurationError
+    assert raised.value.code == "config_invalid"
+    assert raised.value.status is None
+    assert raised.value.message == message
+    assert raised.value.hint is None
+    assert str(raised.value) == message

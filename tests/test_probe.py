@@ -6,11 +6,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from hushscript import UnsupportedMediaError
+from hushscript import PreflightError, UnsupportedMediaError
 from hushscript.transcribe.preflight import Options, check_media
 from hushscript.transcribe.probe import probe_duration, scan_mp3_duration
 from hushscript.transcribe.sniff import HEAD_BYTES, sniff
 from hushscript.transcribe.source import BytesSource, PathSource, make_source
+from pipe import media
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -113,6 +114,21 @@ def test_bytes_that_are_not_readable_media_have_no_duration(data: bytes) -> None
     assert "duration_seconds" in str(raised.value)
 
 
+@pytest.mark.parametrize(
+    ("data", "shown"),
+    [
+        (b"fLaC" + bytes(40), "error: file said 2 bytes, read 0 bytes"),
+        (b"\x00\x00\x00\x18ftypM4A " + bytes(40), "MP4StreamInfoError: not a MP4 file"),
+        (b"RIFF\x00\x00\x00\x00WAVE" + bytes(40), "InvalidChunk: Container chunk data size < 4"),
+        (b"OggS" + bytes(60), "OggVorbisHeaderError: page has not packets"),
+    ],
+)
+def test_a_probe_failure_names_the_original_type_and_message(data: bytes, shown: str) -> None:
+    with pytest.raises(UnsupportedMediaError) as raised:
+        probe_duration(BytesSource(data))
+    assert raised.value.message == f"Could not read the duration ({shown}); pass duration_seconds."
+
+
 def test_a_stream_that_cannot_seek_cannot_be_probed() -> None:
     source = make_source(OneWay(FRAME_128 * 10), 4170)
     with pytest.raises(UnsupportedMediaError):
@@ -124,3 +140,33 @@ def test_a_file_that_reports_no_length_is_unreadable(media_dir: Path) -> None:
     silent[40:44] = b"\x00\x00\x00\x00"
     with pytest.raises(UnsupportedMediaError):
         probe_duration(BytesSource(bytes(silent)))
+
+
+class FailingHead(BytesSource):
+    """Bytes whose head read fails on the given call."""
+
+    def __init__(self, data: bytes, failing_call: int) -> None:
+        super().__init__(data)
+        self.failing_call = failing_call
+        self.calls = 0
+
+    def head(self) -> bytes:
+        self.calls += 1
+        if self.calls == self.failing_call:
+            raise OSError("disk went away")
+        return super().head()
+
+
+@pytest.mark.parametrize("failing_call", [1, 2])
+def test_a_read_failure_in_preflight_names_the_original_and_keeps_the_os_error(
+    failing_call: int,
+) -> None:
+    source = FailingHead(media(), failing_call)
+    with pytest.raises(PreflightError) as raised:
+        check_media(source, Options())
+    assert (raised.value.code, raised.value.message) == (
+        "file_unreadable",
+        "The file cannot be read (OSError: disk went away).",
+    )
+    assert source.calls == failing_call
+    assert type(raised.value.__cause__) is OSError  # spec 9.2: the OS error is the cause

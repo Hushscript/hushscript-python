@@ -55,7 +55,12 @@ def test_a_missing_path_is_file_unreadable_with_the_os_error_and_no_request(
     hs = hs_for(monkeypatch, api)
     with pytest.raises(PreflightError) as raised:
         hs.transcribe(tmp_path / "missing.mp3", duration_seconds=100)
+    missing = tmp_path / "missing.mp3"
     assert raised.value.code == "file_unreadable"
+    assert raised.value.message == (
+        f"The file {missing} cannot be read "
+        f"(FileNotFoundError: [Errno 2] No such file or directory: '{missing}')."
+    )
     assert isinstance(raised.value.__cause__, FileNotFoundError)
     assert api.requests == []
 
@@ -119,6 +124,9 @@ def test_a_read_failure_in_the_middle_of_the_upload_is_source_read_failed(
     with pytest.raises(UploadError) as raised:
         hs.transcribe(stream, duration_seconds=100, concurrency=1)
     assert raised.value.code == "source_read_failed"
+    assert (
+        raised.value.message == "Part 2 could not be read from the file (OSError: disk went away)."
+    )
     assert isinstance(raised.value.__cause__, OSError)
     assert api.count("POST", COMPLETE) == 0
     assert raised.value.resume_token

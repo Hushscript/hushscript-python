@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from conftest import TOKEN
-from helpers import error_body, reply
+from helpers import error_body, reply, snapshot
 from hushscript import (
     ApiError,
     AsyncHushscript,
@@ -67,7 +67,7 @@ class Shop:
         self.log: list[httpx.Request] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
-        self.log.append(request)
+        self.log.append(snapshot(request))
         if request.url.path == CARDS:
             return reply(200, self.cards)
         assert request.url.path == PURCHASE, request.url.path
@@ -249,6 +249,33 @@ def test_a_network_error_is_retried_once_then_carries_the_key(
     assert len(shop.sent()) == 2
     assert shop.sent()[0] == shop.sent()[1]
     assert raised.value.idempotency_key == shop.sent()[0]["idempotency_key"]
+
+
+def test_a_purchase_that_provably_never_went_out_carries_no_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shop = Shop(purchases=[httpx.ConnectError("refused")])
+    with pytest.raises(NetworkError) as raised:
+        buy(monkeypatch, shop)
+    assert len(shop.sent()) == 2
+    assert raised.value.idempotency_key is None
+    assert raised.value.message == (
+        "Could not reach the Hushscript API before the request was sent: "
+        "POST /v1/billing/purchase (ConnectError: refused)."
+    )
+
+
+def test_a_purchase_that_may_have_gone_out_once_keeps_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shop = Shop(purchases=[httpx.ReadError("reset"), httpx.ConnectError("refused")])
+    with pytest.raises(NetworkError) as raised:
+        buy(monkeypatch, shop)
+    assert len(shop.sent()) == 2
+    assert raised.value.idempotency_key == shop.sent()[0]["idempotency_key"]
+    assert raised.value.message == (
+        "Could not reach the Hushscript API: POST /v1/billing/purchase (ConnectError: refused)."
+    )
 
 
 def test_a_key_from_a_failed_attempt_asks_again_with_the_same_key(

@@ -12,7 +12,10 @@ from ._errors import (
     HushscriptError,
     NetworkError,
     OutcomeUnknownError,
+    describe_failure,
+    mark_unsent,
     parse_retry_after,
+    redacted_cause,
     unexpected_error,
 )
 from ._guard import generated_parser, unusable_answer
@@ -117,6 +120,15 @@ def release(request: httpx.Request) -> None:
     request._content = b""  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]  # httpx cached the body
 
 
+def sanitize(request: httpx.Request) -> None:
+    """Strips what is secret from a request that is done with (R91): the bearer header, the
+    query (a signed URL's signature) and the body (a claim secret). httpx keeps the request on
+    the response and on its errors, so it is changed in place; method, host and path stay."""
+    request.headers.pop("Authorization", None)
+    request.url = request.url.copy_with(query=None)
+    release(request)
+
+
 class _WrittenBody(httpx.SyncByteStream, httpx.AsyncByteStream):
     """Passes a request body through and notes when the last chunk has been handed to the socket."""
 
@@ -150,37 +162,55 @@ class _DeadlineBody(httpx.SyncByteStream, httpx.AsyncByteStream):
         self._attempt = attempt
 
     def __iter__(self) -> Iterator[bytes]:
-        chunks = iter(cast("Iterable[bytes]", self._inner))
-        while True:
-            self._attempt.tighten()
-            try:
-                chunk = next(chunks)
-            except StopIteration:
-                return
-            yield chunk
+        try:
+            chunks = iter(cast("Iterable[bytes]", self._inner))
+            while True:
+                self._attempt.tighten()
+                try:
+                    chunk = next(chunks)
+                except StopIteration:
+                    return
+                yield chunk
+        finally:
+            self._attempt.body_ended()
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
-        chunks = aiter(cast("AsyncIterable[bytes]", self._inner))
-        while True:
-            self._attempt.tighten()
-            try:
-                chunk = await anext(chunks)
-            except StopAsyncIteration:
-                return
-            yield chunk
+        try:
+            chunks = aiter(cast("AsyncIterable[bytes]", self._inner))
+            while True:
+                self._attempt.tighten()
+                try:
+                    chunk = await anext(chunks)
+                except StopAsyncIteration:
+                    return
+                yield chunk
+        finally:
+            self._attempt.body_ended()
 
     def close(self) -> None:
-        cast("httpx.SyncByteStream", self._inner).close()
+        try:
+            cast("httpx.SyncByteStream", self._inner).close()
+        finally:
+            self._let_go()
 
     async def aclose(self) -> None:
-        await cast("httpx.AsyncByteStream", self._inner).aclose()
+        try:
+            await cast("httpx.AsyncByteStream", self._inner).aclose()
+        finally:
+            self._let_go()
+
+    def _let_go(self) -> None:
+        """A closed body is done with: the transport's stream underneath keeps its own copy of
+        the request (bearer header, signed URL), so it is dropped."""
+        self._inner = httpx.ByteStream(b"")
+        self._attempt.body_ended()
 
 
 class _Attempt:
     """The bookkeeping shared by the sync and async transports."""
 
     def __init__(self, request: httpx.Request, settings: TransportSettings) -> None:
-        self.request = request
+        self._request: httpx.Request | None = request
         self.settings = settings
         on_base = _same_origin(request.url, settings.base_url)
         # Spec 7.4: the class comes from the method and the path relative to the base URL. A
@@ -210,8 +240,36 @@ class _Attempt:
         self.deadline = self.started + self.budget
         self.body: _WrittenBody | None = None
         self.answered = False
+        self.maybe_sent = False
+        """Some attempt may have reached the server: an answer came, a failure was not one of
+        those raised before anything is written, or the SDK cannot tell (R103)."""
+        self.handed_out = False
+        """The response went to the caller with its body unread; reading or closing that body
+        ends the call."""
         self.phases: dict[str, float | None] = {}
         self._track_body()
+
+    @property
+    def request(self) -> httpx.Request:
+        """The request carries the bearer token, a claim secret in its body and, for a part, the
+        signed URL as plain text, so it is stripped and let go once the call is over (R91); a
+        streamed body still being read keeps the attempt open."""
+        if self._request is None:
+            raise RuntimeError("the attempt is over")
+        return self._request
+
+    def finish(self) -> None:
+        """Ends the call; a second call does nothing."""
+        request, self._request = self._request, None
+        self.body = None
+        if request is not None:
+            sanitize(request)
+
+    def body_ended(self) -> None:
+        """A response body was read to its end or closed. That ends the call only for the
+        response handed out; one closed before a retry leaves the attempt going."""
+        if self.handed_out:
+            self.finish()
 
     def _authorize(self) -> None:
         credentials = self.settings.credentials
@@ -285,7 +343,9 @@ class _Attempt:
         response.stream = _DeadlineBody(response.stream, self)
 
     def stamp(self, error: HushscriptError) -> None:
-        if self.purchase_key is not None and error.idempotency_key is None:
+        """R61 and R103: the purchase key rides on every error unless no attempt can have been
+        sent, when nothing can have been charged."""
+        if self.purchase_key is not None and self.maybe_sent and error.idempotency_key is None:
             error.idempotency_key = self.purchase_key
 
     def unusable(self, response: httpx.Response) -> HushscriptError | None:
@@ -337,26 +397,41 @@ class _Attempt:
         )
 
     def failure_error(self, failure: httpx.RequestError) -> NetworkError | OutcomeUnknownError:
-        reason = type(failure).__name__
+        """The error for a transport failure. Its cause is a stand-in: the httpx error keeps the
+        request it sent, bearer header and signed URL included (R86, R91)."""
+        reason = describe_failure(failure, self.settings.credentials)
         where = f"{self.request.method} {self.label}"
+        error: NetworkError | OutcomeUnknownError
         if self.retry_class is RetryClass.NEVER and not is_not_sent(failure):
-            return OutcomeUnknownError(
+            error = OutcomeUnknownError(
                 f"No response arrived for {where} ({reason}).",
                 code="outcome_unknown",
                 hint=UNKNOWN_HINTS.get(self.route or ""),
             )
-        return NetworkError(f"Could not reach the Hushscript API: {where} ({reason}).")
+        elif self.purchase_key is not None and not self.maybe_sent:
+            error = NetworkError(
+                "Could not reach the Hushscript API before the request was sent: "
+                f"{where} ({reason})."
+            )
+            mark_unsent(error)
+        else:
+            error = NetworkError(f"Could not reach the Hushscript API: {where} ({reason}).")
+        error.__cause__ = redacted_cause(failure, self.settings.credentials)
+        return error
 
     def unexpected(self, failure: Exception) -> HushscriptError:
         """Spec 9.2 and R61: a failure of the SDK's own. A claim, rotation or signup answer lost
         this way after the request went out is as lost as one that never came (spec 7.4); one
-        before it was sent lost nothing."""
-        error = unexpected_error(failure, self.settings.credentials)
+        before it was sent lost nothing. Whether it was sent is known once an answer came, or,
+        for a request whose body is tracked, from that body (R100)."""
+        sent: bool | None = True if self.sent() else (None if self.body is None else False)
+        self.maybe_sent = self.maybe_sent or sent is not False
+        error = unexpected_error(failure, self.settings.credentials, sent=sent)
         if self.retry_class is not RetryClass.NEVER or not self.sent():
             return error
         unknown = OutcomeUnknownError(
             f"The answer to {self.request.method} {self.label} could not be used "
-            f"({type(failure).__name__}).",
+            f"({describe_failure(failure, self.settings.credentials)}).",
             code="outcome_unknown",
             hint=UNKNOWN_HINTS.get(self.route or ""),
         )
@@ -385,13 +460,19 @@ class RetryingTransport(httpx.BaseTransport):
         attempt = _Attempt(request, self._settings)
         del request
         try:
-            return self._run(attempt)
+            response = self._run(attempt)
         except BaseException as error:
             if isinstance(error, HushscriptError):
                 attempt.stamp(error)
             if attempt.retry_class is RetryClass.PART:
                 release(attempt.request)
+            attempt.finish()
             raise
+        if attempt.stream and not response.is_closed:
+            attempt.handed_out = True  # its body's end or close finishes the attempt
+        else:
+            attempt.finish()
+        return response
 
     def _run(self, attempt: _Attempt) -> httpx.Response:
         while True:
@@ -411,29 +492,32 @@ class RetryingTransport(httpx.BaseTransport):
     def _once(self, attempt: _Attempt) -> tuple[Decision, httpx.Response | None]:
         """One attempt: what to do next and the response, if one came. Nothing but an SDK error
         leaves it (R61)."""
-        unexpected: HushscriptError | None = None
+        failed: HushscriptError
         try:
             try:
                 response = self._send(attempt)
             except httpx.RequestError as failure:
+                attempt.maybe_sent = attempt.maybe_sent or not is_not_sent(failure)
                 decision = attempt.judge(Outcome(failure=failure))
-                if not decision.retry:
-                    raise attempt.failure_error(failure) from failure
-                return decision, None
-            try:
-                return attempt.judge(attempt.outcome_of(response)), response
-            except BaseException:
-                response.close()
-                raise
+                if decision.retry:
+                    return decision, None
+                # Raised once the handlers have ended, so the httpx error is not its context.
+                failed = attempt.failure_error(failure)
+            else:
+                try:
+                    return attempt.judge(attempt.outcome_of(response)), response
+                except BaseException:
+                    response.close()
+                    raise
         except HushscriptError:
             raise
         except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
-            unexpected = attempt.unexpected(failure)
-        raise unexpected
+            failed = attempt.unexpected(failure)
+        raise failed
 
     def _send(self, attempt: _Attempt) -> httpx.Response:
         response = self._inner.handle_request(attempt.request)
-        attempt.answered = True
+        attempt.answered = attempt.maybe_sent = True
         try:
             attempt.read(response)
             if not attempt.stream:
@@ -456,13 +540,19 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
         attempt = _Attempt(request, self._settings)
         del request
         try:
-            return await self._run(attempt)
+            response = await self._run(attempt)
         except BaseException as error:
             if isinstance(error, HushscriptError):
                 attempt.stamp(error)
             if attempt.retry_class is RetryClass.PART:
                 release(attempt.request)
+            attempt.finish()
             raise
+        if attempt.stream and not response.is_closed:
+            attempt.handed_out = True  # its body's end or close finishes the attempt
+        else:
+            attempt.finish()
+        return response
 
     async def _run(self, attempt: _Attempt) -> httpx.Response:
         while True:
@@ -482,28 +572,31 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
     async def _once(self, attempt: _Attempt) -> tuple[Decision, httpx.Response | None]:
         """One attempt: what to do next and the response, if one came. Nothing but an SDK error
         leaves it (R61); a cancellation passes through, with the note a lost secret needs."""
-        unexpected: HushscriptError | None = None
+        failed: HushscriptError
         try:
             try:
                 response = await self._send(attempt)
             except httpx.RequestError as failure:
+                attempt.maybe_sent = attempt.maybe_sent or not is_not_sent(failure)
                 decision = attempt.judge(Outcome(failure=failure))
-                if not decision.retry:
-                    raise attempt.failure_error(failure) from failure
-                return decision, None
+                if decision.retry:
+                    return decision, None
+                # Raised once the handlers have ended, so the httpx error is not its context.
+                failed = attempt.failure_error(failure)
             except asyncio.CancelledError as cancelled:
                 attempt.note_cancellation(cancelled)
                 raise
-            try:
-                return attempt.judge(attempt.outcome_of(response)), response
-            except BaseException:
-                await response.aclose()
-                raise
+            else:
+                try:
+                    return attempt.judge(attempt.outcome_of(response)), response
+                except BaseException:
+                    await response.aclose()
+                    raise
         except HushscriptError:
             raise
         except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
-            unexpected = attempt.unexpected(failure)
-        raise unexpected
+            failed = attempt.unexpected(failure)
+        raise failed
 
     async def _send(self, attempt: _Attempt) -> httpx.Response:
         """One attempt, held to its deadline even while blocked on the network. Only the expiry of
@@ -511,7 +604,7 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
         try:
             async with asyncio.timeout(max(attempt.remaining(), 0.0)):
                 response = await self._inner.handle_async_request(attempt.request)
-                attempt.answered = True
+                attempt.answered = attempt.maybe_sent = True
                 try:
                     attempt.read(response)
                     if not attempt.stream:

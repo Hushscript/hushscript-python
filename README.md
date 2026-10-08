@@ -56,6 +56,10 @@ The list holds finished transcripts only. A recording that is still processing i
 it in `hs.jobs.list(active=True)`. `hs.jobs.wait(job_id)` waits for one, and
 `hs.transcripts.get(transcript_id)` returns the full `Transcript` once it is done.
 
+`hs.transcripts.page(cursor=...)` returns one page. A page that hands back the cursor it was sent
+raises `HushscriptError` with the code `pagination_loop`, from `page` and from the list iterators
+alike.
+
 ## Buy a pack
 
 ```python
@@ -244,6 +248,17 @@ An error raised after an upload started, or after a purchase was sent, carries `
 once the job exists it carries `resume_token` too. Pass the token to `hs.resume(token, file)` to
 carry on without a second charge.
 
+Every error that wraps another ends its message with the original's type and its message, tokens and
+signed-URL queries removed, for example `(ConnectError: refused)`. Where the original comes from the
+HTTP or parsing layer (`network_error`, `outcome_unknown`, `unexpected_error`, `bad_response`), the
+`__cause__` is a stand-in with that text, not the original: an httpx error keeps the request it sent
+and a JSON error the body it read. Where it comes from a local file or media read
+(`file_unreadable`, `source_read_failed`, `duration_unreadable`, a resume token that does not
+decode), the cause is the original error itself. A failure of the SDK itself that is not a transport
+failure is `unexpected_error`; its message says whether the request was sent when the SDK knows. A
+purchase that provably failed before its request was sent carries no `idempotency_key` and says so:
+nothing was charged.
+
 ## What the SDK does for you
 
 - **Checks before it spends.** It sniffs the format from the file's bytes, probes the duration,
@@ -266,9 +281,15 @@ carry on without a second charge.
   error, log line, `repr`, pickle and copy. The results that hand you a secret
   (`AgentSignup.claim_secret`, `AgentAccount.token`, `RotatedToken.token`) keep it readable as a
   field, but `repr`, `str` and `pprint` show `[redacted]` in its place; `dataclasses.asdict`, `json`
-  and `pickle` are your own export and carry the value. The SDK keeps secrets out of the local
-  variables of its own frames, but an error reporter that captures local variables (for example
-  Sentry with `include_local_variables`) can still see them inside the HTTP library's frames.
+  and `pickle` are your own export and carry the value. Once an HTTP call has returned or raised, no
+  local of an SDK frame and no attribute of an SDK object reachable from one holds the token, a
+  signed URL or a claim secret as plain text; the SDK keeps them in `Secret` and `Credentials`
+  holders that print nothing. Once a call is over, the request httpx keeps on the response and on
+  its errors is stripped in place: no `Authorization` header, no query string, no body; a streamed
+  response's request is stripped when its body is read to the end or closed. The body of a claim,
+  rotation or signup answer is dropped once read. While a call runs, httpx's own frames hold the
+  request as sent; a tool that captures local variables at that moment (for example a profiler, or
+  Sentry with `include_local_variables` on an event raised from inside the call) can see them there.
 
 ## Supported formats
 
@@ -291,9 +312,11 @@ ffmpeg -i input -vn -c:a libopus output.opus
 | `log_level`              | `HUSHSCRIPT_LOG`      | `off` (`debug` logs one metadata line per request to standard error) |
 | `clock`                  | none                  | `SystemClock`; pass a `Clock` in tests                               |
 
-An explicit option beats its environment variable. The base URL must be `https://`, or `http://` to
-`localhost`, `127.0.0.1` or `[::1]`, with no path. Each upload part has its own 300 s timeout, which
-you cannot change.
+An explicit option beats its environment variable. A `None`, empty or whitespace-only option, and
+an empty or whitespace-only environment variable, count as not set: the option falls back to the
+environment variable, then to the default. A token that is still missing raises `ConfigurationError`
+with the setup hint. The base URL must be `https://`, or `http://` to `localhost`, `127.0.0.1` or
+`[::1]`, with no path. Each upload part has its own 300 s timeout, which you cannot change.
 
 ## Privacy
 

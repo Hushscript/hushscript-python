@@ -10,9 +10,9 @@ from hypothesis import strategies as st
 
 from conftest import TOKEN
 from helpers import reply
-from hushscript import OutcomeUnknownError
+from hushscript import HushscriptError, OutcomeUnknownError
 from hushscript._errors import error_from_response
-from hushscript._redact import REDACTED, TOKEN_PATTERN, Credentials, redact
+from hushscript._redact import REDACTED, TOKEN_PATTERN, Credentials, redact, redact_queries
 from routes import hs_on
 
 
@@ -139,3 +139,43 @@ def test_a_registered_secret_with_a_lone_surrogate_never_breaks_redaction() -> N
         f"echo {REDACTED} {REDACTED}"
     )
     assert credentials.scrub(f"echo {TOKEN}") == f"echo {REDACTED}"
+
+
+@pytest.mark.parametrize(
+    ("text", "shown"),
+    [
+        (
+            "PUT https://acct.r2.example.com/b/k?X-Amz-Signature=abc&X-Amz-Expires=60 failed",
+            "PUT https://acct.r2.example.com/b/k?[redacted] failed",
+        ),
+        ("HTTP://HOST/b/k?sig=abc", "HTTP://HOST/b/k?[redacted]"),
+        ("wss://host/p?t=1#part", "wss://host/p?[redacted]#part"),
+        ("/b/k?sig=abc", "/b/k?[redacted]"),
+        ("PUT /b/k?sig=abc", "PUT /b/k?[redacted]"),
+        ('url "/b/k?sig=abc"', 'url "/b/k?[redacted]"'),
+        ("(ConnectError: https://h/p?sig=abc).", "(ConnectError: https://h/p?[redacted])."),
+        ("url=/b?sig=abc", "url=/b?[redacted]"),
+        ("/?sig=abc", "/?[redacted]"),
+        ("ready?", "ready?"),
+        ("what? yes", "what? yes"),
+        ("a/b?c=1", "a/b?c=1"),
+        ("/b/k?", "/b/k?"),
+        ("https://host/b/k", "https://host/b/k"),
+        ("", ""),
+        ("   ", "   "),
+    ],
+)
+def test_a_query_string_is_redacted_and_the_rest_of_the_url_kept(text: str, shown: str) -> None:
+    assert redact_queries(text) == shown
+    assert redact_queries(shown) == shown
+
+
+def test_an_error_message_and_hint_have_their_query_strings_redacted() -> None:
+    error = HushscriptError(
+        "PUT https://r2.example/b/k?X-Amz-Signature=abc failed", hint="Retry /b/k?sig=abc later."
+    )
+    assert error.message == "PUT https://r2.example/b/k?[redacted] failed"
+    assert error.hint == "Retry /b/k?[redacted] later."
+    assert str(error) == (
+        "PUT https://r2.example/b/k?[redacted] failed Retry /b/k?[redacted] later."
+    )

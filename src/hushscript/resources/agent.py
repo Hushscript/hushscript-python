@@ -9,13 +9,14 @@ from hushscript._errors import (
     HushscriptError,
     OutcomeUnknownError,
     ValidationError,
+    describe_failure,
     raise_for_response,
-    unexpected_error,
+    redacted_cause,
 )
 from hushscript._http import UNKNOWN_HINTS
 from hushscript._json import as_dict, as_list, loads
-from hushscript._redact import REDACTED, Secret
-from hushscript._response import bad_response, parsed
+from hushscript._redact import MIN_SECRET_TAIL, REDACTED, Secret
+from hushscript._response import bad_response, forget_body, parsed
 from hushscript._retry import CLAIM, ROTATE
 from hushscript._shape import INT_LIMIT, as_text, as_whole, check_shape, to_datetime
 from hushscript._shapes import AGENT_SIGNUP
@@ -218,10 +219,17 @@ def _decode(response: httpx.Response) -> dict[str, object]:
 
 
 def _unknown(
-    route: str, hint_key: str, seen: Secret | None, credentials: Credentials
+    route: str,
+    hint_key: str,
+    seen: Secret | None,
+    credentials: Credentials,
+    reason: str | None = None,
 ) -> OutcomeUnknownError:
+    because = "" if reason is None else f" ({reason})"
     return OutcomeUnknownError(
-        credentials.scrub(f"The answer to {route} could not be used, so the token may be lost."),
+        credentials.scrub(
+            f"The answer to {route} could not be used{because}, so the token may be lost."
+        ),
         hint=UNKNOWN_HINTS[hint_key],
         received_token=seen,
     )
@@ -247,8 +255,8 @@ def _stray_credential(
 ) -> OutcomeUnknownError:
     """The same loss when the SDK itself failed on the answer (R61): the original rides along as
     a redacted cause, and `seen` is kept on the error."""
-    lost = _unknown(route, hint_key, seen, credentials)
-    lost.__cause__ = unexpected_error(failure, credentials).__cause__
+    lost = _unknown(route, hint_key, seen, credentials, describe_failure(failure, credentials))
+    lost.__cause__ = redacted_cause(failure, credentials)
     return lost
 
 
@@ -289,6 +297,8 @@ def settle(
         raise
     except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
         lost = _stray_credential(failure, route, hint_key, seen, credentials)
+    finally:
+        forget_body(response)  # the body held the token as text
     raise lost
 
 
@@ -322,12 +332,23 @@ def claim_path(signup_id: object) -> str:
     return f"/v1/agent/accounts/{path_id(signup_id)}/claim"
 
 
+def remember_claim_secret(credentials: Credentials, claim_secret: Secret) -> None:
+    """R96: the claim secret is scrubbed from every error text while the claim runs, like the
+    token. A text shorter than a token's secret part is not one the server issues, and scrubbing
+    it would cut every word that contains it, so it is left out."""
+    if len(claim_secret.reveal()) >= MIN_SECRET_TAIL:
+        credentials.remember(claim_secret.reveal())
+
+
 def claim_body(claim_secret: Secret) -> dict[str, object]:
     return {"claim_secret": claim_secret.reveal()}
 
 
 def signed_up(response: httpx.Response, credentials: Credentials) -> AgentSignup:
-    return parsed(response, credentials, signup_of)
+    try:
+        return parsed(response, credentials, signup_of)
+    finally:
+        forget_body(response)  # the body held the claim secret as text
 
 
 def claimed(response: httpx.Response, credentials: Credentials) -> AgentAccount:

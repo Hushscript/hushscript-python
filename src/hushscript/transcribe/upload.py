@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Final
 import httpx
 
 from hushscript._config import PART_TIMEOUT
-from hushscript._errors import NetworkError, UploadError, raise_for_response
+from hushscript._errors import NetworkError, UploadError, describe_failure, raise_for_response
 from hushscript._http import CLASS_EXTENSION, LABEL_EXTENSION, STREAM_EXTENSION, release
 from hushscript._json import as_dict, as_list
 from hushscript._log import hiding_signed_url
@@ -276,7 +276,8 @@ def etag_missing(n: int) -> UploadError:
 
 def source_read_failed(n: int, failure: BaseException) -> UploadError:
     return UploadError(
-        f"Part {n} could not be read from the file ({failure}).", code="source_read_failed"
+        f"Part {n} could not be read from the file ({describe_failure(failure)}).",
+        code="source_read_failed",
     )
 
 

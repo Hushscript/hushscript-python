@@ -28,6 +28,12 @@ def pagination_loop() -> HushscriptError:
     )
 
 
+def check_cursor_advanced(sent: str | None, page: Page[T]) -> None:
+    """R89: a page that hands back the cursor it was asked with would repeat forever."""
+    if page.next_cursor and page.next_cursor == sent:
+        raise pagination_loop()
+
+
 def paginate(fetch: Callable[[str | None], Page[T]]) -> Iterator[T]:
     """Walks a cursor-paged list one page at a time, yielding every item in order. The walk is lazy:
     closing the iterator (or breaking out of a loop over it) sends no further request. A page that
@@ -38,11 +44,10 @@ def paginate(fetch: Callable[[str | None], Page[T]]) -> Iterator[T]:
         sent = cursor
         page = fetch(sent)
         yield from page.items
+        check_cursor_advanced(sent, page)
         cursor = page.next_cursor or None
         if cursor is None:
             return
-        if cursor == sent:
-            raise pagination_loop()
 
 
 async def apaginate(fetch: Callable[[str | None], Awaitable[Page[T]]]) -> AsyncIterator[T]:
@@ -53,8 +58,7 @@ async def apaginate(fetch: Callable[[str | None], Awaitable[Page[T]]]) -> AsyncI
         page = await fetch(sent)
         for item in page.items:
             yield item
+        check_cursor_advanced(sent, page)
         cursor = page.next_cursor or None
         if cursor is None:
             return
-        if cursor == sent:
-            raise pagination_loop()

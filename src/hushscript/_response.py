@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, TypeVar
 
-from ._errors import ApiError, raise_for_response
+import httpx
+
+from ._errors import ApiError, describe_failure, raise_for_response, redacted_cause
 from ._json import loads
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    import httpx
 
     from ._redact import Credentials
 
@@ -26,6 +26,28 @@ def bad_response(response: httpx.Response, what: str) -> ApiError:
     )
 
 
+def unreadable_response(
+    response: httpx.Response, failure: BaseException, credentials: Credentials | None
+) -> ApiError:
+    """`bad_response` for a body the SDK could not read, naming the original's type and redacted
+    message (R86). Its cause is a stand-in: a JSON error keeps the whole body it read, which may
+    hold a token or a claim secret."""
+    error = ApiError(
+        f"The API's response could not be used ({describe_failure(failure, credentials)}).",
+        code="bad_response",
+        status=response.status_code,
+    )
+    error.__cause__ = redacted_cause(failure, credentials)
+    return error
+
+
+def forget_body(response: httpx.Response) -> None:
+    """Drops a read body that carried a secret (a token, a claim secret) once the SDK is done with
+    it (R91); the response itself may outlive the call in a frame or an error reporter."""
+    response.stream = httpx.ByteStream(b"")
+    response._content = b""  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]  # httpx cached the body
+
+
 def json_body(response: httpx.Response, credentials: Credentials) -> object:
     """The JSON of a 2xx response; a non-2xx one raises the spec 9.2 error."""
     raise_for_response(response, credentials=credentials)
@@ -35,7 +57,9 @@ def json_body(response: httpx.Response, credentials: Credentials) -> object:
         ValueError,
         RecursionError,
     ) as failure:  # a deeply nested body is not JSON the SDK reads
-        raise bad_response(response, "response (not JSON)") from failure
+        # Raised once the handler has ended, so the JSON error is not its context either.
+        failed = unreadable_response(response, failure, credentials)
+    raise failed
 
 
 def parsed(response: httpx.Response, credentials: Credentials, parse: Callable[[object], T]) -> T:

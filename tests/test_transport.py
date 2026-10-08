@@ -13,17 +13,27 @@ from helpers import (
     Script,
     async_client,
     error_body,
+    failing_body,
     reply,
     settings_for,
+    stand_in,
     sync_client,
 )
-from hushscript import AsyncHushscript, Hushscript, NetworkError, OutcomeUnknownError
+from hushscript import (
+    AsyncHushscript,
+    Hushscript,
+    HushscriptError,
+    NetworkError,
+    OutcomeUnknownError,
+)
 from hushscript._http import (
     ANONYMOUS_EXTENSION,
     CLASS_EXTENSION,
     LABEL_EXTENSION,
+    AsyncRetryingTransport,
     RetryingTransport,
 )
+from hushscript._redact import REDACTED
 from hushscript._retry import RetryClass
 from hushscript.generated.api.default import get_account
 
@@ -64,7 +74,7 @@ async def test_a_derived_api_failure_leaves_the_token_out_of_sdk_request_locals(
                 get_account.sync_detailed(client=derived)
     assert type(raised.value) is NetworkError
     assert (raised.value.code, raised.value.status) == ("network_error", None)
-    assert raised.value.__cause__ is failure
+    assert stand_in(raised.value) == "ReadError: reset"
     assert script.calls == 4
     assert len(clock.sleeps) == 3
     assert all(request.headers["Authorization"] == f"Bearer {TOKEN}" for request in script.requests)
@@ -158,7 +168,7 @@ def test_claim_is_never_retried_and_a_lost_response_is_unknown() -> None:
     assert script.calls == 1
     assert raised.value.hint is not None
     assert "The claim may have succeeded" in raised.value.hint
-    assert isinstance(raised.value.__cause__, httpx.ReadError)
+    assert stand_in(raised.value) == "ReadError: reset"
 
 
 def test_rotate_is_never_retried_and_a_lost_response_is_unknown() -> None:
@@ -560,3 +570,190 @@ async def test_retry_after_cannot_make_a_forbidden_status_retryable(
     assert response.status_code == status
     assert script.calls == 1
     assert clock.sleeps == []
+
+
+# Each foreign message and what the description shows after the original's type name.
+MESSAGES = [
+    ("", ""),
+    ("   ", ""),
+    ("\t", ""),
+    ("\u2003", ""),
+    ("transport failed", ": transport failed"),
+    ("echo hsr-odd-secret", f": echo {REDACTED}"),
+    (
+        "put https://r2.example/b/k?X-Amz-Signature=abc failed",
+        ": put https://r2.example/b/k?[redacted] failed",
+    ),
+    ("PUT /b/k?sig=abc failed", ": PUT /b/k?[redacted] failed"),
+    ("HTTPS://R2.EXAMPLE/b/k?sig=abc", ": HTTPS://R2.EXAMPLE/b/k?[redacted]"),
+    ("ready? what? yes", ": ready? what? yes"),
+]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("foreign", MESSAGES)
+@pytest.mark.parametrize(
+    ("make", "path", "error_class", "code", "prefix", "key"),
+    [
+        (
+            httpx.ConnectError,
+            "/v1/account",
+            NetworkError,
+            "network_error",
+            "Could not reach the Hushscript API: POST /v1/account",
+            None,
+        ),
+        (
+            httpx.ReadError,
+            "/v1/agent/accounts/sg_1/claim",
+            OutcomeUnknownError,
+            "outcome_unknown",
+            "No response arrived for POST /v1/agent/accounts/sg_1/claim",
+            None,
+        ),
+    ],
+)
+async def test_a_transport_failure_names_its_type_and_redacted_message(
+    asynchronous: bool,  # noqa: FBT001
+    foreign: tuple[str, str],
+    make: type[httpx.RequestError],
+    path: str,
+    error_class: type[HushscriptError],
+    code: str,
+    prefix: str,
+    key: str | None,
+) -> None:
+    message, shown = foreign
+    failure = make(message)
+    script = Script([failure])
+    if asynchronous:
+        async with async_client(
+            script, FakeClock(), token="hsr-odd-secret", max_retries=0
+        ) as client:
+            with pytest.raises(error_class) as raised:
+                await client.post(path, json={"idempotency_key": "purchase-key"})
+    else:
+        with (
+            sync_client(script, FakeClock(), token="hsr-odd-secret", max_retries=0) as client,
+            pytest.raises(error_class) as raised,
+        ):
+            client.post(path, json={"idempotency_key": "purchase-key"})
+    assert type(raised.value) is error_class
+    assert (raised.value.code, raised.value.status) == (code, None)
+    described = type(failure).__name__ + shown
+    assert raised.value.message == f"{prefix} ({described})."
+    assert stand_in(raised.value) == described
+    assert script.calls == 1
+    assert raised.value.idempotency_key == key
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("foreign", MESSAGES)
+@pytest.mark.parametrize(
+    ("body_fails", "path", "error_class", "code", "prefix", "key"),
+    [
+        # Nothing answered and the purchase body is not tracked: whether it went out is unknown.
+        (
+            False,
+            "/v1/billing/purchase",
+            HushscriptError,
+            "unexpected_error",
+            "An unexpected TypeError interrupted the SDK",
+            "purchase-key",
+        ),
+        (
+            True,
+            "/v1/billing/purchase",
+            HushscriptError,
+            "unexpected_error",
+            "An unexpected TypeError interrupted the SDK after the request was sent",
+            "purchase-key",
+        ),
+        (
+            True,
+            "/v1/agent/accounts/sg_1/claim",
+            OutcomeUnknownError,
+            "outcome_unknown",
+            "The answer to POST /v1/agent/accounts/sg_1/claim could not be used",
+            None,
+        ),
+    ],
+)
+async def test_an_unexpected_failure_names_its_type_and_redacted_message(
+    asynchronous: bool,  # noqa: FBT001
+    foreign: tuple[str, str],
+    body_fails: bool,  # noqa: FBT001
+    path: str,
+    error_class: type[HushscriptError],
+    code: str,
+    prefix: str,
+    key: str | None,
+) -> None:
+    message, shown = foreign
+    failure = TypeError(message)
+    script = Script([failing_body(failure) if body_fails else failure])
+    if asynchronous:
+        async with async_client(
+            script, FakeClock(), token="hsr-odd-secret", max_retries=0
+        ) as client:
+            with pytest.raises(error_class) as raised:
+                await client.post(path, json={"idempotency_key": "purchase-key"})
+    else:
+        with (
+            sync_client(script, FakeClock(), token="hsr-odd-secret", max_retries=0) as client,
+            pytest.raises(error_class) as raised,
+        ):
+            client.post(path, json={"idempotency_key": "purchase-key"})
+    described = type(failure).__name__ + shown
+    assert type(raised.value) is error_class
+    assert (raised.value.code, raised.value.status) == (code, None)
+    assert raised.value.message == f"{prefix} ({described})."
+    assert type(raised.value.__cause__).__name__ == "_RedactedCause"
+    assert str(raised.value.__cause__) == described
+    assert raised.value.__context__ is None
+    assert script.calls == 1
+    assert raised.value.idempotency_key == key
+
+
+class Unread(httpx.BaseTransport, httpx.AsyncBaseTransport):
+    """Fails before it reads a byte of the request body."""
+
+    def __init__(self, failure: Exception) -> None:
+        self.failure = failure
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:  # noqa: ARG002
+        raise self.failure
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:  # noqa: ARG002
+        raise self.failure
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_an_unexpected_failure_before_a_claim_body_was_written_says_so(
+    asynchronous: bool,  # noqa: FBT001
+) -> None:
+    settings = settings_for(FakeClock(), max_retries=0)
+    unread = Unread(TypeError("boom"))
+    path = "/v1/agent/accounts/sg_1/claim"
+    if asynchronous:
+        transport = AsyncRetryingTransport(unread, settings)
+        async with httpx.AsyncClient(base_url=BASE_URL, transport=transport) as client:
+            with pytest.raises(HushscriptError) as raised:
+                await client.post(path, json={"claim_secret": "s"})
+    else:
+        with pytest.raises(HushscriptError) as raised:
+            send_through(RetryingTransport(unread, settings), path)
+    assert type(raised.value) is HushscriptError
+    assert (raised.value.code, raised.value.status) == ("unexpected_error", None)
+    assert raised.value.message == (
+        "An unexpected TypeError interrupted the SDK before the request was sent (TypeError: boom)."
+    )
+    assert stand_in(raised.value) == "TypeError: boom"
+
+
+def send_through(transport: RetryingTransport, path: str) -> None:
+    with httpx.Client(base_url=BASE_URL, transport=transport) as client:
+        client.post(path, json={"claim_secret": "s"})

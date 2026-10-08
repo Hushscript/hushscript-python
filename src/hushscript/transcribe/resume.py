@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass
 from typing import Final
 
-from hushscript._errors import ConfigurationError, ResumeMismatchError
+from hushscript._errors import ConfigurationError, ResumeMismatchError, describe_failure
 from hushscript._json import as_dict, loads
 
 from .segment import usable_segment
@@ -50,7 +50,9 @@ def decode_token(token: object) -> ResumeState:
         raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
         fields = as_dict(loads(raw))
     except (ValueError, binascii.Error) as failure:
-        raise invalid from failure
+        raise ConfigurationError(
+            f"This is not a resume token from this SDK ({describe_failure(failure)})."
+        ) from failure
     if fields is None or fields.get("v") != TOKEN_VERSION:
         raise invalid
     job_id = fields.get("jobId")

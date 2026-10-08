@@ -13,7 +13,7 @@ from hushscript._shape import (
     to_datetime,
 )
 from hushscript._shapes import DELETED_LIST, TRANSCRIPT_LIST
-from hushscript.paginate import Page, apaginate, paginate
+from hushscript.paginate import Page, apaginate, check_cursor_advanced, paginate
 from hushscript.resources._params import check_page_size, list_params, path_id
 from hushscript.transcript import Transcript
 
@@ -116,9 +116,12 @@ class Transcripts:
     def page(
         self, *, cursor: str | None = None, page_size: int | None = None
     ) -> Page[TranscriptSummary]:
-        """One page of `list()`; `cursor` is a previous page's `next_cursor`."""
+        """One page of `list()`; `cursor` is a previous page's `next_cursor`. A page that returns
+        the cursor it was sent raises `pagination_loop`."""
         check_page_size(page_size)
-        return self._page(cursor, page_size)
+        page = self._page(cursor, page_size)
+        check_cursor_advanced(cursor, page)
+        return page
 
     def get(self, transcript_id: str) -> Transcript:
         path = f"/v1/transcripts/{path_id(transcript_id)}"
@@ -153,7 +156,9 @@ class AsyncTranscripts:
         self, *, cursor: str | None = None, page_size: int | None = None
     ) -> Page[TranscriptSummary]:
         check_page_size(page_size)
-        return await self._page(cursor, page_size)
+        page = await self._page(cursor, page_size)
+        check_cursor_advanced(cursor, page)
+        return page
 
     async def get(self, transcript_id: str) -> Transcript:
         path = f"/v1/transcripts/{path_id(transcript_id)}"

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import math
 import re
+import traceback
 from typing import TYPE_CHECKING, Any, ClassVar, Final
 
 from ._json import as_dict, as_list, loads
-from ._redact import Credentials, Secret, redact
+from ._redact import Credentials, Secret, redact, redact_queries
 from .generated.catalog import ERROR_CATALOG
 from .generated.hints import HINTS
 from .generated.scopes import OPERATION_SCOPES
@@ -19,7 +20,6 @@ _PLACEHOLDER: Final = re.compile(r"\{(\w+)\}")
 _SENTENCE_BREAK: Final = re.compile(r"(?<=\.) ")
 _TEMPLATE_PARAMETER: Final = re.compile(r"\\\{[^}/]+\\\}")
 _JOB_OR_UPLOAD: Final = re.compile(r"^[A-Z]+ /v1/(?:jobs|uploads)(?:/|$)")
-_URL_QUERY: Final = re.compile(r"(https?://[^\s\"'<>?#]+)\?[^\s\"'<>#]*")
 _INT_LIMIT: Final = 2**63
 """Numbers the SDK reads stay inside a signed 64-bit range; beyond it, or not finite, they are
 absent."""
@@ -159,10 +159,11 @@ class HushscriptError(Exception):
         """Set on every error `transcribe()` raises once its create was sent (spec 7.3): passing it
         back to `transcribe()` replays the same job."""
         self.resume_token: str | None = None
+        self._unsent = False
         if hint is None and self.auto_hint:
             hint = render_hint(self.code, self.details, retry_after, scope)
-        self.hint: str | None = redact(hint) if hint is not None else None
-        self.message: str = redact(message)
+        self.hint: str | None = redact_queries(redact(hint)) if hint is not None else None
+        self.message: str = redact_queries(redact(message))
         super().__init__(self.message)
 
     def __str__(self) -> str:
@@ -175,6 +176,15 @@ class HushscriptError(Exception):
         )
 
 
+def mark_unsent(error: HushscriptError) -> None:
+    """R103: the request provably never went out, so a purchase key must not ride along."""
+    error._unsent = True  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]  # the one writer
+
+
+def is_unsent(error: HushscriptError) -> bool:
+    return error._unsent  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]  # the one reader
+
+
 class _RedactedCause(Exception):  # noqa: N818  # a stand-in for an exception, never raised by name
     """What an unexpected failure looked like, with tokens and signed-URL queries removed."""
 
@@ -182,22 +192,51 @@ class _RedactedCause(Exception):  # noqa: N818  # a stand-in for an exception, n
 UNEXPECTED: Final = "unexpected_error"
 
 
-def unexpected_error(
-    failure: BaseException, credentials: Credentials | None = None
-) -> HushscriptError:
-    """Spec 9.2: a failure inside the SDK, after a request was sent, that fits no other class. The
-    original rides along as a redacted cause."""
+def describe_failure(failure: BaseException, credentials: Credentials | None = None) -> str:
+    """R86: the original's type and its message, with tokens and signed-URL queries removed. A
+    message that is blank, or whose own text breaks, leaves the type alone."""
     name = type(failure).__name__
-    error = HushscriptError(
-        f"An unexpected {name} interrupted the SDK after the request was sent.", code=UNEXPECTED
-    )
     try:
-        text = f"{name}: {failure}"
+        text = str(failure)
     except Exception:  # noqa: BLE001  # an exception whose own text breaks still has a name
-        text = name
+        text = ""
+    if not text.strip():
+        return name
     scrubbed = credentials.scrub(text) if credentials is not None else redact(text)
-    cause = _RedactedCause(_URL_QUERY.sub(r"\1?…[redacted]", scrubbed))
-    error.__cause__ = cause.with_traceback(failure.__traceback__)
+    return f"{name}: {redact_queries(scrubbed)}"
+
+
+def redacted_cause(failure: BaseException, credentials: Credentials | None = None) -> BaseException:
+    """R86: what stands in for a foreign exception as the cause of an SDK error. The original
+    cannot be redacted in place: an HTTP error keeps the request it sent (bearer header, signed
+    URL, body) and a JSON error keeps the whole text it read. The stand-in has its type and
+    redacted message, and its traceback with the locals of every finished frame cleared, so the
+    HTTP library's frames no longer hold their copy of the request either."""
+    traceback.clear_frames(failure.__traceback__)
+    return _RedactedCause(describe_failure(failure, credentials)).with_traceback(
+        failure.__traceback__
+    )
+
+
+_SENT: Final[dict[bool | None, str]] = {
+    True: " after the request was sent",
+    False: " before the request was sent",
+    None: "",
+}
+
+
+def unexpected_error(
+    failure: BaseException, credentials: Credentials | None = None, *, sent: bool | None = None
+) -> HushscriptError:
+    """Spec 9.2: a failure inside the SDK that fits no other class. The message names the
+    original's type and redacted message (R86) and says whether the request was sent only when
+    `sent` says the SDK knows (R100); the original rides along as a redacted cause."""
+    description = describe_failure(failure, credentials)
+    error = HushscriptError(
+        f"An unexpected {type(failure).__name__} interrupted the SDK{_SENT[sent]} ({description}).",
+        code=UNEXPECTED,
+    )
+    error.__cause__ = redacted_cause(failure, credentials)
     return error
 
 

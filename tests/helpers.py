@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from hushscript._errors import _RedactedCause  # pyright: ignore[reportPrivateUsage]
 from hushscript._http import (
     AsyncRetryingTransport,
     RetryingTransport,
@@ -45,6 +46,30 @@ class FakeClock:
         self.sleep(seconds)
 
 
+def stand_in(error: BaseException) -> str:
+    """The text of the redacted stand-in that is `error`'s cause (R86), once it is checked that the
+    cause is that stand-in and that the original is not `error`'s context either."""
+    assert type(error.__cause__) is _RedactedCause
+    assert error.__context__ is None
+    return str(error.__cause__)
+
+
+def snapshot(request: httpx.Request) -> httpx.Request:
+    """A copy of the request as it was sent. Once a call is over the SDK strips the token, the
+    query and the body from the request it sent (R91), so a record that keeps the original would
+    show only what is left. The extensions stay shared: the transport cuts the phase timeouts in
+    them while the body is read."""
+    try:
+        content = request.content
+    except httpx.RequestNotRead:
+        content = b""
+    copy = httpx.Request(
+        request.method, request.url, headers=request.headers.copy(), content=content
+    )
+    copy.extensions = request.extensions
+    return copy
+
+
 class Script:
     """Answers each request with the next step; an Exception step is raised as a failure."""
 
@@ -53,7 +78,7 @@ class Script:
         self.requests: list[httpx.Request] = []
 
     def _next(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
+        self.requests.append(snapshot(request))
         step = self.steps.pop(0) if len(self.steps) > 1 else self.steps[0]
         if isinstance(step, Exception):
             raise step
