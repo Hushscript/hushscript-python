@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from conftest import TOKEN
-from helpers import error_body, reply
+from helpers import error_body, reply, snapshot
 from hushscript import (
     ApiError,
     AsyncHushscript,
@@ -67,7 +67,7 @@ class Shop:
         self.log: list[httpx.Request] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
-        self.log.append(request)
+        self.log.append(snapshot(request))
         if request.url.path == CARDS:
             return reply(200, self.cards)
         assert request.url.path == PURCHASE, request.url.path

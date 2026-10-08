@@ -9,7 +9,7 @@ import httpx
 
 import hushscript._client as client_module
 from conftest import TOKEN
-from helpers import BASE_URL, FakeClock
+from helpers import BASE_URL, FakeClock, snapshot
 from hushscript import AsyncHushscript, Hushscript
 
 if TYPE_CHECKING:
@@ -24,7 +24,7 @@ class Routes:
         self.requests: list[httpx.Request] = []
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
+        self.requests.append(snapshot(request))
         return self.handler(request)
 
     def sync(self) -> httpx.MockTransport:

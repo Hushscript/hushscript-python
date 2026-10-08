@@ -8,6 +8,7 @@ import pytest
 
 import hushscript._client as client_module
 from conftest import TOKEN
+from helpers import snapshot
 from hushscript import AgentInfo, AsyncHushscript
 
 if TYPE_CHECKING:
@@ -47,7 +48,7 @@ async def test_canceling_a_public_call_after_sending_reports_the_unknown_outcome
     requests: list[httpx.Request] = []
 
     async def hold(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
+        requests.append(snapshot(request))
         async for _ in cast("httpx.AsyncByteStream", request.stream):
             pass
         waiting.set()
