@@ -248,12 +248,16 @@ An error raised after an upload started, or after a purchase was sent, carries `
 once the job exists it carries `resume_token` too. Pass the token to `hs.resume(token, file)` to
 carry on without a second charge.
 
-A wrapped error names the original: `network_error`, `outcome_unknown`, `unexpected_error` and a
-`bad_response` for a body that is not JSON end their message with the original's type and its
-message, tokens and signed-URL queries removed, for example `(ConnectError: refused)`. Their
-`__cause__` is a stand-in with that same text, not the original: an httpx error keeps the request
-it sent and a JSON error the body it read. A failure of the SDK itself that is not a transport
-failure is `unexpected_error`.
+Every error that wraps another ends its message with the original's type and its message, tokens and
+signed-URL queries removed, for example `(ConnectError: refused)`. Where the original comes from the
+HTTP or parsing layer (`network_error`, `outcome_unknown`, `unexpected_error`, `bad_response`), the
+`__cause__` is a stand-in with that text, not the original: an httpx error keeps the request it sent
+and a JSON error the body it read. Where it comes from a local file or media read
+(`file_unreadable`, `source_read_failed`, `duration_unreadable`, a resume token that does not
+decode), the cause is the original error itself. A failure of the SDK itself that is not a transport
+failure is `unexpected_error`; its message says whether the request was sent when the SDK knows. A
+purchase that provably failed before its request was sent carries no `idempotency_key` and says so:
+nothing was charged.
 
 ## What the SDK does for you
 
