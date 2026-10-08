@@ -53,7 +53,7 @@ from pipe import async_hs_for, hs_for, media
 from routes import Routes, hs_on
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterable, Iterator
     from types import TracebackType
 
 ODD = "hsr1-oddé-RECEIVED-SECRET"
@@ -266,8 +266,8 @@ def _request_parts(request: httpx.Request) -> list[object]:
     return [request.url, request.headers, content, request.stream, request.extensions]
 
 
-def _sdk_attributes(value: object) -> list[object]:
-    """Every attribute of an object from a `hushscript` module: its `__dict__` and its slots."""
+def _attributes(value: object) -> list[object]:
+    """Every attribute of an object: its `__dict__` and its slots."""
     held: list[object] = [getattr(value, "__dict__", {})]
     for cls in type(value).__mro__:
         slots = getattr(cls, "__slots__", ())
@@ -278,24 +278,49 @@ def _sdk_attributes(value: object) -> list[object]:
     return held
 
 
+_WALKED_PACKAGES = frozenset({"hushscript", "httpx", "httpcore"})
+"""The SDK's objects and the HTTP library's responses (request, stream, read body) and stream
+wrappers, walked through their attributes."""
+
+
+def _walked(value: object) -> bool:
+    return (
+        not isinstance(value, type)
+        and type(value).__module__.split(".", maxsplit=1)[0] in _WALKED_PACKAGES
+    )
+
+
+def _error_parts(error: BaseException) -> list[object]:
+    return [error.__cause__, error.__context__, *error.args, *_attributes(error)]
+
+
+def _header_parts(headers: httpx.Headers) -> list[object]:
+    return [headers.raw]
+
+
+_PARTS: tuple[tuple[type[Any], Callable[[Any], list[object]]], ...] = (
+    (BaseException, _error_parts),
+    (httpx.Request, _request_parts),
+    (httpx.Headers, _header_parts),
+)
+
+
 def _children(value: object) -> list[object]:
-    if isinstance(value, httpx.Request):
-        return _request_parts(value)
-    if isinstance(value, httpx.Headers):
-        return [value.raw]
+    for kind, parts in _PARTS:
+        if isinstance(value, kind):
+            return parts(value)
     if isinstance(value, dict):
         pairs = cast("dict[object, object]", value)
         return [*pairs.keys(), *pairs.values()]
     if isinstance(value, (list, tuple, set, frozenset)):
         return list(cast("Iterable[object]", value))
-    if not isinstance(value, type) and type(value).__module__.startswith("hushscript."):
-        return _sdk_attributes(value)
-    return []
+    return _attributes(value) if _walked(value) else []
 
 
 def holds_text(value: object, secret: str, seen: set[int] | None = None) -> bool:
-    """Whether `value` is, or reaches through SDK objects, containers and HTTP request holders,
-    plain secret text. `Secret` and `Credentials` are the two designated holders at rest and are
+    """Whether `value` is, or reaches through SDK objects, exceptions (cause, context, arguments,
+    attributes), containers and the HTTP library's requests, responses and streams, plain secret
+    text. `Secret` and `Credentials` are the two designated holders at rest and are
     not entered."""
     if type(value) in {Secret, Credentials}:
         return False
@@ -308,6 +333,19 @@ def holds_text(value: object, secret: str, seen: set[int] | None = None) -> bool
         return False
     visited.add(id(value))
     return any(holds_text(child, secret, visited) for child in _children(value))
+
+
+def context_of(original: Exception) -> HushscriptError:
+    """An SDK error raised while `original` was being handled."""
+    error = HushscriptError("wrapped")
+    error.__context__ = original
+    return error
+
+
+def cause_of(original: Exception) -> HushscriptError:
+    error = HushscriptError("wrapped")
+    error.__cause__ = original
+    return error
 
 
 @pytest.mark.parametrize(
@@ -329,6 +367,44 @@ def holds_text(value: object, secret: str, seen: set[int] | None = None) -> bool
         ),
         pytest.param(httpx.Headers({"Authorization": f"Bearer {PAT}"}), PAT, True, id="headers"),
         pytest.param(Secret(SIGNED), "SIGNED-SECRET", False, id="secret-holder"),
+        pytest.param(
+            httpx.Response(200, request=httpx.Request("PUT", SIGNED)),
+            "SIGNED-SECRET",
+            True,
+            id="response-request",
+        ),
+        pytest.param(
+            httpx.Response(200, content=CLAIM_SECRET.encode()),
+            CLAIM_SECRET,
+            True,
+            id="response-body",
+        ),
+        pytest.param(
+            httpx.Response(200, stream=httpx.ByteStream(PAT.encode())),
+            PAT,
+            True,
+            id="response-stream",
+        ),
+        pytest.param(
+            httpx.ReadError("reset", request=httpx.Request("PUT", SIGNED)),
+            "SIGNED-SECRET",
+            True,
+            id="error-request",
+        ),
+        pytest.param(context_of(ValueError(SIGNED)), "SIGNED-SECRET", True, id="error-context"),
+        pytest.param(cause_of(ValueError(SIGNED)), "SIGNED-SECRET", True, id="error-cause"),
+        pytest.param(
+            json.JSONDecodeError("Expecting ','", f'{{"claim_secret": "{CLAIM_SECRET}"', 30),
+            CLAIM_SECRET,
+            True,
+            id="json-error-doc",
+        ),
+        pytest.param(
+            httpx.Response(200, request=httpx.Request("GET", BASE_URL)),
+            "SIGNED-SECRET",
+            False,
+            id="clean-response",
+        ),
     ],
 )
 def test_the_frame_probe_detects_plain_http_secrets(
@@ -351,6 +427,39 @@ def test_the_frame_probe_detects_secrets_in_sdk_object_attributes(
     assert holds_text(attempt, secret) is True
     monkeypatch.delattr(attempt, "plain_control")
     assert holds_text(attempt, secret) is (secret == SIGNED)
+
+
+@pytest.mark.parametrize(
+    ("method", "url", "body", "kept"),
+    [
+        pytest.param(
+            "POST",
+            f"{BASE_URL}/v1/agent/accounts/sg_1/claim?x=1",
+            {"claim_secret": CLAIM_SECRET},
+            f"{BASE_URL}/v1/agent/accounts/sg_1/claim",
+            id="claim",
+        ),
+        pytest.param("PUT", SIGNED, None, "https://acct.r2.example.com/b/part-1", id="signed-part"),
+    ],
+)
+def test_an_attempt_holds_its_secrets_until_it_finishes_and_then_strips_the_request(
+    method: str, url: str, body: dict[str, object] | None, kept: str
+) -> None:
+    request = httpx.Request(method, url, json=body) if body else httpx.Request(method, url)
+    attempt = _Attempt(request, settings_for(FakeClock(), token=PAT))
+    attempt.begin()
+    secrets = (PAT, CLAIM_SECRET) if body else ("SIGNED-SECRET",)
+    for secret in secrets:
+        assert holds_text(attempt, secret) is True
+        assert holds_text(request, secret) is True
+    attempt.finish()
+    attempt.finish()  # a second end is a no-op
+    for secret in secrets:
+        assert holds_text(attempt, secret) is False
+        assert holds_text(request, secret) is False
+    assert (request.method, str(request.url)) == (method, kept)
+    assert "Authorization" not in request.headers
+    assert request.content == b""
 
 
 def assert_no_plain_secret(error: BaseException, *secrets: str) -> None:
@@ -393,6 +502,52 @@ async def test_the_asyncio_upload_leaves_the_signed_url_out_of_sdk_frames_too(
     with pytest.raises(UploadError) as raised:
         await hs.transcribe(media(), duration_seconds=100, concurrency=1)
     assert (raised.value.code, raised.value.status) == ("etag_missing", None)
+    url = signed_url_of(api)
+    assert_no_plain_secret(raised.value, url, url.split("?")[1])
+
+
+class Streamed(httpx.SyncByteStream, httpx.AsyncByteStream):
+    """A body that arrives as a stream, unlike FakeApi's read ones, so the SDK's own end-of-body
+    path runs; it notes being closed."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield b"ok"
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b"ok"
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_a_streamed_part_answer_is_closed_and_leaves_the_signed_url_out_of_sdk_frames(
+    monkeypatch: pytest.MonkeyPatch,
+    asynchronous: bool,  # noqa: FBT001
+) -> None:
+    bodies: list[Streamed] = []
+
+    def streamed_without_etag(_n: int, _attempt: int) -> httpx.Response:
+        bodies.append(Streamed())
+        return httpx.Response(200, stream=bodies[-1])
+
+    api = FakeApi(r2_hook=streamed_without_etag)
+    if asynchronous:
+        hs = async_hs_for(monkeypatch, api)
+        with pytest.raises(UploadError) as raised:
+            await hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    else:
+        with pytest.raises(UploadError) as raised:
+            hs_for(monkeypatch, api).transcribe(media(), duration_seconds=100, concurrency=1)
+    assert (raised.value.code, raised.value.status) == ("etag_missing", None)
+    assert [body.closed for body in bodies] == [True]
     url = signed_url_of(api)
     assert_no_plain_secret(raised.value, url, url.split("?")[1])
 

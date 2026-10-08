@@ -119,6 +119,15 @@ def release(request: httpx.Request) -> None:
     request._content = b""  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]  # httpx cached the body
 
 
+def sanitize(request: httpx.Request) -> None:
+    """Strips what is secret from a request that is done with (R91): the bearer header, the
+    query (a signed URL's signature) and the body (a claim secret). httpx keeps the request on
+    the response and on its errors, so it is changed in place; method, host and path stay."""
+    request.headers.pop("Authorization", None)
+    request.url = request.url.copy_with(query=None)
+    release(request)
+
+
 class _WrittenBody(httpx.SyncByteStream, httpx.AsyncByteStream):
     """Passes a request body through and notes when the last chunk has been handed to the socket."""
 
@@ -152,30 +161,48 @@ class _DeadlineBody(httpx.SyncByteStream, httpx.AsyncByteStream):
         self._attempt = attempt
 
     def __iter__(self) -> Iterator[bytes]:
-        chunks = iter(cast("Iterable[bytes]", self._inner))
-        while True:
-            self._attempt.tighten()
-            try:
-                chunk = next(chunks)
-            except StopIteration:
-                return
-            yield chunk
+        try:
+            chunks = iter(cast("Iterable[bytes]", self._inner))
+            while True:
+                self._attempt.tighten()
+                try:
+                    chunk = next(chunks)
+                except StopIteration:
+                    return
+                yield chunk
+        finally:
+            self._attempt.body_ended()
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
-        chunks = aiter(cast("AsyncIterable[bytes]", self._inner))
-        while True:
-            self._attempt.tighten()
-            try:
-                chunk = await anext(chunks)
-            except StopAsyncIteration:
-                return
-            yield chunk
+        try:
+            chunks = aiter(cast("AsyncIterable[bytes]", self._inner))
+            while True:
+                self._attempt.tighten()
+                try:
+                    chunk = await anext(chunks)
+                except StopAsyncIteration:
+                    return
+                yield chunk
+        finally:
+            self._attempt.body_ended()
 
     def close(self) -> None:
-        cast("httpx.SyncByteStream", self._inner).close()
+        try:
+            cast("httpx.SyncByteStream", self._inner).close()
+        finally:
+            self._let_go()
 
     async def aclose(self) -> None:
-        await cast("httpx.AsyncByteStream", self._inner).aclose()
+        try:
+            await cast("httpx.AsyncByteStream", self._inner).aclose()
+        finally:
+            self._let_go()
+
+    def _let_go(self) -> None:
+        """A closed body is done with: the transport's stream underneath keeps its own copy of
+        the request (bearer header, signed URL), so it is dropped."""
+        self._inner = httpx.ByteStream(b"")
+        self._attempt.body_ended()
 
 
 class _Attempt:
@@ -212,20 +239,33 @@ class _Attempt:
         self.deadline = self.started + self.budget
         self.body: _WrittenBody | None = None
         self.answered = False
+        self.handed_out = False
+        """The response went to the caller with its body unread; reading or closing that body
+        ends the call."""
         self.phases: dict[str, float | None] = {}
         self._track_body()
 
     @property
     def request(self) -> httpx.Request:
-        """The request carries the bearer token and, for a part, the signed URL as plain text, so
-        it is let go once the call is over (R91); a body still being read keeps the attempt
-        open."""
+        """The request carries the bearer token, a claim secret in its body and, for a part, the
+        signed URL as plain text, so it is stripped and let go once the call is over (R91); a
+        streamed body still being read keeps the attempt open."""
         if self._request is None:
             raise RuntimeError("the attempt is over")
         return self._request
 
     def finish(self) -> None:
-        self._request = None
+        """Ends the call; a second call does nothing."""
+        request, self._request = self._request, None
+        self.body = None
+        if request is not None:
+            sanitize(request)
+
+    def body_ended(self) -> None:
+        """A response body was read to its end or closed. That ends the call only for the
+        response handed out; one closed before a retry leaves the attempt going."""
+        if self.handed_out:
+            self.finish()
 
     def _authorize(self) -> None:
         credentials = self.settings.credentials
@@ -413,7 +453,9 @@ class RetryingTransport(httpx.BaseTransport):
                 release(attempt.request)
             attempt.finish()
             raise
-        if not attempt.stream:
+        if attempt.stream and not response.is_closed:
+            attempt.handed_out = True  # its body's end or close finishes the attempt
+        else:
             attempt.finish()
         return response
 
@@ -490,7 +532,9 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
                 release(attempt.request)
             attempt.finish()
             raise
-        if not attempt.stream:
+        if attempt.stream and not response.is_closed:
+            attempt.handed_out = True  # its body's end or close finishes the attempt
+        else:
             attempt.finish()
         return response
 

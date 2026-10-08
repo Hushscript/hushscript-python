@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, TypeVar
 
+import httpx
+
 from ._errors import ApiError, describe_failure, raise_for_response, redacted_cause
 from ._json import loads
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    import httpx
 
     from ._redact import Credentials
 
@@ -39,6 +39,13 @@ def unreadable_response(
     )
     error.__cause__ = redacted_cause(failure, credentials)
     return error
+
+
+def forget_body(response: httpx.Response) -> None:
+    """Drops a read body that carried a secret (a token, a claim secret) once the SDK is done with
+    it (R91); the response itself may outlive the call in a frame or an error reporter."""
+    response.stream = httpx.ByteStream(b"")
+    response._content = b""  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]  # httpx cached the body
 
 
 def json_body(response: httpx.Response, credentials: Credentials) -> object:

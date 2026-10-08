@@ -280,10 +280,12 @@ failure is `unexpected_error`.
   and `pickle` are your own export and carry the value. Once an HTTP call has returned or raised, no
   local of an SDK frame and no attribute of an SDK object reachable from one holds the token, a
   signed URL or a claim secret as plain text; the SDK keeps them in `Secret` and `Credentials`
-  holders that print nothing. This does not reach the HTTP library's own objects: a response still
-  refers to the request it sent, which holds the bearer header and the signed URL, and a streamed
-  response keeps its request for as long as it lives. An error reporter that captures local
-  variables (for example Sentry with `include_local_variables`) can see them there.
+  holders that print nothing. Once a call is over, the request httpx keeps on the response and on
+  its errors is stripped in place: no `Authorization` header, no query string, no body; a streamed
+  response's request is stripped when its body is read to the end or closed. The body of a claim,
+  rotation or signup answer is dropped once read. While a call runs, httpx's own frames hold the
+  request as sent; a tool that captures local variables at that moment (for example a profiler, or
+  Sentry with `include_local_variables` on an event raised from inside the call) can see them there.
 
 ## Supported formats
 

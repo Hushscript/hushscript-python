@@ -15,7 +15,7 @@ from hushscript._errors import (
 from hushscript._http import UNKNOWN_HINTS
 from hushscript._json import as_dict, as_list, loads
 from hushscript._redact import REDACTED, Secret
-from hushscript._response import bad_response, parsed
+from hushscript._response import bad_response, forget_body, parsed
 from hushscript._retry import CLAIM, ROTATE
 from hushscript._shape import INT_LIMIT, as_text, as_whole, check_shape, to_datetime
 from hushscript._shapes import AGENT_SIGNUP
@@ -289,6 +289,8 @@ def settle(
         raise
     except Exception as failure:  # noqa: BLE001  # R61: nothing but an SDK error leaves
         lost = _stray_credential(failure, route, hint_key, seen, credentials)
+    finally:
+        forget_body(response)  # the body held the token as text
     raise lost
 
 
@@ -327,7 +329,10 @@ def claim_body(claim_secret: Secret) -> dict[str, object]:
 
 
 def signed_up(response: httpx.Response, credentials: Credentials) -> AgentSignup:
-    return parsed(response, credentials, signup_of)
+    try:
+        return parsed(response, credentials, signup_of)
+    finally:
+        forget_body(response)  # the body held the claim secret as text
 
 
 def claimed(response: httpx.Response, credentials: Credentials) -> AgentAccount:
