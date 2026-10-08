@@ -410,8 +410,10 @@ class _Attempt:
     def unexpected(self, failure: Exception) -> HushscriptError:
         """Spec 9.2 and R61: a failure of the SDK's own. A claim, rotation or signup answer lost
         this way after the request went out is as lost as one that never came (spec 7.4); one
-        before it was sent lost nothing."""
-        error = unexpected_error(failure, self.settings.credentials)
+        before it was sent lost nothing. Whether it was sent is known once an answer came, or,
+        for a request whose body is tracked, from that body (R100)."""
+        sent: bool | None = True if self.sent() else (None if self.body is None else False)
+        error = unexpected_error(failure, self.settings.credentials, sent=sent)
         if self.retry_class is not RetryClass.NEVER or not self.sent():
             return error
         unknown = OutcomeUnknownError(

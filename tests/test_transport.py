@@ -30,6 +30,7 @@ from hushscript._http import (
     ANONYMOUS_EXTENSION,
     CLASS_EXTENSION,
     LABEL_EXTENSION,
+    AsyncRetryingTransport,
     RetryingTransport,
 )
 from hushscript._redact import REDACTED
@@ -653,8 +654,17 @@ async def test_a_transport_failure_names_its_type_and_redacted_message(
 @pytest.mark.parametrize(
     ("body_fails", "path", "error_class", "code", "prefix", "key"),
     [
+        # Nothing answered and the purchase body is not tracked: whether it went out is unknown.
         (
             False,
+            "/v1/billing/purchase",
+            HushscriptError,
+            "unexpected_error",
+            "An unexpected TypeError interrupted the SDK",
+            "purchase-key",
+        ),
+        (
+            True,
             "/v1/billing/purchase",
             HushscriptError,
             "unexpected_error",
@@ -705,3 +715,45 @@ async def test_an_unexpected_failure_names_its_type_and_redacted_message(
     assert raised.value.__context__ is None
     assert script.calls == 1
     assert raised.value.idempotency_key == key
+
+
+class Unread(httpx.BaseTransport, httpx.AsyncBaseTransport):
+    """Fails before it reads a byte of the request body."""
+
+    def __init__(self, failure: Exception) -> None:
+        self.failure = failure
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:  # noqa: ARG002
+        raise self.failure
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:  # noqa: ARG002
+        raise self.failure
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_an_unexpected_failure_before_a_claim_body_was_written_says_so(
+    asynchronous: bool,  # noqa: FBT001
+) -> None:
+    settings = settings_for(FakeClock(), max_retries=0)
+    unread = Unread(TypeError("boom"))
+    path = "/v1/agent/accounts/sg_1/claim"
+    if asynchronous:
+        transport = AsyncRetryingTransport(unread, settings)
+        async with httpx.AsyncClient(base_url=BASE_URL, transport=transport) as client:
+            with pytest.raises(HushscriptError) as raised:
+                await client.post(path, json={"claim_secret": "s"})
+    else:
+        with pytest.raises(HushscriptError) as raised:
+            send_through(RetryingTransport(unread, settings), path)
+    assert type(raised.value) is HushscriptError
+    assert (raised.value.code, raised.value.status) == ("unexpected_error", None)
+    assert raised.value.message == (
+        "An unexpected TypeError interrupted the SDK before the request was sent (TypeError: boom)."
+    )
+    assert stand_in(raised.value) == "TypeError: boom"
+
+
+def send_through(transport: RetryingTransport, path: str) -> None:
+    with httpx.Client(base_url=BASE_URL, transport=transport) as client:
+        client.post(path, json={"claim_secret": "s"})

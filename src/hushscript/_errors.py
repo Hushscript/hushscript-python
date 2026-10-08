@@ -208,16 +208,22 @@ def redacted_cause(failure: BaseException, credentials: Credentials | None = Non
     )
 
 
+_SENT: Final[dict[bool | None, str]] = {
+    True: " after the request was sent",
+    False: " before the request was sent",
+    None: "",
+}
+
+
 def unexpected_error(
-    failure: BaseException, credentials: Credentials | None = None
+    failure: BaseException, credentials: Credentials | None = None, *, sent: bool | None = None
 ) -> HushscriptError:
-    """Spec 9.2: a failure inside the SDK, after a request was sent, that fits no other class. The
-    message names the original's type and redacted message (R86); the original rides along as a
-    redacted cause."""
+    """Spec 9.2: a failure inside the SDK that fits no other class. The message names the
+    original's type and redacted message (R86) and says whether the request was sent only when
+    `sent` says the SDK knows (R100); the original rides along as a redacted cause."""
     description = describe_failure(failure, credentials)
     error = HushscriptError(
-        f"An unexpected {type(failure).__name__} interrupted the SDK after the request was sent "
-        f"({description}).",
+        f"An unexpected {type(failure).__name__} interrupted the SDK{_SENT[sent]} ({description}).",
         code=UNEXPECTED,
     )
     error.__cause__ = redacted_cause(failure, credentials)
