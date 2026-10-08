@@ -181,7 +181,7 @@ class _Attempt:
     """The bookkeeping shared by the sync and async transports."""
 
     def __init__(self, request: httpx.Request, settings: TransportSettings) -> None:
-        self.request = request
+        self._request: httpx.Request | None = request
         self.settings = settings
         on_base = _same_origin(request.url, settings.base_url)
         # Spec 7.4: the class comes from the method and the path relative to the base URL. A
@@ -213,6 +213,18 @@ class _Attempt:
         self.answered = False
         self.phases: dict[str, float | None] = {}
         self._track_body()
+
+    @property
+    def request(self) -> httpx.Request:
+        """The request carries the bearer token and, for a part, the signed URL as plain text, so
+        it is let go once the call is over (R91); a body still being read keeps the attempt
+        open."""
+        if self._request is None:
+            raise RuntimeError("the attempt is over")
+        return self._request
+
+    def finish(self) -> None:
+        self._request = None
 
     def _authorize(self) -> None:
         credentials = self.settings.credentials
@@ -386,13 +398,17 @@ class RetryingTransport(httpx.BaseTransport):
         attempt = _Attempt(request, self._settings)
         del request
         try:
-            return self._run(attempt)
+            response = self._run(attempt)
         except BaseException as error:
             if isinstance(error, HushscriptError):
                 attempt.stamp(error)
             if attempt.retry_class is RetryClass.PART:
                 release(attempt.request)
+            attempt.finish()
             raise
+        if not attempt.stream:
+            attempt.finish()
+        return response
 
     def _run(self, attempt: _Attempt) -> httpx.Response:
         while True:
@@ -457,13 +473,17 @@ class AsyncRetryingTransport(httpx.AsyncBaseTransport):
         attempt = _Attempt(request, self._settings)
         del request
         try:
-            return await self._run(attempt)
+            response = await self._run(attempt)
         except BaseException as error:
             if isinstance(error, HushscriptError):
                 attempt.stamp(error)
             if attempt.retry_class is RetryClass.PART:
                 release(attempt.request)
+            attempt.finish()
             raise
+        if not attempt.stream:
+            attempt.finish()
+        return response
 
     async def _run(self, attempt: _Attempt) -> httpx.Response:
         while True:

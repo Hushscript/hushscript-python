@@ -18,7 +18,7 @@ import hushscript._client as client_module
 import hushscript.resources.agent as agent_module
 from conftest import TOKEN
 from fakeapi import FakeApi
-from helpers import BASE_URL, FakeClock, reply
+from helpers import BASE_URL, FakeClock, reply, settings_for
 from hushscript import (
     AgentAccount,
     AgentInfo,
@@ -34,6 +34,7 @@ from hushscript import (
     UploadError,
     ValidationError,
 )
+from hushscript._http import _Attempt  # pyright: ignore[reportPrivateUsage]
 from hushscript._redact import REDACTED, Credentials, Secret
 from hushscript.money import to_money
 from hushscript.transcribe.upload import Created, parse_created
@@ -246,27 +247,56 @@ def sdk_locals(error: BaseException) -> Iterator[tuple[str, str, object]]:
         pending.extend(part for part in (current.__cause__, current.__context__) if part)
 
 
-def holds_text(value: object, secret: str, depth: int = 0) -> bool:
-    """Whether a local carries plain secret text, including HTTP request and URL holders."""
-    if depth > 6:  # a frame local nests a few levels at most
-        return False
-    if isinstance(value, httpx.Request):
-        return (
-            holds_text(value.url, secret, depth + 1)
-            or holds_text(dict(value.headers), secret, depth + 1)
-            or holds_text(value.content, secret, depth + 1)
+def _request_parts(request: httpx.Request) -> list[object]:
+    try:
+        content = request.content
+    except httpx.RequestNotRead:
+        content = b""
+    return [request.url, request.headers, content, request.stream, request.extensions]
+
+
+def _sdk_attributes(value: object) -> list[object]:
+    """Every attribute of an object from a `hushscript` module: its `__dict__` and its slots."""
+    held: list[object] = [getattr(value, "__dict__", {})]
+    for cls in type(value).__mro__:
+        slots = getattr(cls, "__slots__", ())
+        names = (slots,) if isinstance(slots, str) else slots
+        held.extend(
+            getattr(value, name, None) for name in names if name not in {"__dict__", "__weakref__"}
         )
-    if isinstance(value, (str, bytes, httpx.URL)):
-        return secret.encode() in value if isinstance(value, bytes) else secret in str(value)
+    return held
+
+
+def _children(value: object) -> list[object]:
+    if isinstance(value, httpx.Request):
+        return _request_parts(value)
+    if isinstance(value, httpx.Headers):
+        return [value.raw]
     if isinstance(value, dict):
         pairs = cast("dict[object, object]", value)
-        return any(
-            holds_text(key, secret, depth + 1) or holds_text(part, secret, depth + 1)
-            for key, part in pairs.items()
-        )
+        return [*pairs.keys(), *pairs.values()]
     if isinstance(value, (list, tuple, set, frozenset)):
-        return any(holds_text(part, secret, depth + 1) for part in cast("Iterable[object]", value))
-    return False
+        return list(cast("Iterable[object]", value))
+    if not isinstance(value, type) and type(value).__module__.startswith("hushscript."):
+        return _sdk_attributes(value)
+    return []
+
+
+def holds_text(value: object, secret: str, seen: set[int] | None = None) -> bool:
+    """Whether `value` is, or reaches through SDK objects, containers and HTTP request holders,
+    plain secret text. `Secret` and `Credentials` are the two designated holders at rest and are
+    not entered."""
+    if type(value) in {Secret, Credentials}:
+        return False
+    if isinstance(value, bytes):
+        return secret.encode() in value
+    if isinstance(value, (str, httpx.URL)):
+        return secret in str(value)
+    visited: set[int] = set() if seen is None else seen
+    if id(value) in visited:
+        return False
+    visited.add(id(value))
+    return any(holds_text(child, secret, visited) for child in _children(value))
 
 
 @pytest.mark.parametrize(
@@ -286,6 +316,7 @@ def holds_text(value: object, secret: str, depth: int = 0) -> bool:
             True,
             id="request-body",
         ),
+        pytest.param(httpx.Headers({"Authorization": f"Bearer {PAT}"}), PAT, True, id="headers"),
         pytest.param(Secret(SIGNED), "SIGNED-SECRET", False, id="secret-holder"),
     ],
 )
@@ -297,12 +328,28 @@ def test_the_frame_probe_detects_plain_http_secrets(
     assert holds_text(value, secret) is expected
 
 
+@pytest.mark.parametrize("secret", [PAT, SIGNED, CLAIM_SECRET])
+def test_the_frame_probe_detects_secrets_in_sdk_object_attributes(
+    secret: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = settings_for(FakeClock())
+    settings.base_url = httpx.URL(secret if secret == SIGNED else BASE_URL)
+    attempt = _Attempt(httpx.Request("POST", BASE_URL), settings)
+    monkeypatch.setattr(attempt, "plain_control", {"nested": [(secret,)]}, raising=False)
+    monkeypatch.setattr(attempt, "cycle", attempt, raising=False)
+    assert holds_text(attempt, secret) is True
+    monkeypatch.delattr(attempt, "plain_control")
+    assert holds_text(attempt, secret) is (secret == SIGNED)
+
+
 def assert_no_plain_secret(error: BaseException, *secrets: str) -> None:
     walked = list(sdk_locals(error))
-    assert walked
+    assert len(walked) > 0
     for module, where, value in walked:
         for secret in secrets:
-            assert not holds_text(value, secret), f"{secret!r} is a plain local: {module} {where}"
+            assert holds_text(value, secret) is False, (
+                f"{secret!r} is a plain local: {module} {where}"
+            )
 
 
 def signed_url_of(api: FakeApi) -> str:
@@ -337,6 +384,35 @@ async def test_the_asyncio_upload_leaves_the_signed_url_out_of_sdk_frames_too(
     assert (raised.value.code, raised.value.status) == ("etag_missing", None)
     url = signed_url_of(api)
     assert_no_plain_secret(raised.value, url, url.split("?")[1])
+
+
+def unreachable(_n: int, _attempt: int) -> httpx.Response:
+    raise httpx.ConnectError("refused")
+
+
+def test_a_network_failure_while_putting_a_part_leaves_the_signed_url_out_of_sdk_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(r2_hook=unreachable, part_hook=unreachable)
+    hs = hs_for(monkeypatch, api)
+    with pytest.raises(NetworkError) as raised:
+        hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    assert (raised.value.code, raised.value.status) == ("network_error", None)
+    url = signed_url_of(api)
+    assert_no_plain_secret(raised.value, url, url.split("?")[1], TOKEN)
+
+
+@pytest.mark.anyio
+async def test_the_asyncio_network_failure_on_a_part_leaves_the_signed_url_out_of_sdk_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(r2_hook=unreachable, part_hook=unreachable)
+    hs = async_hs_for(monkeypatch, api)
+    with pytest.raises(NetworkError) as raised:
+        await hs.transcribe(media(), duration_seconds=100, concurrency=1)
+    assert (raised.value.code, raised.value.status) == ("network_error", None)
+    url = signed_url_of(api)
+    assert_no_plain_secret(raised.value, url, url.split("?")[1], TOKEN)
 
 
 def refuse_part(_n: int, _attempt: int) -> httpx.Response:

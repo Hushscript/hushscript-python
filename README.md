@@ -275,9 +275,14 @@ that is not a transport failure, is `unexpected_error`, with the original as a r
   error, log line, `repr`, pickle and copy. The results that hand you a secret
   (`AgentSignup.claim_secret`, `AgentAccount.token`, `RotatedToken.token`) keep it readable as a
   field, but `repr`, `str` and `pprint` show `[redacted]` in its place; `dataclasses.asdict`, `json`
-  and `pickle` are your own export and carry the value. The SDK keeps secrets out of the local
-  variables of its own frames, but an error reporter that captures local variables (for example
-  Sentry with `include_local_variables`) can still see them inside the HTTP library's frames.
+  and `pickle` are your own export and carry the value. Once an HTTP call has returned or raised,
+  no local of an SDK frame and no attribute of an SDK object reachable from one holds the token, a
+  signed URL or a claim secret as plain text; the SDK keeps them in `Secret` and `Credentials`
+  holders that print nothing. This does not reach the HTTP library's own objects: a response, and the
+  transport error that `network_error` and `outcome_unknown` carry as `__cause__`, still refer to
+  the request it sent, which holds the bearer header and the signed URL, and a streamed response
+  keeps its request for as long as it lives. An error reporter that captures local variables (for
+  example Sentry with `include_local_variables`) can see them there.
 
 ## Supported formats
 
