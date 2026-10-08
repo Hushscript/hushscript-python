@@ -357,6 +357,14 @@ minutes of the recording; medical mode and each translation target use more. Cur
 Python 3.11 or newer. `just build` installs the built wheel on 3.11 and on 3.14 with nothing but the
 runtime dependencies and imports it. The package is typed (`py.typed`).
 
+## Links
+
+- Documentation: <https://hushscript.com/sdks>
+- REST API reference: <https://hushscript.com/developers>
+- Package on PyPI: <https://pypi.org/project/hushscript/>
+- Source: <https://github.com/Hushscript/hushscript-python>
+- Other Hushscript SDKs: [TypeScript](https://github.com/Hushscript/hushscript-typescript), [Go](https://github.com/Hushscript/hushscript-go), [PHP](https://github.com/Hushscript/hushscript-php), [CLI](https://github.com/Hushscript/hushscript-cli)
+
 ## Releases
 
 Releases come from release-please. The package is published to PyPI by `publish.yml` through PyPI
