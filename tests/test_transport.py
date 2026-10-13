@@ -1,0 +1,759 @@
+from __future__ import annotations
+
+import logging
+
+import httpx
+import pytest
+
+import hushscript._client as client_module
+from conftest import TOKEN
+from helpers import (
+    BASE_URL,
+    FakeClock,
+    Script,
+    async_client,
+    error_body,
+    failing_body,
+    reply,
+    settings_for,
+    stand_in,
+    sync_client,
+)
+from hushscript import (
+    AsyncHushscript,
+    Hushscript,
+    HushscriptError,
+    NetworkError,
+    OutcomeUnknownError,
+)
+from hushscript._http import (
+    ANONYMOUS_EXTENSION,
+    CLASS_EXTENSION,
+    LABEL_EXTENSION,
+    AsyncRetryingTransport,
+    RetryingTransport,
+)
+from hushscript._redact import REDACTED
+from hushscript._retry import RetryClass
+from hushscript.generated.api.default import get_account
+
+RATE_LIMITED = error_body("rate_limited", 5000)
+CONNECT = httpx.ConnectError("refused")
+READ = httpx.ReadError("reset")
+
+
+@pytest.mark.parametrize(
+    ("method", "argument"),
+    [
+        ("with_timeout", httpx.Timeout(7)),
+        ("with_headers", {"X-Test": "1"}),
+        ("with_cookies", {"a": "b"}),
+    ],
+)
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.anyio
+async def test_a_derived_api_failure_leaves_the_token_out_of_sdk_request_locals(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    argument: object,
+    asynchronous: bool,  # noqa: FBT001
+) -> None:
+    failure = httpx.ReadError("reset")
+    script, clock = Script([failure]), FakeClock()
+    monkeypatch.setattr(client_module, "_sync_inner", script.sync)
+    monkeypatch.setattr(client_module, "_async_inner", script.asynchronous)
+    if asynchronous:
+        async with AsyncHushscript(TOKEN, base_url=BASE_URL, clock=clock) as async_hs:
+            derived = getattr(async_hs.api, method)(argument)
+            with pytest.raises(NetworkError) as raised:
+                await get_account.asyncio_detailed(client=derived)
+    else:
+        with Hushscript(TOKEN, base_url=BASE_URL, clock=clock) as sync_hs:
+            derived = getattr(sync_hs.api, method)(argument)
+            with pytest.raises(NetworkError) as raised:
+                get_account.sync_detailed(client=derived)
+    assert type(raised.value) is NetworkError
+    assert (raised.value.code, raised.value.status) == ("network_error", None)
+    assert stand_in(raised.value) == "ReadError: reset"
+    assert script.calls == 4
+    assert len(clock.sleeps) == 3
+    assert all(request.headers["Authorization"] == f"Bearer {TOKEN}" for request in script.requests)
+    seen: set[int] = set()
+    delegation_seen = False
+    delegation_method = "handle_async_request" if asynchronous else "handle_request"
+    pending: list[BaseException] = [raised.value]
+    while pending:
+        error = pending.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        traceback = error.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            module = str(frame.f_globals.get("__name__", ""))
+            if module.split(".", maxsplit=1)[0] == "hushscript":
+                if module == "hushscript._client" and frame.f_code.co_name == delegation_method:
+                    delegation_seen = True
+                for name, value in frame.f_locals.items():
+                    if isinstance(value, httpx.Request):
+                        assert TOKEN not in value.headers.get("Authorization", ""), (module, name)
+            traceback = traceback.tb_next
+        pending.extend(part for part in (error.__cause__, error.__context__) if part)
+    assert delegation_seen
+
+
+def test_does_not_wait_for_a_retry_after_above_60_seconds() -> None:
+    script, clock = Script([reply(429, RATE_LIMITED, {"Retry-After": "61"})]), FakeClock()
+    with sync_client(script, clock) as client:
+        response = client.get("/v1/account")
+    assert response.status_code == 429
+    assert script.calls == 1
+    assert clock.sleeps == []
+
+
+def test_waits_exactly_the_retry_after_and_then_succeeds() -> None:
+    script = Script([reply(429, RATE_LIMITED, {"Retry-After": "2"}), reply(200, {"ok": True})])
+    clock = FakeClock()
+    with sync_client(script, clock) as client:
+        assert client.get("/v1/account").status_code == 200
+    assert clock.sleeps == [2.0]
+
+
+def test_a_get_retries_503_three_times_then_returns_the_last_response() -> None:
+    script, clock = Script([reply(503)]), FakeClock()
+    with sync_client(script, clock) as client:
+        assert client.get("/v1/jobs").status_code == 503
+    assert script.calls == 4
+    assert len(clock.sleeps) == 3
+    assert all(0 <= delay <= 8 for delay in clock.sleeps)
+
+
+def test_max_retries_zero_sends_once() -> None:
+    script, clock = Script([reply(503)]), FakeClock()
+    with sync_client(script, clock, max_retries=0) as client:
+        client.get("/v1/jobs")
+    assert script.calls == 1
+
+
+def test_a_purchase_retries_502_once_with_the_same_body() -> None:
+    script, clock = Script([reply(502), reply(502)]), FakeClock()
+    with sync_client(script, clock, max_retries=5) as client:
+        response = client.post(
+            "/v1/billing/purchase", json={"pack": "300min", "idempotency_key": "k"}
+        )
+    assert response.status_code == 502
+    assert script.calls == 2
+    assert script.requests[0].content == script.requests[1].content
+
+
+def test_a_purchase_never_retries_a_403() -> None:
+    script, clock = Script([reply(403, error_body("pat_purchase_requires_app", 4021))]), FakeClock()
+    with sync_client(script, clock) as client:
+        assert client.post("/v1/billing/purchase", json={}).status_code == 403
+    assert script.calls == 1
+    assert clock.sleeps == []
+
+
+def test_a_purchase_retries_a_network_error_once() -> None:
+    script, clock = Script([READ, reply(200, {"balance_seconds": 1})]), FakeClock()
+    with sync_client(script, clock) as client:
+        assert client.post("/v1/billing/purchase", json={}).status_code == 200
+    assert script.calls == 2
+
+
+def test_claim_is_never_retried_and_a_lost_response_is_unknown() -> None:
+    script, clock = Script([READ]), FakeClock()
+    with sync_client(script, clock) as client, pytest.raises(OutcomeUnknownError) as raised:
+        client.post("/v1/agent/accounts/sg_1/claim", json={})
+    assert script.calls == 1
+    assert raised.value.hint is not None
+    assert "The claim may have succeeded" in raised.value.hint
+    assert stand_in(raised.value) == "ReadError: reset"
+
+
+def test_rotate_is_never_retried_and_a_lost_response_is_unknown() -> None:
+    script, clock = Script([httpx.ReadTimeout("slow")]), FakeClock()
+    with sync_client(script, clock) as client, pytest.raises(OutcomeUnknownError) as raised:
+        client.post("/v1/agent/credentials/rotate", json={})
+    assert script.calls == 1
+    assert raised.value.hint is not None
+    assert "The old token may already be revoked" in raised.value.hint
+
+
+def test_a_connect_failure_on_claim_is_a_plain_network_error() -> None:
+    script, clock = Script([CONNECT]), FakeClock()
+    with sync_client(script, clock) as client, pytest.raises(NetworkError) as raised:
+        client.post("/v1/agent/accounts/sg_1/claim", json={})
+    assert not isinstance(raised.value, OutcomeUnknownError)
+    assert script.calls == 1
+
+
+def test_other_mutations_retry_only_failures_before_the_request_was_sent() -> None:
+    script, clock = Script([CONNECT, reply(200, {})]), FakeClock()
+    with sync_client(script, clock) as client:
+        assert client.patch("/v1/org/members/u1", json={}).status_code == 200
+    assert script.calls == 2
+    lost = Script([READ])
+    with sync_client(lost, FakeClock()) as client, pytest.raises(NetworkError):
+        client.patch("/v1/org/members/u1", json={})
+    assert lost.calls == 1
+
+
+def test_network_errors_are_retried_for_gets_and_then_raised() -> None:
+    script, clock = Script([CONNECT]), FakeClock()
+    with sync_client(script, clock) as client, pytest.raises(NetworkError, match="Could not reach"):
+        client.get("/v1/account")
+    assert script.calls == 4
+    assert len(clock.sleeps) == 3
+
+
+def test_create_backs_off_15_30_60_without_a_retry_after() -> None:
+    script, clock = Script([reply(429, RATE_LIMITED)]), FakeClock()
+    with sync_client(script, clock, max_retries=5) as client:
+        assert client.post("/v1/uploads", json={"idempotency_key": "k" * 20}).status_code == 429
+    assert clock.sleeps == [15.0, 30.0, 60.0]
+    assert script.calls == 4
+
+
+def test_create_waits_30_seconds_ten_tries_on_too_many_active_jobs() -> None:
+    script, clock = Script([reply(429, error_body("too_many_active_jobs", 5001))]), FakeClock()
+    with sync_client(script, clock, max_retries=1) as client:
+        response = client.post("/v1/uploads", json={"idempotency_key": "k" * 20})
+    assert response.json()["error"] == "too_many_active_jobs"
+    assert script.calls == 10
+    assert clock.sleeps == [30.0] * 9
+
+
+def test_max_retries_zero_disables_the_active_jobs_wait() -> None:
+    script = Script([reply(429, error_body("too_many_active_jobs", 5001))])
+    with sync_client(script, FakeClock(), max_retries=0) as client:
+        client.post("/v1/uploads", json={"idempotency_key": "k" * 20})
+    assert script.calls == 1
+
+
+def test_create_with_a_non_json_429_backs_off_too() -> None:
+    script, clock = Script([reply(429), reply(200, {"ok": True})]), FakeClock()
+    with sync_client(script, clock) as client:
+        assert client.post("/v1/uploads", json={"idempotency_key": "k" * 20}).status_code == 200
+    assert clock.sleeps == [15.0]
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [("PUT", "/v1/uploads/j1/parts/2"), ("POST", "/v1/uploads/j1/complete")],
+)
+def test_part_and_complete_retry_a_500(method: str, path: str) -> None:
+    script, clock = Script([reply(500), reply(200, {})]), FakeClock()
+    with sync_client(script, clock) as client:
+        assert client.request(method, path, content=b"x").status_code == 200
+    assert script.calls == 2
+
+
+def test_the_authorization_header_is_added_per_request() -> None:
+    script, clock = Script([reply(200, {})]), FakeClock()
+    with sync_client(script, clock, token=TOKEN) as client:
+        client.get("/v1/account")
+        assert "authorization" not in client.headers
+    assert script.requests[0].headers["Authorization"] == f"Bearer {TOKEN}"
+
+
+def test_an_anonymous_request_and_a_client_without_a_token_send_no_authorization() -> None:
+    script, clock = Script([reply(200, {})]), FakeClock()
+    with sync_client(script, clock, token=TOKEN) as client:
+        client.get("/v1/account", extensions={ANONYMOUS_EXTENSION: True})
+    with sync_client(script, clock) as client:
+        client.get("/v1/account")
+    assert all("authorization" not in request.headers for request in script.requests)
+
+
+def test_a_class_extension_applies_to_a_request_to_another_host() -> None:
+    script, clock = Script([reply(500), reply(200, {})]), FakeClock()
+    with sync_client(script, clock) as client:
+        response = client.put(
+            "https://r2.example.com/part",
+            content=b"x",
+            extensions={CLASS_EXTENSION: RetryClass.PART},
+        )
+    assert response.status_code == 200
+    assert script.calls == 2
+
+
+def test_a_class_extension_cannot_relabel_an_api_request() -> None:
+    script, clock = Script([READ]), FakeClock()
+    with sync_client(script, clock) as client, pytest.raises(OutcomeUnknownError):
+        client.post(
+            "/v1/agent/credentials/rotate", json={}, extensions={CLASS_EXTENSION: RetryClass.SAFE}
+        )
+    assert script.calls == 1
+
+
+def test_a_path_that_names_an_api_route_on_another_host_is_not_that_route() -> None:
+    script, clock = Script([READ]), FakeClock()
+    with sync_client(script, clock) as client, pytest.raises(NetworkError) as raised:
+        client.post("https://r2.example.com/v1/agent/credentials/rotate", json={})
+    assert not isinstance(raised.value, OutcomeUnknownError)
+    assert script.calls == 1
+
+
+@pytest.mark.parametrize("url", ["https://r2.example.com/part", "http://127.0.0.1:4011/v1/account"])
+def test_the_token_goes_only_to_the_base_url_host(url: str) -> None:
+    script, clock = Script([reply(200, {})]), FakeClock()
+    with sync_client(script, clock, token=TOKEN) as client:
+        client.get(url)
+        client.get("/v1/account")
+    assert "authorization" not in script.requests[0].headers
+    assert script.requests[1].headers["Authorization"] == f"Bearer {TOKEN}"
+
+
+def test_debug_logging_writes_one_line_per_attempt_without_the_query(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    script = Script([reply(503), reply(200, {})])
+    with (
+        caplog.at_level(logging.DEBUG, logger="hushscript"),
+        sync_client(script, FakeClock(), level="debug", token=TOKEN) as client,
+    ):
+        client.get("/v1/jobs?secret=abc")
+        client.put(
+            "https://r2.example.com/signed?X-Signature=zzz",
+            content=b"x",
+            extensions={LABEL_EXTENSION: "r2:part/3", CLASS_EXTENSION: RetryClass.PART},
+        )
+    lines = [record.getMessage() for record in caplog.records]
+    assert lines[0].startswith("hushscript GET /v1/jobs error") is False
+    assert lines[0].startswith("hushscript GET /v1/jobs 503 attempt=1")
+    assert "retry_in=" in lines[0]
+    assert lines[1].startswith("hushscript GET /v1/jobs 200 attempt=2")
+    assert lines[2].startswith("hushscript PUT r2:part/3 200 attempt=1")
+    joined = "\n".join(lines)
+    assert "secret" not in joined
+    assert "X-Signature" not in joined
+    assert TOKEN not in joined
+
+
+def test_logging_is_silent_by_default(caplog: pytest.LogCaptureFixture) -> None:
+    with (
+        caplog.at_level(logging.DEBUG, logger="hushscript"),
+        sync_client(Script([reply(200, {})]), FakeClock()) as client,
+    ):
+        client.get("/v1/account")
+    assert caplog.records == []
+
+
+def test_a_failed_attempt_is_logged_as_an_error(caplog: pytest.LogCaptureFixture) -> None:
+    with (
+        caplog.at_level(logging.DEBUG, logger="hushscript"),
+        sync_client(Script([CONNECT]), FakeClock(), level="debug", max_retries=0) as client,
+        pytest.raises(NetworkError),
+    ):
+        client.get("/v1/account")
+    assert "GET /v1/account error attempt=1" in caplog.records[0].getMessage()
+
+
+@pytest.mark.anyio
+async def test_async_waits_the_retry_after_and_not_above_sixty() -> None:
+    script = Script([reply(429, RATE_LIMITED, {"Retry-After": "3"}), reply(200, {})])
+    clock = FakeClock()
+    async with async_client(script, clock) as client:
+        assert (await client.get("/v1/account")).status_code == 200
+    assert clock.sleeps == [3.0]
+    long = Script([reply(429, RATE_LIMITED, {"Retry-After": "61"})])
+    async with async_client(long, FakeClock()) as client:
+        assert (await client.get("/v1/account")).status_code == 429
+    assert long.calls == 1
+
+
+@pytest.mark.anyio
+async def test_async_purchase_cap_and_claim_never() -> None:
+    purchase = Script([reply(502)])
+    async with async_client(purchase, FakeClock(), max_retries=5) as client:
+        assert (await client.post("/v1/billing/purchase", json={})).status_code == 502
+    assert purchase.calls == 2
+    claim = Script([READ])
+    async with async_client(claim, FakeClock()) as client:
+        with pytest.raises(OutcomeUnknownError):
+            await client.post("/v1/agent/accounts/sg_1/claim", json={})
+    assert claim.calls == 1
+
+
+@pytest.mark.anyio
+async def test_async_network_errors_and_create_pacing() -> None:
+    script = Script([CONNECT])
+    clock = FakeClock()
+    async with async_client(script, clock) as client:
+        with pytest.raises(NetworkError):
+            await client.get("/v1/account")
+    assert script.calls == 4
+    create, create_clock = Script([reply(429, RATE_LIMITED)]), FakeClock()
+    async with async_client(create, create_clock, max_retries=5) as client:
+        assert (
+            await client.post("/v1/uploads", json={"idempotency_key": "k" * 20})
+        ).status_code == 429
+    assert create_clock.sleeps == [15.0, 30.0, 60.0]
+    active = Script([reply(429, error_body("too_many_active_jobs", 5001))])
+    async with async_client(active, FakeClock()) as client:
+        await client.post("/v1/uploads", json={"idempotency_key": "k" * 20})
+    assert active.calls == 10
+
+
+STATUSES = [429, 500, 502, 503, 504]
+
+
+@pytest.mark.parametrize("status", STATUSES)
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/v1/agent/accounts/sg_1/claim"),
+        ("POST", "/v1/agent/credentials/rotate"),
+        ("POST", "/v1/agent/accounts"),
+        ("POST", "/v1/billing/cards/default"),
+        ("PUT", "/v1/billing/cards/default"),
+        ("PATCH", "/v1/org/members/u1"),
+    ],
+)
+def test_claim_rotate_signup_and_other_mutations_never_retry_on_a_status(
+    method: str, path: str, status: int
+) -> None:
+    script, clock = Script([reply(status), reply(200, {})]), FakeClock()
+    with sync_client(script, clock, max_retries=5) as client:
+        assert client.request(method, path, json={}).status_code == status
+    assert script.calls == 1
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize(("status", "calls"), [(502, 2), (503, 2), (500, 1), (504, 1), (429, 1)])
+def test_a_purchase_makes_at_most_two_calls_and_retries_only_502_and_503(
+    status: int, calls: int
+) -> None:
+    script = Script([reply(status)])
+    with sync_client(script, FakeClock(), max_retries=5) as client:
+        client.post("/v1/billing/purchase", json={})
+    assert script.calls == calls
+
+
+def test_a_purchase_makes_at_most_two_calls_on_network_errors() -> None:
+    script = Script([READ])
+    with (
+        sync_client(script, FakeClock(), max_retries=5) as client,
+        pytest.raises(NetworkError) as raised,
+    ):
+        client.post("/v1/billing/purchase", json={"idempotency_key": "purchase-key"})
+    assert (raised.value.code, raised.value.status) == ("network_error", None)
+    assert script.calls == 2
+    assert script.requests[0].content == script.requests[1].content
+
+
+@pytest.mark.parametrize("status", [501, 505, 507])
+def test_a_get_does_not_retry_other_5xx(status: int) -> None:
+    script = Script([reply(status)])
+    with sync_client(script, FakeClock()) as client:
+        assert client.get("/v1/uploads/j1/part-urls").status_code == status
+    assert script.calls == 1
+
+
+@pytest.mark.parametrize("status", STATUSES)
+def test_get_heartbeat_and_part_urls_retry_the_listed_statuses(status: int) -> None:
+    for method, path in (
+        ("GET", "/v1/account"),
+        ("POST", "/v1/uploads/j1/heartbeat"),
+        ("GET", "/v1/uploads/j1/part-urls"),
+    ):
+        script = Script([reply(status), reply(200, {})])
+        with sync_client(script, FakeClock()) as client:
+            assert client.request(method, path).status_code == 200
+        assert script.calls == 2
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/v1/account"),
+        ("PUT", "/v1/uploads/j1/parts/1"),
+        ("POST", "/v1/uploads/j1/complete"),
+        ("POST", "/v1/uploads"),
+        ("POST", "/v1/billing/purchase"),
+    ],
+)
+def test_a_retry_after_above_60_on_a_5xx_is_returned_at_once(
+    method: str, path: str, status: int
+) -> None:
+    script, clock = Script([reply(status, headers={"Retry-After": "61"})]), FakeClock()
+    with sync_client(script, clock) as client:
+        response = client.request(method, path, content=b"x")
+    assert response.status_code == status
+    assert response.headers["Retry-After"] == "61"
+    assert script.calls == 1
+    assert clock.sleeps == []
+
+
+def test_the_create_429_schedule_counts_only_429s_after_other_retries() -> None:
+    script = Script(
+        [reply(500), reply(429, RATE_LIMITED), reply(429, RATE_LIMITED), reply(200, {})]
+    )
+    clock = FakeClock()
+    with sync_client(script, clock, max_retries=5) as client:
+        assert client.post("/v1/uploads", json={"idempotency_key": "k" * 20}).status_code == 200
+    assert script.calls == 4
+    assert clock.sleeps[1:] == [15.0, 30.0]
+
+
+def test_the_create_429_schedule_still_ends_after_three_waits_following_a_500() -> None:
+    script = Script([reply(500), reply(429, RATE_LIMITED)])
+    clock = FakeClock()
+    with sync_client(script, clock, max_retries=9) as client:
+        assert client.post("/v1/uploads", json={"idempotency_key": "k" * 20}).status_code == 429
+    assert clock.sleeps[1:] == [15.0, 30.0, 60.0]
+
+
+def test_the_active_jobs_wait_counts_only_active_jobs_429s() -> None:
+    active = reply(429, error_body("too_many_active_jobs", 5001))
+    script = Script([reply(429, RATE_LIMITED), reply(500), active])
+    clock = FakeClock()
+    with sync_client(script, clock, max_retries=3) as client:
+        assert client.post("/v1/uploads", json={"idempotency_key": "k" * 20}).status_code == 429
+    assert script.calls == 12
+    assert clock.sleeps[2:] == [30.0] * 9
+
+
+def test_a_token_unset_since_an_earlier_attempt_is_not_sent_on_the_retry() -> None:
+    clock = FakeClock()
+    settings = settings_for(clock, token=TOKEN)
+    assert settings.credentials is not None
+    credentials = settings.credentials
+    sent: list[str | None] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers.get("authorization"))
+        if len(sent) == 1:
+            credentials._tokens.clear()  # pyright: ignore[reportPrivateUsage]
+            return reply(503)
+        return reply(200, {})
+
+    with httpx.Client(
+        base_url=BASE_URL, transport=RetryingTransport(httpx.MockTransport(handle), settings)
+    ) as client:
+        assert client.get("/v1/account").status_code == 200
+    assert sent == [f"Bearer {TOKEN}", None]
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "status"),
+    [
+        ("POST", "/v1/agent/accounts/sg_1/claim", 503),
+        ("POST", "/v1/agent/credentials/rotate", 503),
+        ("POST", "/v1/agent/accounts", 503),
+        ("POST", "/v1/billing/purchase", 429),
+        ("POST", "/v1/billing/purchase", 500),
+        ("PATCH", "/v1/org/members/u1", 503),
+        ("GET", "/v1/jobs/missing", 404),
+    ],
+)
+@pytest.mark.parametrize("retry_after", ["1", "60"])
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_retry_after_cannot_make_a_forbidden_status_retryable(
+    method: str,
+    path: str,
+    status: int,
+    retry_after: str,
+    asynchronous: bool,  # noqa: FBT001
+) -> None:
+    script = Script([reply(status, headers={"Retry-After": retry_after}), reply(200, {})])
+    clock = FakeClock()
+    if asynchronous:
+        async with async_client(script, clock) as client:
+            response = await client.request(method, path, json={"idempotency_key": "k"})
+    else:
+        with sync_client(script, clock) as client:
+            response = client.request(method, path, json={"idempotency_key": "k"})
+    assert response.status_code == status
+    assert script.calls == 1
+    assert clock.sleeps == []
+
+
+# Each foreign message and what the description shows after the original's type name.
+MESSAGES = [
+    ("", ""),
+    ("   ", ""),
+    ("\t", ""),
+    ("\u2003", ""),
+    ("transport failed", ": transport failed"),
+    ("echo hsr-odd-secret", f": echo {REDACTED}"),
+    (
+        "put https://r2.example/b/k?X-Amz-Signature=abc failed",
+        ": put https://r2.example/b/k?[redacted] failed",
+    ),
+    ("PUT /b/k?sig=abc failed", ": PUT /b/k?[redacted] failed"),
+    ("HTTPS://R2.EXAMPLE/b/k?sig=abc", ": HTTPS://R2.EXAMPLE/b/k?[redacted]"),
+    ("ready? what? yes", ": ready? what? yes"),
+]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("foreign", MESSAGES)
+@pytest.mark.parametrize(
+    ("make", "path", "error_class", "code", "prefix", "key"),
+    [
+        (
+            httpx.ConnectError,
+            "/v1/account",
+            NetworkError,
+            "network_error",
+            "Could not reach the Hushscript API: POST /v1/account",
+            None,
+        ),
+        (
+            httpx.ReadError,
+            "/v1/agent/accounts/sg_1/claim",
+            OutcomeUnknownError,
+            "outcome_unknown",
+            "No response arrived for POST /v1/agent/accounts/sg_1/claim",
+            None,
+        ),
+    ],
+)
+async def test_a_transport_failure_names_its_type_and_redacted_message(
+    asynchronous: bool,  # noqa: FBT001
+    foreign: tuple[str, str],
+    make: type[httpx.RequestError],
+    path: str,
+    error_class: type[HushscriptError],
+    code: str,
+    prefix: str,
+    key: str | None,
+) -> None:
+    message, shown = foreign
+    failure = make(message)
+    script = Script([failure])
+    if asynchronous:
+        async with async_client(
+            script, FakeClock(), token="hsr-odd-secret", max_retries=0
+        ) as client:
+            with pytest.raises(error_class) as raised:
+                await client.post(path, json={"idempotency_key": "purchase-key"})
+    else:
+        with (
+            sync_client(script, FakeClock(), token="hsr-odd-secret", max_retries=0) as client,
+            pytest.raises(error_class) as raised,
+        ):
+            client.post(path, json={"idempotency_key": "purchase-key"})
+    assert type(raised.value) is error_class
+    assert (raised.value.code, raised.value.status) == (code, None)
+    described = type(failure).__name__ + shown
+    assert raised.value.message == f"{prefix} ({described})."
+    assert stand_in(raised.value) == described
+    assert script.calls == 1
+    assert raised.value.idempotency_key == key
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("foreign", MESSAGES)
+@pytest.mark.parametrize(
+    ("body_fails", "path", "error_class", "code", "prefix", "key"),
+    [
+        # Nothing answered and the purchase body is not tracked: whether it went out is unknown.
+        (
+            False,
+            "/v1/billing/purchase",
+            HushscriptError,
+            "unexpected_error",
+            "An unexpected TypeError interrupted the SDK",
+            "purchase-key",
+        ),
+        (
+            True,
+            "/v1/billing/purchase",
+            HushscriptError,
+            "unexpected_error",
+            "An unexpected TypeError interrupted the SDK after the request was sent",
+            "purchase-key",
+        ),
+        (
+            True,
+            "/v1/agent/accounts/sg_1/claim",
+            OutcomeUnknownError,
+            "outcome_unknown",
+            "The answer to POST /v1/agent/accounts/sg_1/claim could not be used",
+            None,
+        ),
+    ],
+)
+async def test_an_unexpected_failure_names_its_type_and_redacted_message(
+    asynchronous: bool,  # noqa: FBT001
+    foreign: tuple[str, str],
+    body_fails: bool,  # noqa: FBT001
+    path: str,
+    error_class: type[HushscriptError],
+    code: str,
+    prefix: str,
+    key: str | None,
+) -> None:
+    message, shown = foreign
+    failure = TypeError(message)
+    script = Script([failing_body(failure) if body_fails else failure])
+    if asynchronous:
+        async with async_client(
+            script, FakeClock(), token="hsr-odd-secret", max_retries=0
+        ) as client:
+            with pytest.raises(error_class) as raised:
+                await client.post(path, json={"idempotency_key": "purchase-key"})
+    else:
+        with (
+            sync_client(script, FakeClock(), token="hsr-odd-secret", max_retries=0) as client,
+            pytest.raises(error_class) as raised,
+        ):
+            client.post(path, json={"idempotency_key": "purchase-key"})
+    described = type(failure).__name__ + shown
+    assert type(raised.value) is error_class
+    assert (raised.value.code, raised.value.status) == (code, None)
+    assert raised.value.message == f"{prefix} ({described})."
+    assert type(raised.value.__cause__).__name__ == "_RedactedCause"
+    assert str(raised.value.__cause__) == described
+    assert raised.value.__context__ is None
+    assert script.calls == 1
+    assert raised.value.idempotency_key == key
+
+
+class Unread(httpx.BaseTransport, httpx.AsyncBaseTransport):
+    """Fails before it reads a byte of the request body."""
+
+    def __init__(self, failure: Exception) -> None:
+        self.failure = failure
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:  # noqa: ARG002
+        raise self.failure
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:  # noqa: ARG002
+        raise self.failure
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_an_unexpected_failure_before_a_claim_body_was_written_says_so(
+    asynchronous: bool,  # noqa: FBT001
+) -> None:
+    settings = settings_for(FakeClock(), max_retries=0)
+    unread = Unread(TypeError("boom"))
+    path = "/v1/agent/accounts/sg_1/claim"
+    if asynchronous:
+        transport = AsyncRetryingTransport(unread, settings)
+        async with httpx.AsyncClient(base_url=BASE_URL, transport=transport) as client:
+            with pytest.raises(HushscriptError) as raised:
+                await client.post(path, json={"claim_secret": "s"})
+    else:
+        with pytest.raises(HushscriptError) as raised:
+            send_through(RetryingTransport(unread, settings), path)
+    assert type(raised.value) is HushscriptError
+    assert (raised.value.code, raised.value.status) == ("unexpected_error", None)
+    assert raised.value.message == (
+        "An unexpected TypeError interrupted the SDK before the request was sent (TypeError: boom)."
+    )
+    assert stand_in(raised.value) == "TypeError: boom"
+
+
+def send_through(transport: RetryingTransport, path: str) -> None:
+    with httpx.Client(base_url=BASE_URL, transport=transport) as client:
+        client.post(path, json={"claim_secret": "s"})

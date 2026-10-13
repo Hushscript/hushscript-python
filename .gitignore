@@ -1,0 +1,15 @@
+.venv/
+build/
+dist/
+mutants/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+__pycache__/
+*.egg-info/
+.coverage
+coverage.json
+htmlcov/
+*.log
+.DS_Store

@@ -1,0 +1,213 @@
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hushscript"
+version = "0.0.0"
+description = "The official Python SDK for the Hushscript transcription API."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Hushscript", email = "support@hushscript.com" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+  "Typing :: Typed",
+]
+# Runtime dependencies are ranges on purpose: a library that pins exact versions breaks its users'
+# resolvers. uv.lock pins the exact set that CI tests.
+dependencies = [
+  "httpx>=0.28.1,<0.29",
+  "mutagen>=1.47,<2",
+  "attrs>=23.2",
+  "typing-extensions>=4.12",
+  "anyio>=4,<5",
+  "async-timeout>=5,<6",
+  "exceptiongroup>=1.2; python_version < '3.11'",
+]
+
+[project.urls]
+Homepage = "https://hushscript.com"
+Source = "https://github.com/Hushscript/hushscript-sdk-python"
+
+[dependency-groups]
+dev = [
+  "openapi-python-client==0.29.1; python_version >= '3.11'",
+  "pytest==9.1.1",
+  "exceptiongroup>=1.2",
+  "tomli==2.4.0",
+  "pydantic==2.14.0; python_version >= '3.15'",
+  "pytest-randomly==5.0.0",
+  "pytest-cov==7.1.0",
+  "coverage==7.16.2",
+  "hypothesis==6.168.5",
+  "mypy==2.4.0",
+  "basedpyright==1.40.2",
+  "ruff==0.16.10",
+  "deptry==0.25.1",
+  "mutmut==3.8.0; python_version >= '3.11'",
+  "pip-audit==2.10.1",
+  "check-wheel-contents==0.6.3",
+  "twine==7.0.0",
+  "hatchling==1.32.4",
+  "cyclonedx-bom==7.5.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hushscript"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/LICENSE", "/README.md", "/pyproject.toml"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["src/hushscript/generated", "build"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  # Docstrings: the project rule is to comment only what is not obvious; names and types carry the rest.
+  "D",
+  # Formatter conflicts, the two rules ruff itself warns about.
+  "COM812",
+  "ISC001",
+  # Files carry no per-file copyright header; LICENSE at the repository root covers them.
+  "CPY001",
+  # TODO comments and their issue-link format are not enforced in this repository.
+  "TD002",
+  "TD003",
+  "FIX002",
+  # SDK errors take their message and fields as constructor arguments; a temporary variable per
+  # raise site adds noise without changing the traceback.
+  "EM101",
+  "EM102",
+  "TRY003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+  # pytest idiom.
+  "S101",
+  # Literal status codes and counts are the assertions.
+  "PLR2004",
+  # Tests build private objects on purpose.
+  "SLF001",
+  # Fixtures and helpers return Any from mocks.
+  "ANN401",
+  # The made-up conformance token is not a secret.
+  "S105",
+  "S106",
+]
+"scripts/**" = [
+  # Stand-alone scripts, not a package.
+  "INP001",
+  # The generator and the coverage check report on stdout.
+  "T201",
+  # The generator runs pinned tools (openapi-python-client) in the container; arguments are fixed.
+  "S603",
+  "S607",
+]
+"examples/**" = [
+  "INP001",
+  # Argument counts and status sets are the point of a short example.
+  "PLR2004",
+  # The examples report on stdout and stderr.
+  "T201",
+]
+"smoke/**" = [
+  "INP001",
+  # The smoke script reports on stdout.
+  "T201",
+]
+"conformance/**" = [
+  "INP001",
+  "T201",
+  # The runner prints one line per scenario, as the runner contract requires.
+  "S105",
+  "S106",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["hushscript"]
+
+[tool.ruff.lint.pylint]
+max-args = 8
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src", "tests", "scripts", "conformance", "smoke", "examples"]
+cache_dir = "/tmp/mypy-cache"
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[[tool.mypy.overrides]]
+module = "hushscript.generated.*"
+# Generated code is type checked under strict like the rest (spec 13.2: not excluded from type
+# checking). The one relaxation: the generator emits isinstance branches on declared unions that
+# mypy proves unreachable (models/job.py).
+warn_unreachable = false
+
+[tool.basedpyright]
+pythonVersion = "3.10"
+typeCheckingMode = "strict"
+include = ["src", "tests", "scripts", "conformance", "smoke", "examples"]
+exclude = ["src/hushscript/generated"]
+reportMissingTypeStubs = false
+extraPaths = ["conformance"]
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config", "-p", "no:cacheprovider"]
+filterwarnings = ["error"]
+pythonpath = ["src", "conformance"]
+
+[tool.coverage.run]
+source = ["hushscript"]
+branch = true
+omit = ["*/hushscript/generated/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_also = ["if TYPE_CHECKING:", "@overload", "^\\s*\\.\\.\\.\\s*$"]
+
+[tool.deptry]
+extend_exclude = ["build"]
+known_first_party = ["hushscript", "golden_table"]
+
+[tool.mutmut]
+source_paths = [
+  "src/hushscript/_retry.py",
+  "src/hushscript/_pacing.py",
+  "src/hushscript/_http.py",
+  "src/hushscript/transcribe/",
+  "src/hushscript/resources/billing.py",
+]
+# The selected tests read SDK siblings, examples, generated inputs and gate configuration.
+also_copy = [
+  "src/hushscript/",
+  "conformance/",
+  "examples/",
+  "scripts/",
+  ".github/",
+  "openapi.json",
+  "README.md",
+  "justfile",
+  "compose.yaml",
+  "conformance-ref",
+  ".release-please-manifest.json",
+]
+pytest_add_cli_args_test_selection = ["tests/"]
