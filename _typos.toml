@@ -1,5 +1,5 @@
 [files]
-extend-exclude = ["openapi.json", "uv.lock", "src/hushscript/generated/**", "LICENSE"]
+extend-exclude = ["openapi.json", "uv.lock", "src/hushscript/generated/**", "LICENSE", "CHANGELOG.md"]
 
 [default.extend-words]
 JOD = "JOD"
